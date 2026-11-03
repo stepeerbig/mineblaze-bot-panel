@@ -1,0 +1,387 @@
+:root {
+  /* Палитра: материалы Minecraft */
+  --deepslate: #1c1e22;
+  --slate: #25282d;
+  --cobble: #373b42;
+  --chalk: #e4e6ea;
+  --dust: #8e949e;
+
+  --emerald: #3bd47f;
+  --redstone: #e5534b;
+  --gold: #f0b43c;
+  --lapis: #6b9bff;
+  --amber: #ff9440;
+
+  --ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --mono: "Cascadia Mono", Consolas, "Courier New", monospace;
+
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; margin: 0; }
+
+body {
+  background: var(--deepslate);
+  color: var(--chalk);
+  font: 14px/1.45 var(--ui);
+  overflow: hidden;
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  height: 100%;
+}
+
+/* ---------- левая панель ---------- */
+
+.side {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 22px 18px;
+  background: var(--slate);
+  border-right: 1px solid var(--cobble);
+  overflow-y: auto;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.status-title {
+  font: 600 17px/1.25 var(--ui);
+}
+
+.status-sub {
+  margin-top: 2px;
+  color: var(--dust);
+  font: 12.5px var(--mono);
+  overflow-wrap: anywhere;
+}
+
+/* Лампа — индикатор состояния в виде блока Minecraft */
+.lamp {
+  --lamp-bg: #4a4136;
+  --lamp-glow: 0px;
+  --lamp-glow-color: transparent;
+  flex: none;
+  width: 52px;
+  height: 52px;
+  border-radius: 3px;
+  background-color: var(--lamp-bg);
+  background-image:
+    linear-gradient(to right, rgba(0, 0, 0, .3) 2px, transparent 2px),
+    linear-gradient(to bottom, rgba(0, 0, 0, .3) 2px, transparent 2px);
+  background-size: 13px 13px;
+  box-shadow:
+    inset 0 0 0 3px rgba(0, 0, 0, .38),
+    0 0 0 1px rgba(0, 0, 0, .5),
+    0 0 var(--lamp-glow) var(--lamp-glow-color);
+  transition: background-color .25s, box-shadow .25s;
+}
+
+.lamp[data-state="connecting"],
+.lamp[data-state="connected"] {
+  --lamp-bg: #d9992f;
+  --lamp-glow: 18px;
+  --lamp-glow-color: rgba(240, 180, 60, .35);
+  animation: pulse 1.3s ease-in-out infinite;
+}
+
+.lamp[data-state="online"] {
+  --lamp-bg: #f4d36b;
+  --lamp-glow: 26px;
+  --lamp-glow-color: rgba(244, 211, 107, .55);
+}
+
+.lamp[data-state="reconnecting"] {
+  --lamp-bg: #b5473e;
+  --lamp-glow: 14px;
+  --lamp-glow-color: rgba(229, 83, 75, .35);
+  animation: pulse 2.2s ease-in-out infinite;
+}
+
+@keyframes pulse { 50% { filter: brightness(.7); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .lamp { animation: none !important; transition: none; }
+}
+
+.actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 44px;
+  border: 0;
+  border-radius: 6px;
+  font: 600 14px var(--ui);
+  cursor: pointer;
+}
+
+.btn svg { width: 13px; height: 13px; fill: currentColor; }
+
+.btn.start { background: var(--emerald); color: #0d1f15; }
+.btn.start:hover:not(:disabled) { background: #5be39a; }
+
+.btn.stop { background: var(--redstone); color: #240d0b; }
+.btn.stop:hover:not(:disabled) { background: #f0706a; }
+
+.btn:disabled { opacity: .3; cursor: not-allowed; }
+
+/* «Экран бота» — второстепенная кнопка на всю ширину под «Старт» и «Стоп» */
+.btn.view {
+  grid-column: 1 / -1;
+  height: 40px;
+  background: var(--cobble);
+  color: var(--chalk);
+}
+
+.btn.view svg { fill: var(--lapis); }
+.btn.view:hover:not(:disabled) { background: #424750; }
+.btn.view:disabled { opacity: .6; cursor: progress; } /* окно открывается */
+
+.group { display: flex; flex-direction: column; gap: 10px; }
+
+.group-title {
+  color: var(--chalk);
+  font: 600 13px var(--ui);
+}
+
+.reconnect {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.seg {
+  display: inline-grid;
+  grid-template-columns: 1fr 1fr;
+  padding: 2px;
+  background: var(--deepslate);
+  border: 1px solid var(--cobble);
+  border-radius: 6px;
+}
+
+.seg-btn {
+  padding: 6px 16px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--dust);
+  font: 600 12.5px var(--mono);
+  cursor: pointer;
+}
+
+.seg-btn:hover { color: var(--chalk); }
+.seg-btn.is-on { background: var(--cobble); color: var(--chalk); }
+#arOn.is-on { background: var(--emerald); color: #0d1f15; }
+
+.delay {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dust);
+  font-size: 12.5px;
+}
+
+.delay input { width: 54px; padding: 6px 4px; text-align: center; }
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+  color: var(--dust);
+  font-size: 12.5px;
+}
+
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+input, select, textarea {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--deepslate);
+  border: 1px solid var(--cobble);
+  border-radius: 6px;
+  color: var(--chalk);
+  font: 13.5px var(--ui);
+}
+
+textarea {
+  min-height: 64px;
+  resize: vertical;
+  font: 13px/1.4 var(--mono);
+}
+
+input::placeholder, textarea::placeholder { color: #6f7681; }
+
+input:disabled, select:disabled, textarea:disabled { opacity: .5; cursor: not-allowed; }
+
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--lapis);
+  outline-offset: 2px;
+}
+
+/* Сворачиваемая группа «Автовход и команды» */
+.fold { display: block; }
+.fold > * + * { margin-top: 10px; }
+
+.fold > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+
+.fold > summary::-webkit-details-marker { display: none; }
+
+.fold > summary::before {
+  content: "";
+  border-left: 5px solid var(--dust);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform .15s;
+}
+
+.fold[open] > summary::before { transform: rotate(90deg); }
+
+.tag {
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: rgba(59, 212, 127, .14);
+  color: var(--emerald);
+  font: 600 11px var(--ui);
+}
+
+.tag[hidden] { display: none; }
+
+.hint {
+  margin: 0;
+  color: var(--dust);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/* ---------- консоль и чат ---------- */
+
+.main {
+  display: grid;
+  grid-template-rows: minmax(130px, 2fr) minmax(200px, 3fr);
+  gap: 1px;
+  min-width: 0;
+  min-height: 0;
+  background: var(--cobble);
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--deepslate);
+}
+
+.pane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px 6px;
+}
+
+.pane-head h2 { margin: 0; font: 600 13px var(--ui); }
+
+.pane-tools { display: flex; gap: 4px; }
+
+.link {
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--dust);
+  font: 12.5px var(--ui);
+  cursor: pointer;
+}
+
+.link:hover { color: var(--chalk); }
+
+.log {
+  flex: 1;
+  min-height: 0;
+  padding: 4px 16px 12px;
+  overflow-y: auto;
+  font: 13px/1.5 var(--mono);
+}
+
+.log:empty::before {
+  content: attr(data-empty);
+  color: var(--dust);
+  font-family: var(--ui);
+}
+
+.log::-webkit-scrollbar { width: 12px; }
+.log::-webkit-scrollbar-thumb {
+  background: var(--cobble);
+  border: 3px solid var(--deepslate);
+  border-radius: 6px;
+}
+
+.line {
+  display: flex;
+  gap: 10px;
+  padding: 1px 0 1px 8px;
+  border-left: 2px solid transparent;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ts { flex: none; color: #6f7681; user-select: none; }
+.tx { min-width: 0; }
+.cnt { flex: none; color: var(--dust); }
+
+.chat-self .tx { color: var(--dust); font-style: italic; }
+
+/* Ссылки от сервера: открываются во внешнем браузере */
+.ext-link { color: var(--lapis); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.ext-link:hover { color: #9bbcff; }
+.hidden-link { color: var(--dust); }
+
+/* Строка отправки сообщений под чатом */
+.chat-form {
+  display: flex;
+  gap: 8px;
+  padding: 8px 16px 12px;
+  border-top: 1px solid var(--cobble);
+}
+
+.chat-form input { flex: 1; min-width: 0; font-family: var(--mono); font-size: 13px; }
+
+.btn.send {
+  height: auto;
+  padding: 0 16px;
+  background: var(--lapis);
+  color: #0b1530;
+  font-size: 13px;
+}
+
+.btn.send:hover:not(:disabled) { background: #8db2ff; }
+
+.lv-info { color: #c6cad1; }
+.lv-ok { color: var(--emerald); border-left-color: var(--emerald); }
+.lv-warn { color: var(--gold); border-left-color: var(--gold); }
+.lv-error { color: var(--redstone); border-left-color: var(--redstone); }
+.lv-kick { color: var(--amber); border-left-color: var(--amber); }

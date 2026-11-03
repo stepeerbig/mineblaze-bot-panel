@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MineBlaze Bot Panel</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="side">
+      <div class="status">
+        <div id="lamp" class="lamp" data-state="offline" aria-hidden="true"></div>
+        <div>
+          <div id="statusText" class="status-title" role="status">Не в сети</div>
+          <div id="statusSub" class="status-sub"></div>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="btnStart" class="btn start" type="button">
+          <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 1l9 5-9 5z"/></svg>
+          Старт
+        </button>
+        <button id="btnStop" class="btn stop" type="button" disabled>
+          <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M1.5 1.5h9v9h-9z"/></svg>
+          Стоп
+        </button>
+        <button id="btnView" class="btn view" type="button" title="Открыть отдельное окно: что видит бот">
+          <svg viewBox="0 0 12 12" aria-hidden="true"><path fill-rule="evenodd" d="M6 2.5C3.2 2.5 1.1 4.4.3 6c.8 1.6 2.9 3.5 5.7 3.5s4.9-1.9 5.7-3.5C10.9 4.4 8.8 2.5 6 2.5zm0 1.2a2.3 2.3 0 1 1 0 4.6 2.3 2.3 0 0 1 0-4.6zm0 1.1a1.2 1.2 0 1 0 0 2.4 1.2 1.2 0 0 0 0-2.4z"/></svg>
+          Экран бота
+        </button>
+      </div>
+
+      <div class="group">
+        <div class="group-title">Автоматический реконнект</div>
+        <div class="reconnect">
+          <div class="seg" role="group" aria-label="Автоматический реконнект">
+            <button id="arOff" class="seg-btn is-on" type="button" aria-pressed="true">OFF</button>
+            <button id="arOn" class="seg-btn" type="button" aria-pressed="false">ON</button>
+          </div>
+          <label class="delay" title="После трёх неудачных попыток подряд пауза удваивается, но не больше минуты">
+            пауза <input id="delay" type="number" min="1" max="600" step="1"> с
+          </label>
+        </div>
+      </div>
+
+      <div class="group">
+        <div class="group-title">Подключение</div>
+        <label class="field">Сервер
+          <input id="host" type="text" autocomplete="off" spellcheck="false">
+        </label>
+        <div class="row">
+          <label class="field">Порт
+            <input id="port" type="number" min="1" max="65535">
+          </label>
+          <label class="field">Версия
+            <input id="version" type="text" list="versions" placeholder="авто" autocomplete="off" spellcheck="false">
+          </label>
+        </div>
+        <datalist id="versions">
+          <option value="1.21.11"></option>
+          <option value="1.21.10"></option>
+          <option value="1.21.8"></option>
+          <option value="1.21.4"></option>
+          <option value="1.21.1"></option>
+          <option value="1.20.4"></option>
+          <option value="1.20.1"></option>
+          <option value="1.19.4"></option>
+          <option value="1.18.2"></option>
+          <option value="1.16.5"></option>
+          <option value="1.12.2"></option>
+        </datalist>
+        <label class="field"><span id="usernameLabel">Ник бота</span>
+          <input id="username" type="text" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="field">Вход
+          <select id="auth">
+            <option value="offline">Offline (без лицензии)</option>
+            <option value="microsoft">Microsoft (лицензия)</option>
+          </select>
+        </label>
+      </div>
+
+      <details id="autologin" class="group fold">
+        <summary class="group-title">Автовход и команды <span id="autologinTag" class="tag" hidden>настроено</span></summary>
+        <label class="field">Пароль для /login
+          <input id="loginPassword" type="password" autocomplete="off" spellcheck="false" placeholder="не отправлять">
+        </label>
+        <label class="field">Команды после входа
+          <textarea id="joinCommands" rows="3" spellcheck="false" placeholder="/server survival"></textarea>
+        </label>
+        <p class="hint">Отправляются один раз после появления в мире, по одной строке с паузой. Пароль хранится зашифрованным и в чате показывается точками.</p>
+      </details>
+    </aside>
+
+    <main class="main">
+      <section class="pane">
+        <header class="pane-head">
+          <h2>Консоль</h2>
+          <button id="clearConsole" class="link" type="button">Очистить</button>
+        </header>
+        <div id="console" class="log" role="log" data-empty="Здесь появятся статусы и ошибки. Нажми «Старт»."></div>
+      </section>
+
+      <section class="pane">
+        <header class="pane-head">
+          <h2>Чат</h2>
+          <div class="pane-tools">
+            <button id="openLogs" class="link" type="button" title="Весь чат и консоль сохраняются в файлы по дням">Логи</button>
+            <button id="clearChat" class="link" type="button">Очистить</button>
+          </div>
+        </header>
+        <div id="chat" class="log" role="log" data-empty="Здесь будет весь чат сервера."></div>
+        <form id="chatForm" class="chat-form" autocomplete="off">
+          <input id="chatInput" type="text" maxlength="256" spellcheck="false" aria-label="Сообщение или команда" placeholder="Бот не в сети" disabled>
+          <button id="chatSend" class="btn send" type="submit" disabled>Отправить</button>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <script src="motd.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

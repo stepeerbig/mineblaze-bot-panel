@@ -1,0 +1,242 @@
+/* Окно «Экран бота»: 3D-вид на всё окно и тонкий слой интерфейса поверх него. */
+
+:root {
+  /* Палитра панели (src/renderer/style.css) */
+  --deepslate: #1c1e22;
+  --slate: #25282d;
+  --cobble: #373b42;
+  --chalk: #e4e6ea;
+  --dust: #8e949e;
+  --emerald: #3bd47f;
+  --redstone: #e5534b;
+  --gold: #f0b43c;
+  --lapis: #6b9bff;
+  --glass: rgba(28, 30, 34, .84); /* плашки поверх мира */
+
+  --ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --mono: "Cascadia Mono", Consolas, "Courier New", monospace;
+
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; margin: 0; overflow: hidden; }
+
+body {
+  background: var(--deepslate);
+  color: var(--chalk);
+  font: 13px/1.4 var(--ui);
+}
+
+/* Холст WebGL создаёт index.js и сам растягивает его по размеру окна. */
+canvas { display: block; }
+body.orbit canvas { cursor: grab; }
+body.orbit canvas:active { cursor: grabbing; }
+
+[hidden] { display: none !important; }
+
+/* Слой интерфейса прозрачен для мыши: вращать и двигать камеру можно где угодно, события ловят только кнопки. */
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  pointer-events: none;
+  user-select: none;
+}
+
+.overlay button { pointer-events: auto; }
+
+.chip {
+  background: var(--glass);
+  border: 1px solid var(--cobble);
+  border-radius: 8px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .25);
+}
+
+/* ---------- верхняя строка: плашка бота слева, кнопки справа ---------- */
+
+.top {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 12px;
+}
+
+/* Разделитель — левая граница каждого элемента. В начале строки (и после переноса в узком окне)
+   она уходит на -1px за край и обрезается overflow: hidden. */
+.hud {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  row-gap: 2px;
+  min-width: 0;
+  min-height: 36px;
+  padding: 4px 0;
+  overflow: hidden;
+}
+
+.hud-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: -1px;
+  padding: 0 11px;
+  border-left: 1px solid var(--cobble);
+  white-space: nowrap;
+}
+
+.hud-name { font-weight: 600; }
+.hud-dim { color: var(--dust); }
+
+.hud-num {
+  font: 12.5px var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-ax { color: var(--dust); font: 12.5px var(--mono); }
+.hud-num + .hud-ax { margin-left: 4px; }
+
+.ico { display: block; flex: none; }
+.ico-heart path { fill: var(--redstone); }
+.ico-food .meat { fill: #d9843f; }
+.ico-food .bone { fill: #ece5d6; }
+
+.tools {
+  display: flex;
+  gap: 8px;
+  margin-left: auto; /* кнопки остаются справа, даже когда плашки нет */
+}
+
+.seg { display: inline-flex; padding: 2px; }
+
+.seg-btn,
+.tool-btn {
+  height: 30px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dust);
+  font: 600 12.5px var(--ui);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.seg-btn[aria-pressed="true"] { background: var(--cobble); color: var(--chalk); }
+
+.tool-btn {
+  height: 36px;
+  background: var(--glass);
+  border: 1px solid var(--cobble);
+  border-radius: 8px;
+}
+
+.seg-btn:hover:not(:disabled),
+.tool-btn:hover:not(:disabled) { color: var(--chalk); }
+
+button:disabled { opacity: .45; cursor: default; }
+
+button:focus-visible {
+  outline: 2px solid var(--lapis);
+  outline-offset: 2px;
+}
+
+/* ---------- подсказка и прицел ---------- */
+
+.hint {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  max-width: calc(100% - 24px);
+  padding: 6px 10px;
+  color: var(--dust);
+  font-size: 12px;
+}
+
+/* Прицел в виде глазами бота: куда бот смотрит */
+.crosshair {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 18px;
+  height: 18px;
+  margin: -9px 0 0 -9px;
+  background:
+    linear-gradient(rgba(255, 255, 255, .85), rgba(255, 255, 255, .85)) center / 2px 100% no-repeat,
+    linear-gradient(rgba(255, 255, 255, .85), rgba(255, 255, 255, .85)) center / 100% 2px no-repeat;
+  filter: drop-shadow(0 0 1px rgba(0, 0, 0, .7));
+}
+
+/* ---------- сообщения по центру ---------- */
+
+.curtain {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 64px 24px 24px; /* сверху — место под плашку и кнопки */
+}
+
+/* Пустой мир (голубое небо без блоков) не показываем: только фон панели. */
+.curtain[data-kind="boot"],
+.curtain[data-kind="offline"],
+.curtain[data-kind="unsupported"],
+.curtain[data-kind="nogl"] { background: var(--deepslate); }
+
+.curtain[data-kind="unreachable"] { background: rgba(28, 30, 34, .8); }
+
+.card {
+  max-width: 440px;
+  padding: 20px 24px;
+  background: var(--slate);
+  border: 1px solid var(--cobble);
+  border-radius: 10px;
+  text-align: center;
+}
+
+.card-title { font: 600 16px/1.3 var(--ui); }
+
+/* Предупреждения — золотым, как в консоли панели */
+.curtain[data-kind="unreachable"] .card-title,
+.curtain[data-kind="unsupported"] .card-title,
+.curtain[data-kind="nogl"] .card-title { color: var(--gold); }
+
+.card-text {
+  margin-top: 6px;
+  color: var(--dust);
+  line-height: 1.45;
+}
+
+/* «Загрузка мира…» — небольшая плашка поверх мира, без затемнения */
+.curtain[data-kind="loading"] .card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  background: var(--glass);
+}
+
+.curtain[data-kind="loading"] .card-title { font-size: 13px; }
+
+.curtain[data-kind="loading"] .card::before {
+  content: "";
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--cobble);
+  border-top-color: var(--emerald);
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .curtain[data-kind="loading"] .card::before { animation: none; }
+}

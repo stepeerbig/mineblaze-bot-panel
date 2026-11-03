@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self' blob:">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Экран бота</title>
+  <link rel="stylesheet" href="ui.css">
+</head>
+<body>
+  <!-- Слой интерфейса поверх 3D-вида. Холст WebGL index.js сам добавит в конец body. -->
+  <div class="overlay">
+    <div id="curtain" class="curtain" data-kind="boot">
+      <div id="card" class="card" role="status" aria-live="polite" hidden>
+        <div id="cardTitle" class="card-title"></div>
+        <div id="cardText" class="card-text"></div>
+      </div>
+    </div>
+
+    <div id="crosshair" class="crosshair" hidden></div>
+
+    <div id="hint" class="hint chip" hidden>Левая кнопка — вращать · правая — сдвигать · колесо — приблизить</div>
+
+    <div class="top">
+      <div id="hud" class="hud chip" role="group" aria-label="Состояние бота" hidden>
+        <span id="hudName" class="hud-item hud-name"></span>
+        <span class="hud-item">
+          <svg class="ico ico-heart" width="14" height="12" viewBox="0 0 7 6" shape-rendering="crispEdges" role="img" aria-label="Здоровье">
+            <path d="M1 0h2v1H1zM4 0h2v1H4zM0 1h7v2H0zM1 3h5v1H1zM2 4h3v1H2zM3 5h1v1H3z"/>
+          </svg>
+          <span id="hudHealth" class="hud-num"></span>
+        </span>
+        <span class="hud-item">
+          <svg class="ico ico-food" width="14" height="14" viewBox="0 0 7 7" shape-rendering="crispEdges" role="img" aria-label="Сытость">
+            <path class="meat" d="M3 0h3v1H3zM2 1h5v2H2zM2 3h4v1H2zM3 4h2v1H3z"/>
+            <path class="bone" d="M2 4h1v1H2zM0 5h2v2H0z"/>
+          </svg>
+          <span id="hudFood" class="hud-num"></span>
+        </span>
+        <span class="hud-item" role="group" aria-label="Координаты">
+          <span class="hud-ax">X</span><span id="hudX" class="hud-num"></span>
+          <span class="hud-ax">Y</span><span id="hudY" class="hud-num"></span>
+          <span class="hud-ax">Z</span><span id="hudZ" class="hud-num"></span>
+        </span>
+        <span id="hudDim" class="hud-item hud-dim"></span>
+      </div>
+
+      <div class="tools">
+        <div class="seg chip" role="group" aria-label="Вид камеры">
+          <button id="modeFirst" class="seg-btn" type="button" aria-pressed="true">Глазами бота</button>
+          <button id="modeThird" class="seg-btn" type="button" aria-pressed="false">Со стороны</button>
+        </div>
+        <button id="btnReload" class="tool-btn chip" type="button" title="Перезагрузить вид и навести камеру на бота">↻ Обновить</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="index.js"></script>
+  <script src="ui.js"></script>
+</body>
+</html>

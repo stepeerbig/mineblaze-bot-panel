@@ -1,0 +1,60 @@
+{
+  "name": "mineblaze-bot-panel",
+  "productName": "MineBlaze Bot Panel",
+  "version": "1.1.0",
+  "description": "Панель управления Minecraft-ботом на mineflayer",
+  "main": "src/main.js",
+  "author": "MineBlaze",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test",
+    "dist": "electron-builder --win portable --x64"
+  },
+  "dependencies": {
+    "express": "^4.22.3",
+    "mineflayer": "^4.37.1",
+    "prismarine-viewer": "1.33.0",
+    "socket.io": "^4.8.4"
+  },
+  "devDependencies": {
+    "electron": "^44.10.1",
+    "electron-builder": "^26.15.7",
+    "socket.io-client": "^4.8.4"
+  },
+  "build": {
+    "appId": "net.mineblaze.botpanel",
+    "productName": "MineBlaze Bot Panel",
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json",
+      "!node_modules/minecraft-data/minecraft-data/data/bedrock/**",
+      "node_modules/minecraft-data/minecraft-data/data/bedrock/common/**",
+      "!node_modules/prismarine-viewer/{examples,test,lib}/**",
+      "!node_modules/prismarine-viewer/public/textures/{1.8.8,1.9.4,1.10.2,1.11.2,1.12.2,1.13.2,1.14.4,1.15.2,1.16.1,1.17.1,1.18.1,1.19,1.20.1,1.21.1,1.21.4}/**",
+      "!node_modules/prismarine-viewer/public/textures/1.16.4/{blocks,colormap,effect,environment,font,gui,items,map,misc,mob_effect,models,painting,particle}/**",
+      "!node_modules/prismarine-viewer/public/textures/1.16.4/*.json",
+      "!node_modules/{three,three.meshline,@tweenjs}/**"
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "signAndEditExecutable": false
+    },
+    "portable": {
+      "artifactName": "MineBlazeBotPanel.exe"
+    }
+  }
+}
