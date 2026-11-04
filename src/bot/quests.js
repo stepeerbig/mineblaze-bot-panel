@@ -193,6 +193,30 @@ function parseOffer(s) {
   };
 }
 
+// Ответы сервера в чате (MineBlaze, скриншоты пользователя; системные строки начинаются с «|»):
+//   «| Вы взяли задание Ночная прополка.»
+//   «| Вы передали Ягодный запас» → «| Задание Лесная кислинка выполнено» → «| Вы получаете награду: 16 печенек»
+const CHAT_START = String.raw`^\s*(?:[|│▎▍▌▐┃]\s*)?`;
+const QUEST_CHAT = [
+  ['took', new RegExp(`${CHAT_START}Вы взяли задание\\s+(.+?)\\s*$`, 'i')],
+  ['gave', new RegExp(`${CHAT_START}Вы передали\\s+(.+?)\\s*$`, 'i')],
+  ['done', new RegExp(`${CHAT_START}Задание\\s+(.+?)\\s+(?:выполнено|завершено)[.!]?\\s*$`, 'i')],
+  ['reward', new RegExp(`${CHAT_START}Вы получаете награду:\\s*(.+?)\\s*$`, 'i')],
+];
+
+/** Сообщение сервера о задании → { type: took | gave | done | reward, text } или null (не о задании). */
+function parseQuestChat(line) {
+  const s = clean(line);
+  for (const [type, re] of QUEST_CHAT) {
+    const m = re.exec(s);
+    if (m) return { type, text: m[1].replace(/[.!]+$/, '').trim() };
+  }
+  return null;
+}
+
+/** То же название задания в меню и в чате: «Ночная прополка.» = «Ночная прополка». */
+const sameTitle = (a, b) => clean(a).replace(/[.!]+$/, '').toLowerCase() === clean(b).replace(/[.!]+$/, '').toLowerCase();
+
 const KIND_NAMES = { buy: 'купить у NPC', deliver: 'сдать', breed: 'развести', kill: 'убить', time: 'время на сервере', other: 'задание' };
 
 /** Строка о задании для человека. */
@@ -222,4 +246,6 @@ function matchesQuery(text, query) {
   return words.every((w) => t.includes(w.length > 4 ? w.slice(0, w.length - 2) : w.slice(0, Math.max(2, w.length - 1))));
 }
 
-module.exports = { parseQuest, parseQuestMenu, parseOffer, deliverItems, describeQuest, parseNumber, parseDuration, matchesQuery, KIND_NAMES };
+module.exports = {
+  parseQuest, parseQuestMenu, parseOffer, deliverItems, describeQuest, parseNumber, parseDuration, matchesQuery, parseQuestChat, sameTitle, KIND_NAMES,
+};

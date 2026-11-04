@@ -2,7 +2,20 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { parseQuest, parseQuestMenu, parseOffer, deliverItems, describeQuest, parseNumber, parseDuration, matchesQuery } = require('../src/bot/quests');
+const {
+  parseQuest, parseQuestMenu, parseOffer, deliverItems, describeQuest, parseNumber, parseDuration, matchesQuery, parseQuestChat, sameTitle,
+} = require('../src/bot/quests');
+
+test('ответы сервера о заданиях (скриншоты MineBlaze): взял, передал, выполнено, награда', () => {
+  assert.deepEqual(parseQuestChat('| Вы взяли задание Ночная прополка.'), { type: 'took', text: 'Ночная прополка' });
+  assert.deepEqual(parseQuestChat('| Вы передали Ягодный запас'), { type: 'gave', text: 'Ягодный запас' });
+  assert.deepEqual(parseQuestChat('| Задание Лесная кислинка выполнено'), { type: 'done', text: 'Лесная кислинка' });
+  assert.deepEqual(parseQuestChat('| Вы получаете награду: 16 печенек'), { type: 'reward', text: '16 печенек' });
+  assert.equal(parseQuestChat('[Ender] zJeezy → Вы получаете награду: 1000 монет'), null, 'игрок не может «ответить» за сервер');
+  assert.equal(parseQuestChat('| Перемещение на ah.'), null);
+  assert.ok(sameTitle('Ночная прополка.', 'Ночная прополка'));
+  assert.ok(!sameTitle('Ночная прополка.', 'Лесная кислинка'));
+});
 
 // Меню «Фермер › Уровень 1 → 2» с MineBlaze (из лога панели, #окно; строки описания были через « / »).
 const FARMER_LOG = [

@@ -184,7 +184,10 @@ function autoServer(bot, world, { chests = {}, storage = {}, npcs = {}, onClick 
       const loc = new Vec3(params.location.x, params.location.y, params.location.z);
       const clicked = world.get(loc);
       const spec = storage[`${loc.x},${loc.y},${loc.z}`];
-      if (spec && /chest|barrel|shulker_box/.test(clicked)) {
+      if (spec && spec.deny) {
+        const text = '! К сожалению, Вы не можете открывать это в этом месте.'; // чужая территория (MineBlaze)
+        bot.emit('message', { json: { text }, toString: () => text }, 'system');
+      } else if (spec && /chest|barrel|shulker_box/.test(clicked)) {
         openStorage(spec, clicked);
       } else if (/chest|barrel|shulker_box/.test(clicked)) {
         const items = chests[`${loc.x},${loc.y},${loc.z}`] || [];

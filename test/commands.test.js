@@ -35,8 +35,8 @@ function setup({ players = [], farPlayers = [], chests = {}, storage = {}, inven
     bot.inventory.slots[36 + i] = { name, count, displayName: name };
   });
   const logs = [];
-  const run = async (line) => {
-    const r = await runFor(clock, runCommand(bot, line, (level, text) => logs.push(`${level}:${text}`)));
+  const run = async (line, maxMs) => {
+    const r = await runFor(clock, runCommand(bot, line, (level, text) => logs.push(`${level}:${text}`)), maxMs);
     assert.ifError(r.error); // runCommand сам не падает: ошибки — в ответе
     return r.value;
   };
@@ -453,6 +453,137 @@ test('команды: #квесты у Фермера — показать, вз
   assert.deepEqual([state.left, state.money], [4, 3200]);
   assert.equal(bot.currentWindow, null);
   assert.match((await s.run('#купи торт')).message, /у Фермер нет «торт». Есть: Тюк сена/);
+});
+
+test('команды: #квесты принести — склад (/home), сдать NPC (/warp ah), награды (/home); ответы сервера — из чата', async () => {
+  const json = (text) => JSON.stringify({ text });
+  let bot = null;
+  const state = { taken: { 19: false }, have: { 11: 0, 19: 0 }, done: { 11: false, 19: false } };
+  const QUESTS = {
+    11: { title: 'Грядки без истерики.', icon: 'wheat', need: 224, items: ['wheat', 'carrot', 'potato', 'beetroot'], what: ['Передайте пшеницу, морковь,', 'картофель или свёклу'], gave: 'Урожай', reward: ['bread', 24, '24 хлеба'] },
+    19: { title: 'Лесная кислинка.', icon: 'sweet_berries', need: 96, items: ['sweet_berries', 'apple'], what: ['Передайте сладкие ягоды или', 'яблоки'], gave: 'Ягодный запас', reward: ['cookie', 16, '16 печенек'] },
+  };
+  // Выполненное задание сервер меняет на другой предмет — по меню уже не понять, что оно сдано (только по чату).
+  const questItem = (slot) => {
+    const q = QUESTS[slot];
+    if (state.done[slot]) return { name: 'lime_dye', count: 1, customName: json(q.title), customLore: [json('✔ Выполнено')] };
+    const lore = [`▪ Награда: ${q.reward[2]}`, q.what[0], `${q.what[1]}: ${state.have[slot]}/${q.need}`];
+    if (slot === 19 && !state.taken[19]) lore.push('Нажмите, чтобы взять задание');
+    return { name: q.icon, count: 1, customName: json(q.title), customLore: lore.map(json) };
+  };
+  const menu = (id, title, filled) => {
+    const w = { id, title: json(title), inventoryStart: 54, slots: new Array(90).fill(null) };
+    for (const [i, it] of Object.entries(filled)) w.slots[i] = it;
+    for (let j = 0; j < 36; j += 1) w.slots[54 + j] = bot.inventory.slots[9 + j] || null;
+    return w;
+  };
+  const mainMenu = () => menu(5, 'Фермер › Уровень 1', { 22: { name: 'experience_bottle', count: 1, customName: json('Улучшения'), customLore: [json('Повышайте уровень доверия')] } });
+  const questsMenu = () => menu(6, 'Фермер › Уровень 1 → 2', { 11: questItem(11), 19: questItem(19), 36: { name: 'arrow', count: 1, customName: json('Назад') } });
+  const say = (text) => bot.emit('message', { json: { text }, toString: () => text }, 'system');
+  const deliver = (w, slot) => {
+    const q = QUESTS[slot];
+    let given = 0;
+    for (let i = 9; i < 45; i += 1) {
+      const it = bot.inventory.slots[i];
+      const left = q.need - state.have[slot] - given;
+      if (!it || left <= 0 || !q.items.includes(it.name)) continue;
+      const n = Math.min(it.count, left);
+      given += n;
+      it.count -= n;
+      if (it.count <= 0) {
+        bot.inventory.slots[i] = null;
+        w.slots[w.inventoryStart + i - 9] = null;
+      }
+    }
+    if (!given) return;
+    state.have[slot] += given;
+    say(`| Вы передали ${q.gave}`);
+    if (state.have[slot] < q.need) return;
+    state.done[slot] = true;
+    say(`| Задание ${q.title.replace(/\.$/, '')} выполнено`);
+    say(`| Вы получаете награду: ${q.reward[2]}`);
+    const Item = require('prismarine-item')(bot.registry);
+    const free = bot.inventory.slots.findIndex((it, i) => i >= 9 && i < 45 && !it);
+    const reward = new Item(bot.registry.itemsByName[q.reward[0]].id, q.reward[1]);
+    bot.inventory.slots[free] = reward;
+    w.slots[w.inventoryStart + free - 9] = reward;
+  };
+  const onClick = (w, slot) => {
+    if (w.id === 5 && slot === 22) return questsMenu();
+    if (w.id === 6 && slot === 19 && !state.taken[19]) {
+      state.taken[19] = true;
+      say('| Вы взяли задание Лесная кислинка.');
+    } else if (w.id === 6 && QUESTS[slot] && !state.done[slot]) {
+      deliver(w, slot);
+    }
+    if (w.id === 6 && QUESTS[slot]) w.slots[slot] = questItem(slot);
+    return null;
+  };
+  const npc = { id: 401, type: 'player', username: '#1479d9c455b1f85', position: new Vec3(0.5, 64, 2.5), height: 1.8, width: 0.6 };
+  const sign = { id: 402, type: 'object', name: 'armor_stand', position: new Vec3(0.5, 66.4, 2.5), getCustomName: () => ({ json: { text: 'Фермер' }, toString: () => 'Фермер' }) };
+  const s = setup({
+    entities: [npc, sign],
+    npcs: { 401: mainMenu },
+    onClick,
+    inventory: [['iron_pickaxe', 1], ['wheat', 40]],
+    storage: {
+      '51,64,2': { items: [[0, 'wheat', 64], [1, 'wheat', 64], [2, 'wheat', 64], [3, 'carrot', 32]] },
+      '48,64,2': { items: [[0, 'sweet_berries', 64], [1, 'sweet_berries', 64]] },
+      '101,64,2': { items: [] },
+    },
+  });
+  bot = s.bot;
+  bot.username = 'CycleBot';
+  for (const p of ['51,64,2', '48,64,2', '101,64,2']) s.world.set(new Vec3(...p.split(',').map(Number)), 'chest');
+  // Сервер: /warp ah и дома переносят бота, незнакомый дом — «не найден».
+  const places = { '/warp ah': [0.5, 64, 0.5], '/home урожай': [50.5, 64, 0.5], '/home награды': [100.5, 64, 0.5] };
+  bot.sentCommands = [];
+  bot.sendCommand = (cmd) => {
+    bot.sentCommands.push(cmd);
+    const to = places[cmd];
+    if (to) teleport(bot, { x: to[0], y: to[1], z: to[2] });
+    else say(`| Дом ${cmd.split(' ')[1]} не найден.`);
+    return true;
+  };
+
+  const r = await s.run('#квесты принести урожай награды', 120000);
+  assert.equal(r.ok, true, [].concat(r.message).join('\n'));
+  assert.deepEqual(r.message, [
+    'Взял задания: «Лесная кислинка.»',
+    'Нужно передать: «Грядки без истерики.» — 224 (wheat/carrot/potato/beetroot); «Лесная кислинка.» — 96 (sweet_berries/apple)',
+    'Склад (/home урожай): взял wheat×192, sweet_berries×128',
+    'Сдал в «Грядки без истерики.»: 0 → 224 из 224 — выполнено, награда: 24 хлеба',
+    'Сдал в «Лесная кислинка.»: 0 → 96 из 96 — выполнено, награда: 16 печенек',
+    'Награды (/home награды): положил bread×24, cookie×16',
+  ]);
+  assert.deepEqual(bot.sentCommands, ['/home урожай', '/warp ah', '/home награды']);
+  assert.deepEqual(invNames(bot).sort(), ['iron_pickaxe', 'sweet_berries', 'wheat'], 'остатки для заданий и кирка — с собой');
+  assert.equal(invCount(bot, 'wheat'), 8);
+  assert.equal(bot.currentWindow, null);
+
+  // Ещё раз, без слов — те же дома; приносить уже нечего.
+  const again = await s.run('#квесты принести', 60000);
+  assert.deepEqual(again.message, ['Приносить нечего: заданий «Передайте…» нет или все выполнены']);
+  assert.deepEqual(bot.sentCommands.slice(3), ['/warp ah'], 'к NPC вернулся сам');
+
+  // Дома нет — сервер так и сказал; что успел — в ответе.
+  state.done[11] = false;
+  state.have[11] = 200;
+  const lost = await s.run('#квесты принести нет', 60000);
+  assert.equal(lost.ok, false);
+  assert.equal([].concat(lost.message).at(-1), 'Остановился: после /home нет телепорта не было (сервер: «Дом нет не найден.»)');
+
+  bot.username = 'NewBot';
+  assert.match((await s.run('#квесты принести')).message, /откуда брать\? Например: #квесты принести урожай награды/);
+  assert.match((await s.run('#квесты принести урожай;op')).message, /не похоже на название дома/);
+});
+
+test('команды: сундук на чужой территории — сервер не даёт открыть, бот так и пишет', async () => {
+  const { run, world } = setup({ storage: { '1,64,2': { deny: true } } });
+  world.set(new Vec3(1, 64, 2), 'chest');
+  const r = await run('#достань пшеница');
+  assert.equal(r.ok, false);
+  assert.equal(r.message, '#достань: Сундук в 1 64 2: сервер не даёт открыть — «К сожалению, Вы не можете открывать это в этом месте.» (чужая или защищённая территория)');
 });
 
 test('команды: NPC за прилавком — вплотную не подойти, но дотянуться можно: меню всё равно открывается', async () => {

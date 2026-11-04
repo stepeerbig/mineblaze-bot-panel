@@ -9,7 +9,7 @@
 const { Vec3 } = require('vec3');
 const { FACE_VECTORS } = require('./actions');
 const { chatToText } = require('../chat-utils');
-const { parseQuestMenu, parseOffer, describeQuest, matchesQuery, deliverItems } = require('./quests');
+const { parseQuestMenu, parseOffer, describeQuest, matchesQuery, deliverItems, parseQuestChat, sameTitle } = require('./quests');
 const { isStorageWindow } = require('./window-clicks');
 const { moveStacks, countIn, itemsIn, storageSlots, playerSlots } = require('./chests');
 
@@ -231,6 +231,25 @@ function findEntity(bot, query) {
 const itemTitle = (it) => textOf(it.customName) || it.displayName || it.name;
 const itemLore = (it) => (Array.isArray(it.customLore) ? it.customLore : it.customLore ? [it.customLore] : []).map(textOf).filter(Boolean);
 const windowTitle = (w) => textOf(w.title) || w.type || 'меню';
+
+/** Сообщения сервера (не игроков) с этого момента: lines — все, take() — новые с прошлого раза, stop() — хватит. */
+function watchChat(bot) {
+  const lines = [];
+  let read = 0;
+  const on = (msg, position) => {
+    if (position === 'chat' || position === 'game_info') return; // игроки и надпись над хотбаром — не ответы сервера
+    const text = textOf(msg);
+    if (text) lines.push(text);
+  };
+  if (typeof bot.on === 'function') bot.on('message', on);
+  return {
+    lines,
+    take: () => lines.slice(read, (read = lines.length)),
+    stop: () => {
+      if (typeof bot.removeListener === 'function') bot.removeListener('message', on);
+    },
+  };
+}
 
 /** Ждать (по умолчанию до секунды), пока не откроется новое меню (не то, что было). */
 async function waitNewWindow(bot, before, ms = 1000) {
@@ -701,7 +720,12 @@ async function openNpcSection(bot, npc, isSection, buttonRe, what) {
   return next;
 }
 
-const hasQuests = (w) => parseQuestMenu(menuSlots(w)).quests.length > 0;
+// Меню заданий: в нём задания, кнопка уровня или заголовок «Фермер › Уровень 1 → 2» (когда всё выполнено,
+// заданий в нём может и не остаться).
+const hasQuests = (w) => {
+  const m = parseQuestMenu(menuSlots(w));
+  return m.quests.length > 0 || Boolean(m.level) || /уровень\s*\d+\s*(?:→|->)/i.test(windowTitle(w));
+};
 const hasOffers = (w) => menuSlots(w).some((s) => parseOffer(s));
 const openQuests = (bot, npc) => openNpcSection(bot, npc, hasQuests, /улучшени|задани|квест/i, 'Улучшения');
 const openShop = (bot, npc) => openNpcSection(bot, npc, hasOffers, /покупк|купить|магазин/i, 'Покупка');
@@ -716,15 +740,25 @@ async function clickAndSettle(bot, slot) {
 
 const quote = (q) => `«${q.title}»`;
 
-/** «#квесты [взять|сдать] [NPC]» — разобрать слова. */
+/** «#квесты [взять|сдать] [NPC]», «#квесты принести <дом склада> [<дом наград>] [у NPC]» — разобрать слова. */
 function questArgs(args, words) {
-  const ACTIONS = { взять: 'take', возьми: 'take', прими: 'take', принять: 'take', take: 'take', сдать: 'give', сдай: 'give', отдать: 'give', отдай: 'give', give: 'give', deliver: 'give' };
+  const ACTIONS = {
+    взять: 'take', возьми: 'take', прими: 'take', принять: 'take', take: 'take',
+    сдать: 'give', сдай: 'give', отдать: 'give', отдай: 'give', give: 'give', deliver: 'give',
+    принести: 'bring', принеси: 'bring', bring: 'bring',
+  };
   let action = 'show';
   const rest = [];
   args.forEach((a, i) => {
     if (action === 'show' && ACTIONS[words[i]]) action = ACTIONS[words[i]];
     else rest.push(a);
   });
+  if (action === 'bring') {
+    const at = rest.findIndex((a) => norm(a) === 'у');
+    const homes = at >= 0 ? rest.slice(0, at) : rest;
+    const npc = at >= 0 ? rest.slice(at + 1).join(' ') : '';
+    return { action, npc: npc || QUEST_NPC, storage: homes[0] || null, rewards: homes[1] || null };
+  }
   return { action, npc: rest.join(' ') || QUEST_NPC };
 }
 
@@ -739,7 +773,20 @@ async function closeAfter(bot) {
 }
 
 async function cmdQuests({ bot, args, words }) {
-  const { action, npc } = questArgs(args, words);
+  const { action, npc, storage, rewards } = questArgs(args, words);
+  if (action === 'bring') {
+    // Без слов — те же дома, что в прошлый раз.
+    const last = lastHomes.get(norm(bot.username)) || {};
+    const homes = storage ? { storage, rewards } : last;
+    if (!homes.storage) {
+      throw new CommandError('откуда брать? Например: #квесты принести урожай награды — со склада у /home урожай, награды — в сундук у /home награды');
+    }
+    for (const h of [homes.storage, homes.rewards].filter(Boolean)) {
+      if (!HOME_NAME_RE.test(h)) throw new CommandError(`«${h}» не похоже на название дома (буквы, цифры, «_» и «-»)`);
+    }
+    lastHomes.set(norm(bot.username), homes);
+    return bringQuests(bot, npc, homes.storage, homes.rewards || null);
+  }
   try {
     await openQuests(bot, npc);
     if (action === 'take') return await takeQuests(bot, npc);
@@ -764,13 +811,21 @@ async function takeQuests(bot, npc) {
   const took = [];
   const failed = [];
   const tried = new Set();
-  for (;;) {
-    const next = readQuests(bot).quests.find((q) => !q.taken && !tried.has(q.slot));
-    if (!next) break;
-    tried.add(next.slot);
-    await clickAndSettle(bot, next.slot);
-    const after = readQuests(bot).quests.find((q) => q.slot === next.slot);
-    (after && after.taken ? took : failed).push(next);
+  const chat = watchChat(bot);
+  try {
+    for (;;) {
+      const next = readQuests(bot).quests.find((q) => !q.taken && !tried.has(q.slot));
+      if (!next) break;
+      tried.add(next.slot);
+      chat.take();
+      await clickAndSettle(bot, next.slot);
+      const after = readQuests(bot).quests.find((q) => q.slot === next.slot);
+      // «| Вы взяли задание Ночная прополка.» — подтверждение сервера, даже если меню ещё не обновилось.
+      const said = chat.take().map(parseQuestChat).some((x) => x && x.type === 'took' && sameTitle(x.text, next.title));
+      (said || (after && after.taken) ? took : failed).push(next);
+    }
+  } finally {
+    chat.stop();
   }
   const lines = [];
   if (took.length) lines.push(`Взял задания: ${took.map(quote).join(', ')}`);
@@ -783,20 +838,35 @@ async function giveQuests(bot, npc) {
   const gave = [];
   const nothing = [];
   const lines = [];
-  for (const q of readQuests(bot).quests) {
-    if (q.kind !== 'deliver' || !q.taken || q.done) continue;
-    if (q.items.length && countItems(bot, q.items) === 0) {
-      nothing.push(q);
-      continue;
+  const chat = watchChat(bot);
+  try {
+    for (const q of readQuests(bot).quests) {
+      if (q.kind !== 'deliver' || !q.taken || q.done) continue;
+      if (q.items.length && countItems(bot, q.items) === 0) {
+        nothing.push(q);
+        continue;
+      }
+      chat.take();
+      await clickAndSettle(bot, q.slot);
+      // Сервер пишет: «Вы передали …», «Задание … выполнено», «Вы получаете награду: …». Выполненное задание
+      // в меню может смениться чем-то другим — поэтому чат главнее меню.
+      const said = chat.take().map(parseQuestChat).filter(Boolean);
+      const after = readQuests(bot).quests.find((x) => x.slot === q.slot && sameTitle(x.title, q.title));
+      const done = said.some((x) => x.type === 'done' && sameTitle(x.text, q.title)) || Boolean(after && after.done);
+      const reward = said.filter((x) => x.type === 'reward').map((x) => x.text).join(', ') || null;
+      const handed = said.some((x) => x.type === 'gave');
+      if (done || handed || (after && after.have > q.have)) {
+        let to = after ? after.have : q.have;
+        if (done) to = q.need;
+        gave.push({ slot: q.slot, title: q.title, from: q.have, to, need: q.need, done, reward });
+        const progress = to > q.have ? `: ${q.have} → ${to} из ${q.need}` : '';
+        lines.push(`Сдал в ${quote(q)}${progress}${done ? ' — выполнено' : ''}${reward ? `, награда: ${reward}` : ''}`);
+      } else {
+        lines.push(`${quote(q)}: сервер ничего не взял (нужно: ${q.items.join(', ') || q.goal})`);
+      }
     }
-    await clickAndSettle(bot, q.slot);
-    const after = readQuests(bot).quests.find((x) => x.slot === q.slot) || q;
-    if (after.have > q.have || after.done) {
-      gave.push({ slot: q.slot, title: q.title, from: q.have, to: after.have, need: q.need });
-      lines.push(`Сдал в ${quote(q)}: ${q.have} → ${after.have} из ${q.need}${after.done ? ' — выполнено' : ''}`);
-    } else {
-      lines.push(`${quote(q)}: сервер ничего не взял (нужно: ${q.items.join(', ') || q.goal})`);
-    }
+  } finally {
+    chat.stop();
   }
   if (!gave.length && !lines.length) {
     lines.push(nothing.length
@@ -804,6 +874,191 @@ async function giveQuests(bot, npc) {
       : 'Сдавать нечего: нет взятых заданий «Передайте…»');
   }
   return { ok: true, message: lines, data: { npc, gave } };
+}
+
+// ---------- задания «Передайте…» целиком: склад → NPC → склад наград ----------
+
+const NPC_WARP = '/warp ah'; // где стоят NPC с заданиями (ТЗ)
+const TELEPORT_WAIT_MS = 8000;
+const MAX_STORAGE_CHESTS = 12;
+const HOME_NAME_RE = /^[\p{L}\p{N}_-]{1,32}$/u;
+const lastHomes = new Map(); // ник бота → { storage, rewards }: «#квесты принести» без слов — как в прошлый раз
+
+/**
+ * Написать серверу команду телепорта (/home склад, /warp ah) и дождаться самого телепорта (пакет позиции
+ * или смена мира). Потом постоять, пока вокруг догрузятся чанки с сундуками и NPC.
+ */
+async function teleportBy(bot, cmd) {
+  if (typeof bot.sendCommand !== 'function') throw new CommandError('бот не может писать команды серверу');
+  let moved = false;
+  const onMove = () => {
+    moved = true;
+  };
+  bot.on('forcedMove', onMove);
+  bot.on('respawn', onMove);
+  const chat = watchChat(bot);
+  try {
+    if (!bot.sendCommand(cmd)) throw new CommandError(`не удалось отправить ${cmd}: бот не в сети`);
+    for (let t = 0; t < TELEPORT_WAIT_MS && !moved; t += 100) await bot.actions.wait(100);
+  } finally {
+    bot.removeListener('forcedMove', onMove);
+    bot.removeListener('respawn', onMove);
+    chat.stop();
+  }
+  if (!moved) {
+    const said = chat.lines.filter((l) => /^\s*[|!│]/.test(l)).slice(-2).map((l) => l.replace(/^[\s!|│]+/, '')).join(' / ');
+    throw new CommandError(`после ${cmd} телепорта не было${said ? ` (сервер: «${said}»)` : ''}`);
+  }
+  for (let i = 0; i < 30 && !bot.blockAt(bot.entity.position.offset(0, -1, 0)); i += 1) await bot.actions.wait(100);
+  await bot.actions.wait(800 + Math.floor(Math.random() * 400));
+}
+
+/** NPC рядом? Нет — /warp ah (NPC стоят там) и подождать, пока сервер покажет сущности. */
+async function ensureNpc(bot, npc) {
+  const near = () => {
+    try {
+      return findEntity(bot, npc);
+    } catch (_) {
+      return null;
+    }
+  };
+  if (near()) return;
+  await teleportBy(bot, NPC_WARP);
+  for (let i = 0; i < 30 && !near(); i += 1) await bot.actions.wait(100);
+  if (!near()) throw new CommandError(`после ${NPC_WARP} «${npc}» рядом не видно`);
+}
+
+/** Вторая половина большого сундука (чтобы не открывать его дважды) — как ChestBlock.getConnectedDirection. */
+function chestPartner(block, pos) {
+  let props = {};
+  try {
+    props = typeof block.getProperties === 'function' ? block.getProperties() : {};
+  } catch (_) {
+    return null;
+  }
+  const clockwise = { north: [1, 0], east: [0, 1], south: [-1, 0], west: [0, -1] }[props.facing];
+  if (!clockwise || (props.type !== 'left' && props.type !== 'right')) return null;
+  const [dx, dz] = props.type === 'left' ? clockwise : [-clockwise[0], -clockwise[1]];
+  return pos.offset(dx, 0, dz);
+}
+
+/**
+ * Взять со склада: сундуки в пределах досягаемости (от ближнего); из каждого — по нуждам needs
+ * ([{ test, want, got }], got растёт). Возвращает { taken: имя → сколько, full }.
+ */
+async function takeFromStorage(bot, needs) {
+  const chests = scanBlocks(bot, OPEN_RANGE + 1, (b) => isContainer(b.name)).filter((c) => c.dist <= OPEN_RANGE + 0.5).slice(0, MAX_STORAGE_CHESTS);
+  if (!chests.length) throw new CommandError(`у дома нет сундуков (до ${OPEN_RANGE} блоков от места, куда переносит /home)`);
+  const taken = new Map();
+  const seen = new Set();
+  const key = (p) => `${p.x},${p.y},${p.z}`;
+  let full = false;
+  for (const c of chests) {
+    if (full || needs.every((n) => n.got >= n.want)) break;
+    if (seen.has(key(c.pos))) continue;
+    seen.add(key(c.pos));
+    const partner = chestPartner(c.block, c.pos);
+    if (partner) seen.add(key(partner));
+    const chest = await openStorage(bot, c.pos);
+    try {
+      const w = chest.window;
+      for (const n of needs) {
+        if (n.got >= n.want) continue;
+        const r = await moveStacks(bot, w, storageSlots(w), playerSlots(w), n.test, n.want - n.got);
+        n.got += r.total;
+        for (const [name, count] of r.moved) taken.set(name, (taken.get(name) || 0) + count);
+        if (r.full) {
+          full = true;
+          break;
+        }
+      }
+    } finally {
+      await closeAfter(bot);
+    }
+  }
+  return { taken, full };
+}
+
+/**
+ * «#квесты принести урожай награды»: задания «Передайте…» целиком. У NPC (/warp ah) — взять новые задания и
+ * посчитать, чего не хватает (с учётом инвентаря); /home урожай — взять это из сундуков у дома; /warp ah —
+ * сдать; /home награды — положить награды. Инструменты и остатки для заданий бот оставляет себе.
+ */
+async function bringQuests(bot, npc, storageHome, rewardsHome) {
+  const lines = [];
+  const data = { npc, storage: storageHome, rewards: rewardsHome, needs: [], taken: [], gave: [], stored: [] };
+  try {
+    // 1. Задания.
+    await ensureNpc(bot, npc);
+    let quests;
+    try {
+      await openQuests(bot, npc);
+      const took = await takeQuests(bot, npc);
+      if (took.data.took.length) lines.push([].concat(took.message)[0]);
+      quests = readQuests(bot).quests;
+    } finally {
+      await closeAfter(bot);
+    }
+    const todo = quests.filter((q) => q.kind === 'deliver' && q.taken && !q.done && q.items.length && q.need > q.have);
+    if (!todo.length) {
+      lines.push('Приносить нечего: заданий «Передайте…» нет или все выполнены');
+      return { ok: true, message: lines, data };
+    }
+    // 2. Чего не хватает: нужное минус то, что уже есть в инвентаре.
+    const inv = new Map();
+    for (const it of inventoryItems(bot)) inv.set(it.name, (inv.get(it.name) || 0) + (it.count || 1));
+    const needs = todo.map((q) => {
+      let want = q.need - q.have;
+      for (const id of q.items) {
+        const use = Math.min(want, inv.get(id) || 0);
+        want -= use;
+        if (use) inv.set(id, inv.get(id) - use);
+      }
+      return { q, want, got: 0, test: (it) => q.items.includes(it.name) };
+    });
+    data.needs = needs.map(({ q, want }) => ({ slot: q.slot, title: q.title, missing: q.need - q.have, fetch: want, items: q.items }));
+    lines.push(`Нужно передать: ${needs.map(({ q }) => `${quote(q)} — ${q.need - q.have} (${q.items.join('/')})`).join('; ')}`);
+    // 3. Склад.
+    const fetch = needs.filter((n) => n.want > 0);
+    let taken = new Map();
+    if (fetch.length) {
+      await teleportBy(bot, `/home ${storageHome}`);
+      const r = await takeFromStorage(bot, fetch);
+      taken = r.taken;
+      data.taken = countsData(taken);
+      const short = fetch.filter((n) => n.got < n.want);
+      let line = `Склад (/home ${storageHome}): ${taken.size ? `взял ${countsText(taken)}` : 'подходящего нет'}`;
+      if (short.length) line += `; не хватило: ${short.map((n) => `${quote(n.q)} — ${n.want - n.got}`).join(', ')}`;
+      if (r.full) line += '; инвентарь полон';
+      lines.push(line);
+    }
+    // 4. Сдать.
+    await ensureNpc(bot, npc);
+    let gave;
+    try {
+      await openQuests(bot, npc);
+      gave = await giveQuests(bot, npc);
+    } finally {
+      await closeAfter(bot);
+    }
+    data.gave = gave.data.gave;
+    lines.push(...[].concat(gave.message));
+    // 5. Награды — в сундук у дома наград; инструменты и всё, что ещё пригодится для заданий, — с собой.
+    if (rewardsHome) {
+      const keep = (it) => KEEP_RE.test(it.name) || taken.has(it.name) || needs.some((n) => n.test(it));
+      if (inventoryItems(bot).some((it) => !keep(it))) {
+        await teleportBy(bot, `/home ${rewardsHome}`);
+        const { r } = await putIntoStorage(bot, null, (it) => !keep(it), Infinity);
+        data.stored = countsData(r.moved);
+        lines.push(`Награды (/home ${rewardsHome}): ${r.total ? `положил ${countsText(r.moved)}` : 'ничего не положил'}${r.full ? ' — сундук полон' : ''}`);
+      }
+    }
+    return { ok: true, message: lines, data };
+  } catch (err) {
+    // Что успели — в ответе; дальше — почему остановились.
+    lines.push(`Остановился: ${err && err.message ? err.message : err}`);
+    return { ok: false, code: (err && err.code) || 'failed', message: lines, data };
+  }
 }
 
 /** «#купи сено 2 у Фермер» — купить у NPC в разделе «Покупка». */
@@ -945,11 +1200,17 @@ async function reachBlock(bot, pos) {
   }
 }
 
-/** Открыть сундук (по координатам или ближайший) и вернуть { window, pos, block }; окно остаётся открытым. */
+// «! К сожалению, Вы не можете открывать это в этом месте.» — сундук на чужой (защищённой) территории.
+const NO_OPEN_RE = /не можете открывать|нельзя открывать|не можете использовать это/i;
+
+/**
+ * Открыть сундук и вернуть { window, pos, block }; окно остаётся открытым. at — координаты (слова «X Y Z» или
+ * точка), null — ближайший сундук.
+ */
 async function openStorage(bot, at) {
   let list;
   if (at) {
-    const pos = parseBlockPos(at, bot.entity.position);
+    const pos = Array.isArray(at) ? parseBlockPos(at, bot.entity.position) : new Vec3(Math.floor(at.x), Math.floor(at.y), Math.floor(at.z));
     const block = bot.blockAt(pos);
     if (!block || !isContainer(block.name)) throw new CommandError(`в ${fmtPos(pos)} нет сундука${block ? ` (там ${block.name})` : ''}`);
     const dist = bot.entity.position.distanceTo(pos.offset(0.5, 0.5, 0.5));
@@ -964,9 +1225,21 @@ async function openStorage(bot, at) {
     try {
       await reachBlock(bot, c.pos);
       const before = bot.currentWindow;
-      await bot.actions.activate(c.pos);
-      const w = await waitNewWindow(bot, before, STORAGE_WAIT_MS);
-      if (!w) throw new CommandError(`${storageName(c.block.name)} в ${fmtPos(c.pos)} не открылся`);
+      const chat = watchChat(bot);
+      let w;
+      try {
+        await bot.actions.activate(c.pos);
+        w = await waitNewWindow(bot, before, STORAGE_WAIT_MS);
+      } finally {
+        chat.stop();
+      }
+      if (!w) {
+        const denied = chat.lines.find((l) => NO_OPEN_RE.test(l));
+        if (denied) {
+          throw new CommandError(`${storageName(c.block.name)} в ${fmtPos(c.pos)}: сервер не даёт открыть — «${denied.replace(/^[\s!|│]+/, '')}» (чужая или защищённая территория)`);
+        }
+        throw new CommandError(`${storageName(c.block.name)} в ${fmtPos(c.pos)} не открылся`);
+      }
       if (!isStorageWindow(w)) {
         await closeAfter(bot);
         throw new CommandError(`в ${fmtPos(c.pos)} открылся не сундук, а «${windowTitle(w)}»`);
@@ -1028,18 +1301,23 @@ async function cmdPut({ bot, args, words }) {
     else if (kept.size) why = `в инвентаре только инструменты и броня (${countsText(kept)})`;
     return { ok: false, code: 'not_found', message: `Класть нечего: ${why}`, data: { moved: [], total: 0 } };
   }
+  const { chest, r } = await putIntoStorage(bot, at, test, want);
+  const where = `${storageName(chest.block.name)} ${fmtPos(chest.pos)}`;
+  const notes = [];
+  if (r.full) notes.push('сундук полон');
+  if (r.rejected) notes.push('сервер не дал положить');
+  if (kept.size) notes.push(`оставил себе: ${countsText(kept)}`);
+  const result = { chest: { block: chest.block.name, position: plain(chest.pos) }, moved: countsData(r.moved), total: r.total, full: r.full };
+  if (!r.total) return { ok: false, code: r.full ? 'full' : 'rejected', message: `${where}: ничего не положил — ${notes.join(', ')}`, data: result };
+  return { ok: true, message: `${where}: положил ${countsText(r.moved)}${notes.length ? ` (${notes.join('; ')})` : ''}`, data: result };
+}
+
+/** Открыть сундук (at — как у openStorage) и положить в него то, что подходит под test (до want штук). */
+async function putIntoStorage(bot, at, test, want) {
   const chest = await openStorage(bot, at);
   try {
     const w = chest.window;
-    const where = `${storageName(chest.block.name)} ${fmtPos(chest.pos)}`;
-    const r = await moveStacks(bot, w, playerSlots(w), storageSlots(w), test, want);
-    const notes = [];
-    if (r.full) notes.push('сундук полон');
-    if (r.rejected) notes.push('сервер не дал положить');
-    if (kept.size) notes.push(`оставил себе: ${countsText(kept)}`);
-    const result = { chest: { block: chest.block.name, position: plain(chest.pos) }, moved: countsData(r.moved), total: r.total, full: r.full };
-    if (!r.total) return { ok: false, code: r.full ? 'full' : 'rejected', message: `${where}: ничего не положил — ${notes.join(', ')}`, data: result };
-    return { ok: true, message: `${where}: положил ${countsText(r.moved)}${notes.length ? ` (${notes.join('; ')})` : ''}`, data: result };
+    return { chest, r: await moveStacks(bot, w, playerSlots(w), storageSlots(w), test, want) };
   } finally {
     await closeAfter(bot);
   }
@@ -1182,8 +1460,9 @@ const COMMANDS = [
   {
     name: 'квесты',
     aliases: ['quests', 'задания'],
-    usage: ['#квесты', '#квесты взять', '#квесты сдать', '#квесты Алхимик', '#квесты взять Оружейник'],
-    about: 'задания NPC (по умолчанию Фермер, бот должен быть у /warp ah): показать; взять все новые; сдать предметы из инвентаря',
+    usage: ['#квесты', '#квесты взять', '#квесты сдать', '#квесты принести урожай награды', '#квесты Алхимик', '#квесты взять Оружейник'],
+    about: 'задания NPC (по умолчанию Фермер, у /warp ah): показать; взять все новые; сдать из инвентаря; ' +
+      'принести — всё для «Передайте…» со склада (/home урожай), сдать и сложить награды (/home награды)',
     run: cmdQuests,
   },
   {
