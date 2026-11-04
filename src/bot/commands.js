@@ -1,31 +1,62 @@
 'use strict';
 
-// Команды панели: строка чата, начинающаяся с «#», не уходит на сервер, а выполняется ботом через безопасные
-// действия (src/bot/actions.js). Нужны, чтобы проверить действия руками, пока нет системы задач.
-// Координаты — как в игре: числа или «~» (относительно бота): #goto ~5 ~ ~-3.
+// Команды боту: строка чата панели, начинающаяся с «#», на сервер не уходит — её выполняет бот через безопасные
+// действия (src/bot/actions.js). Писать можно по-русски или по-английски, координаты не обязательны:
+//   #иди ко мне · #иди к Steve · #вперёд 3 · #смотри вниз · #копай · #поставь земля · #открой · #инвентарь
+// Все команды описаны в одном списке (COMMANDS): имена, как писать, что делают. По нему же их сможет вызывать ИИ:
+// catalog() — описание всех команд, runCommand() — выполнить и получить ответ { ok, message, data }.
 
 const { Vec3 } = require('vec3');
+const { FACE_VECTORS } = require('./actions');
 
-const HELP = [
-  '#pos — где бот и куда смотрит',
-  '#look <поворот> <наклон> — повернуть голову (градусы, как в F3: наклон вниз — плюс)',
-  '#goto <x> <y> <z> [бег] — дойти по прямой (поиска пути пока нет, до 64 блоков)',
-  '#dig <x> <y> <z> — сломать блок',
-  '#place <x> <y> <z> [предмет] — поставить блок (например, #place ~1 ~ ~ cobblestone)',
-  '#use <x> <y> <z> — нажать на блок (сундук, дверь, кнопка)',
-  '#equip <предмет> — взять предмет в руку',
-  '#stop — остановить действие',
-  '#help — этот список',
-];
-
-const MAX_WALK = 64;
+const MAX_WALK = 64; // по прямой дальше не ходим (поиска пути пока нет)
+const MAX_STEPS = 32; // «#вперёд N»: не больше
+const NEAR_PLAYERS = 32; // «ко мне»: кого считаем рядом
+const NEAR_CONTAINERS = 8; // «#рядом»: где искать сундуки
+const OPEN_RANGE = 4; // «#открой»: до какого сундука дотянуться
+const PLAYER_STOP = 1.6; // на каком расстоянии от игрока остановиться
 
 class CommandError extends Error {}
+
+const norm = (s) => String(s === undefined || s === null ? '' : s).trim().toLowerCase().replace(/ё/g, 'е');
+const round = (n, d = 1) => Number(n).toFixed(d);
+const toDeg = (rad) => (rad * 180) / Math.PI;
+const toRad = (deg) => (deg * Math.PI) / 180;
+const clampPitch = (p) => Math.max(-90, Math.min(90, p));
+const fmtPos = (p) => `${p.x} ${p.y} ${p.z}`;
+const plain = (v) => ({ x: v.x, y: v.y, z: v.z });
+// Углы как в F3: поворот 0 — юг, 90 — запад, 180 — север, -90 — восток; наклон вниз — плюс.
+const f3Yaw = (yawRad) => ((((180 - toDeg(yawRad) + 180) % 360) + 360) % 360) - 180;
+const f3Pitch = (pitchRad) => -toDeg(pitchRad);
+const fromF3 = (yaw, pitch) => [toRad(180 - yaw), toRad(-pitch)];
+
+// ---------- стороны света и направления ----------
+
+const CARDINALS = [
+  { name: 'юг', yaw: 0, dir: new Vec3(0, 0, 1) },
+  { name: 'запад', yaw: 90, dir: new Vec3(-1, 0, 0) },
+  { name: 'север', yaw: 180, dir: new Vec3(0, 0, -1) },
+  { name: 'восток', yaw: -90, dir: new Vec3(1, 0, 0) },
+];
+const cardinalOf = (yaw) => CARDINALS[((Math.round(yaw / 90) % 4) + 4) % 4];
+const CARDINAL_WORDS = { юг: 0, запад: 90, север: 180, восток: -90, south: 0, west: 90, north: 180, east: -90 };
+// Повороты относительно того, куда бот смотрит сейчас (направо — по часовой стрелке, как в игре).
+const TURN_WORDS = { вперед: 0, прямо: 0, forward: 0, назад: 180, back: 180, налево: -90, влево: -90, left: -90, направо: 90, вправо: 90, right: 90 };
+const SPRINT_RE = /^(бегом|бег|sprint|run)$/;
+
+/** Куда бот смотрит, по сторонам света (по взгляду, известному серверу). */
+const facing = (bot) => cardinalOf(f3Yaw(bot.serverView.yaw));
+
+// ---------- координаты ----------
+
+const COORD_RE = /^(~(-?\d+([.,]\d+)?)?|-?\d+([.,]\d+)?)$/;
+const isCoords = (t) => t.length >= 3 && t.slice(0, 3).every((x) => COORD_RE.test(x));
+const isNumber = (t) => COORD_RE.test(String(t));
 
 function parseCoord(token, base) {
   const t = String(token === undefined ? '' : token).trim();
   if (t.startsWith('~')) {
-    const rest = t.slice(1);
+    const rest = t.slice(1).replace(',', '.');
     const add = rest === '' ? 0 : Number(rest);
     if (!Number.isFinite(add)) throw new CommandError(`непонятная координата «${t}»`);
     return base + add;
@@ -35,116 +66,495 @@ function parseCoord(token, base) {
   return v;
 }
 
-/** Точка из трёх слов: блочные координаты (целые), «~» — от клетки, где стоит бот. */
-function parseBlockPos(args, botPos) {
-  if (args.length < 3) throw new CommandError('нужны три координаты: x y z');
+/** Блок по трём словам: целые координаты, «~» — от клетки, где стоит бот. */
+function parseBlockPos(tokens, botPos) {
+  if (tokens.length < 3) throw new CommandError('нужны три координаты: x y z');
   const base = botPos.floored();
-  return new Vec3(Math.floor(parseCoord(args[0], base.x)), Math.floor(parseCoord(args[1], base.y)), Math.floor(parseCoord(args[2], base.z)));
+  return new Vec3(Math.floor(parseCoord(tokens[0], base.x)), Math.floor(parseCoord(tokens[1], base.y)), Math.floor(parseCoord(tokens[2], base.z)));
 }
 
-const round = (n, d = 1) => Number(n).toFixed(d);
-const toDeg = (rad) => (rad * 180) / Math.PI;
-// Углы как в F3: поворот 0 — юг, 90 — запад; наклон вниз — плюс.
-const f3Yaw = (yawRad) => (((180 - toDeg(yawRad) + 180) % 360) + 360) % 360 - 180;
-const f3Pitch = (pitchRad) => -toDeg(pitchRad);
+/** Точка, куда идти: целые координаты — центр блока, как в игре. */
+function parseWalkPoint(tokens, botPos) {
+  const p = new Vec3(parseCoord(tokens[0], botPos.x), parseCoord(tokens[1], botPos.y), parseCoord(tokens[2], botPos.z));
+  if (/^-?\d+$/.test(tokens[0])) p.x += 0.5;
+  if (/^-?\d+$/.test(tokens[2])) p.z += 0.5;
+  return p;
+}
+
+/** Клетка рядом с ботом по слову: впереди (на уровне ног), под (под ногами), над (над головой). */
+function relativeBlock(bot, word) {
+  const feet = bot.entity.position.floored();
+  const w = norm(word);
+  if (w === 'впереди' || w === 'вперед' || w === 'front') return feet.plus(facing(bot).dir);
+  if (w === 'под' || w === 'снизу' || w === 'вниз' || w === 'below' || w === 'down') return feet.offset(0, -1, 0);
+  if (w === 'над' || w === 'сверху' || w === 'вверх' || w === 'above' || w === 'up') return feet.offset(0, 2, 0);
+  return null;
+}
+
+// ---------- игроки ----------
+
+function otherPlayers(bot) {
+  return Object.values(bot.entities || {}).filter((e) => e && e.type === 'player' && e !== bot.entity && e.username && e.position);
+}
+
+function playersNear(bot, radius) {
+  const me = bot.entity.position;
+  return otherPlayers(bot)
+    .map((e) => ({ entity: e, dist: e.position.distanceTo(me) }))
+    .filter((p) => p.dist <= radius)
+    .sort((a, b) => a.dist - b.dist);
+}
+
+function findPlayer(bot, nick) {
+  const n = norm(nick);
+  const e = otherPlayers(bot).find((x) => norm(x.username) === n);
+  if (e) return e;
+  const known = bot.players && Object.keys(bot.players).find((k) => norm(k) === n);
+  if (known) throw new CommandError(`${known} далеко — бот его не видит`);
+  throw new CommandError(`игрока ${nick} нет рядом и на сервере`);
+}
+
+/** «Ко мне»: единственный игрок рядом. Если рядом несколько — нужно назвать ник. */
+function resolveMe(bot) {
+  const near = playersNear(bot, NEAR_PLAYERS);
+  if (!near.length) throw new CommandError(`рядом никого нет (в пределах ${NEAR_PLAYERS} блоков) — укажи ник: #иди к <ник>`);
+  if (near.length > 1) {
+    const list = near.slice(0, 5).map((p) => `${p.entity.username} (${Math.round(p.dist)} бл.)`).join(', ');
+    throw new CommandError(`рядом несколько игроков: ${list} — скажи, к кому: #иди к ${near[0].entity.username}`);
+  }
+  return near[0].entity;
+}
+
+function directionTo(bot, pos) {
+  const d = pos.minus(bot.entity.position);
+  return cardinalOf(f3Yaw(Math.atan2(-d.x, -d.z))).name;
+}
+
+// ---------- предметы ----------
+
+// Русские названия частых предметов: слово → точные имена или шаблон имени.
+const ITEM_WORDS = [
+  [/^земл/, ['dirt', 'grass_block', 'coarse_dirt', 'rooted_dirt']],
+  [/^дерн/, ['grass_block']],
+  [/^булыжн/, ['cobblestone', 'cobbled_deepslate']],
+  [/^(камен|камн)/, ['stone', 'cobblestone', 'deepslate']],
+  [/^досок|^доск/, /_planks$/],
+  [/^бревн/, /_log$/],
+  [/^стекл/, ['glass']],
+  [/^песо?к/, ['sand', 'red_sand']],
+  [/^грави/, ['gravel']],
+  [/^обсидиан/, ['obsidian']],
+  [/^шерст/, /_wool$/],
+  [/^кирк/, /_pickaxe$/],
+  [/^топор/, /_axe$/],
+  [/^лопат/, /_shovel$/],
+  [/^меч/, /_sword$/],
+  [/^мотыг/, /_hoe$/],
+  [/^факел/, ['torch']],
+  [/^сундук/, ['chest']],
+  [/^верстак/, ['crafting_table']],
+  [/^печ/, ['furnace']],
+  [/^ведр/, /bucket$/],
+  [/^хлеб/, ['bread']],
+  [/^(тнт|динамит)/, ['tnt']],
+  [/^лестниц/, ['ladder']],
+  [/^(ступен|ступеньк)/, /_stairs$/],
+  [/^плит/, /_slab$/],
+];
+const TOOL_TIERS = ['netherite', 'diamond', 'iron', 'golden', 'stone', 'wooden'];
+const tierOf = (name) => {
+  const i = TOOL_TIERS.findIndex((t) => name.startsWith(`${t}_`));
+  return i < 0 ? TOOL_TIERS.length : i;
+};
+
+function inventoryItems(bot) {
+  const inv = bot.inventory;
+  if (!inv) return [];
+  if (typeof inv.items === 'function') return inv.items();
+  return (inv.slots || []).slice(9, 45).filter(Boolean);
+}
+
+function inventorySummary(items, limit = 12) {
+  const counts = new Map();
+  for (const it of items) counts.set(it.name, (counts.get(it.name) || 0) + (it.count || 1));
+  const list = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const text = list.slice(0, limit).map(([n, c]) => `${n}×${c}`).join(', ');
+  return { list, text: list.length > limit ? `${text} и ещё ${list.length - limit}` : text };
+}
+
+/** Предмет из инвентаря по имени: точное имя (cobblestone), по-русски (земля, кирка) или часть имени (planks). */
+function findItem(bot, query) {
+  const q = norm(query).replace(/^minecraft:/, '').replace(/\s+/g, '_');
+  const items = inventoryItems(bot);
+  const best = (list) => list.sort((a, b) => tierOf(a.name) - tierOf(b.name) || (b.count || 1) - (a.count || 1))[0];
+  let found = items.find((it) => it.name === q);
+  if (!found) {
+    // По любому слову: «дубовые доски» — по «доски».
+    const parts = q.split('_');
+    const word = ITEM_WORDS.find(([re]) => parts.some((part) => re.test(part)));
+    if (word) {
+      const m = word[1];
+      found = best(items.filter((it) => (Array.isArray(m) ? m.includes(it.name) : m.test(it.name))));
+    }
+  }
+  if (!found) found = items.find((it) => norm(it.displayName).replace(/\s+/g, '_') === q);
+  if (!found && q.length >= 3) found = best(items.filter((it) => it.name.includes(q)));
+  if (found) return found;
+  const inv = inventorySummary(items).text;
+  throw new CommandError(`у бота нет «${query}». ${inv ? `В инвентаре: ${inv}` : 'Инвентарь пуст'}`);
+}
+
+// ---------- сундуки ----------
+
+const isContainer = (name) => /^(chest|trapped_chest|barrel|ender_chest)$|shulker_box$/.test(name || '');
+
+/** Блоки вокруг бота (куб radius), подходящие под match, — от ближнего к дальнему. */
+function scanBlocks(bot, radius, match) {
+  const c = bot.entity.position.floored();
+  const eye = bot.entity.position.offset(0, 1.62, 0);
+  const found = [];
+  for (let x = -radius; x <= radius; x += 1) {
+    for (let y = -radius; y <= radius; y += 1) {
+      for (let z = -radius; z <= radius; z += 1) {
+        const pos = c.offset(x, y, z);
+        const block = bot.blockAt(pos);
+        if (block && match(block)) found.push({ block, pos, dist: eye.distanceTo(pos.offset(0.5, 0.5, 0.5)) });
+      }
+    }
+  }
+  return found.sort((a, b) => a.dist - b.dist);
+}
+
+/** После нажатия: если открылось окно (сундук), показать содержимое и закрыть, как человек. */
+async function closeAfterLook(bot) {
+  // Сервер открывает окно не мгновенно: ждём до секунды (по тикам бота).
+  for (let i = 0; i < 20 && !bot.currentWindow; i += 1) await bot.actions.wait(50);
+  const window = bot.currentWindow;
+  if (!window) return null;
+  const items = typeof window.containerItems === 'function' ? window.containerItems() : [];
+  const summary = inventorySummary(items, 8);
+  try {
+    await bot.actions.wait(700 + Math.random() * 700); // «посмотреть» и закрыть
+  } finally {
+    // Закрываем, даже если ожидание прервали: открытым сундук не оставляем.
+    if (bot.currentWindow === window && typeof bot.closeWindow === 'function') bot.closeWindow(window);
+  }
+  return { title: window.title ? String(window.title) : '', items: summary.list.map(([name, count]) => ({ name, count })), text: summary.text };
+}
+
+// ---------- команды ----------
+
+async function cmdHelp() {
+  return { ok: true, message: ['Команды боту (пишутся здесь, на сервер не уходят):', ...COMMANDS.map((c) => `${c.usage[0]} — ${c.about}`)], data: catalog() };
+}
+
+async function cmdWhere({ bot }) {
+  const p = bot.entity.position;
+  const v = bot.serverView;
+  const yaw = f3Yaw(v.yaw);
+  const pitch = f3Pitch(v.pitch);
+  const hit = bot.actions.lookedAtBlock();
+  const health = bot.health === undefined ? null : Math.round(bot.health);
+  const lines = [
+    `Бот: ${round(p.x)} ${round(p.y)} ${round(p.z)}, смотрит на ${cardinalOf(yaw).name} (${round(yaw)} / ${round(pitch)})` +
+      `${health === null ? '' : `, здоровье ${health}, сытость ${bot.food}`}`,
+  ];
+  if (hit) lines.push(`Видит блок ${hit.block.name} в ${fmtPos(hit.position)}`);
+  if (bot.actions.current) lines.push(`Сейчас: ${bot.actions.current}`);
+  return {
+    ok: true,
+    message: lines,
+    data: {
+      position: plain(p), yaw, pitch, facing: cardinalOf(yaw).name, health, food: bot.food === undefined ? null : bot.food,
+      lookingAt: hit ? { block: hit.block.name, position: plain(hit.position) } : null, busy: bot.actions.current,
+    },
+  };
+}
+
+async function cmdLook({ bot, args, words }) {
+  const a = bot.actions;
+  const v = bot.serverView;
+  if (!args.length) throw new CommandError('куда смотреть? Например: #смотри вниз, #смотри на Steve, #смотри 90 0');
+  const skip = words[0] === 'на' ? 1 : 0;
+  const raw = args.slice(skip);
+  const w = words.slice(skip);
+  let what;
+  if (isCoords(raw)) {
+    const pos = parseBlockPos(raw, bot.entity.position);
+    await a.lookAt(pos.offset(0.5, 0.5, 0.5));
+    what = `на блок ${fmtPos(pos)}`;
+  } else if (raw.length >= 2 && isNumber(raw[0]) && isNumber(raw[1])) {
+    const yaw = parseCoord(raw[0], f3Yaw(v.yaw));
+    const pitch = clampPitch(parseCoord(raw[1], f3Pitch(v.pitch)));
+    await a.look(...fromF3(yaw, pitch));
+    what = 'в заданную сторону';
+  } else if (w[0] === 'вниз' || w[0] === 'down') {
+    await a.look(...fromF3(f3Yaw(v.yaw), 90));
+    what = 'вниз';
+  } else if (w[0] === 'вверх' || w[0] === 'up') {
+    await a.look(...fromF3(f3Yaw(v.yaw), -90));
+    what = 'вверх';
+  } else if (w[0] in TURN_WORDS) {
+    // Относительно нынешнего взгляда, как поворачивается человек; «прямо» — голова ровно, в ту же сторону.
+    await a.look(...fromF3(f3Yaw(v.yaw) + TURN_WORDS[w[0]], 0));
+    what = TURN_WORDS[w[0]] === 0 ? 'прямо' : w[0];
+  } else if (w[0] in CARDINAL_WORDS) {
+    await a.look(...fromF3(CARDINAL_WORDS[w[0]], 0));
+    what = `на ${cardinalOf(CARDINAL_WORDS[w[0]]).name}`;
+  } else {
+    const e = findPlayer(bot, raw[0]);
+    await a.lookAt(e.position.offset(0, (e.height || 1.8) * 0.9, 0));
+    what = `на ${e.username}`;
+  }
+  const now = { yaw: f3Yaw(v.yaw), pitch: f3Pitch(v.pitch) };
+  return { ok: true, message: `Смотрит ${what}: ${round(now.yaw)} / ${round(now.pitch)}`, data: now };
+}
+
+async function goToPoint(bot, target, sprint) {
+  const dist = bot.entity.position.distanceTo(target);
+  if (dist > MAX_WALK) throw new CommandError(`слишком далеко (${Math.round(dist)} блоков): по прямой — не больше ${MAX_WALK}`);
+  await bot.actions.walkTo(target, { sprint });
+  const p = bot.entity.position;
+  return { ok: true, message: `Дошёл до ${round(p.x)} ${round(p.y)} ${round(p.z)}`, data: { position: plain(p) } };
+}
+
+async function goToPlayer(bot, e, sprint) {
+  const dist = bot.entity.position.distanceTo(e.position);
+  if (dist > MAX_WALK) throw new CommandError(`${e.username} слишком далеко (${Math.round(dist)} блоков)`);
+  await bot.actions.walkTo(e.position.clone(), { range: PLAYER_STOP, sprint });
+  if (bot.entities && bot.entities[e.id]) await bot.actions.lookAt(e.position.offset(0, (e.height || 1.8) * 0.9, 0)); // и посмотреть на него
+  return { ok: true, message: `Подошёл к ${e.username}`, data: { player: e.username, position: plain(bot.entity.position) } };
+}
+
+async function walkDirection(bot, turn, tokens, sprint) {
+  const n = tokens.find((t) => /^\d+$/.test(t));
+  const steps = n === undefined ? 1 : Math.min(MAX_STEPS, Math.max(1, parseInt(n, 10)));
+  const side = cardinalOf(facing(bot).yaw + turn);
+  const start = bot.entity.position.floored().offset(0.5, 0, 0.5);
+  const target = start.plus(side.dir.scaled(steps));
+  await bot.actions.walkTo(target, { sprint });
+  return { ok: true, message: `Прошёл ${steps} бл. на ${side.name}`, data: { steps, direction: side.name, position: plain(bot.entity.position) } };
+}
+
+async function cmdGo({ bot, args, words }) {
+  const sprint = words.some((w) => SPRINT_RE.test(w));
+  const rest = args.filter((_, i) => !SPRINT_RE.test(words[i]));
+  const rw = rest.map(norm);
+  if (!rest.length) throw new CommandError('куда идти? Например: #иди ко мне, #иди к Steve, #вперёд 3, #иди X Y Z');
+  if ((rw[0] === 'ко' && rw[1] === 'мне') || rw[0] === 'сюда') return goToPlayer(bot, resolveMe(bot), sprint);
+  if (rw[0] === 'к' && rest[1]) return goToPlayer(bot, findPlayer(bot, rest[1]), sprint);
+  if (rw[0] in TURN_WORDS) return walkDirection(bot, TURN_WORDS[rw[0]], rest.slice(1), sprint);
+  if (isCoords(rest)) return goToPoint(bot, parseWalkPoint(rest, bot.entity.position), sprint);
+  if (/^[a-z0-9_]{3,16}$/i.test(rest[0])) return goToPlayer(bot, findPlayer(bot, rest[0]), sprint);
+  throw new CommandError(`не понял, куда идти: «${rest.join(' ')}». Например: #иди ко мне, #иди к Steve, #иди X Y Z`);
+}
+
+const walkCommand = (turn) => async ({ bot, args, words }) => walkDirection(bot, turn, args, words.some((w) => SPRINT_RE.test(w)));
+
+/** Блок, на который смотрит бот, или ошибка с подсказкой. */
+function lookedAtOrThrow(bot) {
+  const hit = bot.actions.lookedAtBlock();
+  if (!hit) throw new CommandError('бот не видит блока рядом — сначала поверни его (#смотри вниз) или укажи X Y Z');
+  return hit;
+}
+
+async function cmdDig({ bot, args, words }) {
+  let pos;
+  if (isCoords(args)) pos = parseBlockPos(args, bot.entity.position);
+  else if (words.length) {
+    pos = relativeBlock(bot, words[0]);
+    if (!pos) throw new CommandError(`не понял, что копать: «${args.join(' ')}». Например: #копай, #копай впереди, #копай под, #копай X Y Z`);
+  } else pos = lookedAtOrThrow(bot).position;
+  const block = bot.blockAt(pos);
+  const name = block ? block.name : 'блок';
+  const r = await bot.actions.dig(pos);
+  return { ok: true, message: `Сломал ${name} в ${fmtPos(pos)} (${r.ticks} тиков)`, data: { block: name, position: plain(pos), ticks: r.ticks } };
+}
+
+async function cmdPlace({ bot, args, words }) {
+  let pos;
+  let itemTokens;
+  if (isCoords(args)) {
+    pos = parseBlockPos(args, bot.entity.position);
+    itemTokens = args.slice(3);
+  } else if (words.length && relativeBlock(bot, words[0])) {
+    if (relativeBlock(bot, words[0]).y < bot.entity.position.floored().y) throw new CommandError('ставить блок себе под ноги пока не умею');
+    pos = relativeBlock(bot, words[0]);
+    itemTokens = args.slice(1);
+  } else {
+    const hit = lookedAtOrThrow(bot);
+    pos = hit.position.plus(FACE_VECTORS[hit.face]); // клетка перед гранью, на которую смотрит бот
+    itemTokens = args;
+  }
+  const item = itemTokens.length ? findItem(bot, itemTokens.join(' ')).name : undefined;
+  const r = await bot.actions.place(pos, { item });
+  const placed = bot.blockAt(pos);
+  const name = placed ? placed.name : item || 'блок';
+  return { ok: true, message: `Поставил ${name} в ${fmtPos(pos)}`, data: { block: name, position: plain(pos), against: plain(r.against) } };
+}
+
+async function useBlock(bot, pos) {
+  const block = bot.blockAt(pos);
+  await bot.actions.activate(pos);
+  const opened = await closeAfterLook(bot);
+  const name = block ? block.name : 'блок';
+  if (!opened) return { ok: true, message: `Нажал на ${name} в ${fmtPos(pos)}`, data: { block: name, position: plain(pos), opened: null } };
+  return {
+    ok: true,
+    message: `Открыл ${name} в ${fmtPos(pos)}: ${opened.text || 'пусто'} — и закрыл`,
+    data: { block: name, position: plain(pos), opened },
+  };
+}
+
+async function cmdUse({ bot, args }) {
+  const pos = isCoords(args) ? parseBlockPos(args, bot.entity.position) : lookedAtOrThrow(bot).position;
+  return useBlock(bot, pos);
+}
+
+async function cmdOpen({ bot, args }) {
+  if (isCoords(args)) return useBlock(bot, parseBlockPos(args, bot.entity.position));
+  const near = scanBlocks(bot, OPEN_RANGE + 1, (b) => isContainer(b.name)).filter((c) => c.dist <= OPEN_RANGE + 0.5);
+  if (!near.length) throw new CommandError(`рядом нет сундука (до ${OPEN_RANGE} блоков) — подойди ближе или укажи X Y Z`);
+  let lastError = null;
+  for (const c of near.slice(0, 3)) {
+    try {
+      return await useBlock(bot, c.pos);
+    } catch (err) {
+      if (err && (err.code === 'replaced' || err.code === 'stopped')) throw err;
+      lastError = err; // этот не виден — пробуем следующий
+    }
+  }
+  throw lastError;
+}
+
+async function cmdEquip({ bot, args }) {
+  if (!args.length) throw new CommandError('что взять? Например: #возьми кирка, #возьми земля, #возьми cobblestone');
+  const item = findItem(bot, args.join(' '));
+  await bot.actions.equip(item.name);
+  return { ok: true, message: `В руке: ${bot.heldItem ? bot.heldItem.name : item.name}`, data: { item: item.name } };
+}
+
+async function cmdInventory({ bot }) {
+  const items = inventoryItems(bot);
+  const s = inventorySummary(items, 20);
+  const held = bot.heldItem ? bot.heldItem.name : null;
+  return {
+    ok: true,
+    message: [`В руке: ${held || 'ничего'}`, items.length ? `Инвентарь: ${s.text}` : 'Инвентарь пуст'],
+    data: { held, items: s.list.map(([name, count]) => ({ name, count })) },
+  };
+}
+
+async function cmdNearby({ bot }) {
+  const players = playersNear(bot, 64).slice(0, 8);
+  const chests = scanBlocks(bot, NEAR_CONTAINERS, (b) => isContainer(b.name)).slice(0, 5);
+  const lines = [];
+  lines.push(players.length
+    ? `Игроки: ${players.map((p) => `${p.entity.username} — ${Math.round(p.dist)} бл. на ${directionTo(bot, p.entity.position)}`).join(', ')}`
+    : 'Игроков рядом нет');
+  lines.push(chests.length
+    ? `Сундуки: ${chests.map((c) => `${c.block.name} в ${fmtPos(c.pos)} (${Math.round(c.dist)} бл.)`).join(', ')}`
+    : `Сундуков рядом нет (до ${NEAR_CONTAINERS} блоков)`);
+  return {
+    ok: true,
+    message: lines,
+    data: {
+      players: players.map((p) => ({ name: p.entity.username, distance: Math.round(p.dist * 10) / 10, position: plain(p.entity.position) })),
+      containers: chests.map((c) => ({ block: c.block.name, position: plain(c.pos), distance: Math.round(c.dist * 10) / 10 })),
+    },
+  };
+}
+
+async function cmdStop({ bot }) {
+  const had = bot.actions.stop();
+  return { ok: true, message: had ? 'Остановлено' : 'Бот ничего не делал', data: { stopped: had } };
+}
 
 /**
- * Выполнить команду. log(level, text) — куда писать результат (консоль панели).
- * @returns {Promise<boolean>} true — команда понята (даже если действие не удалось)
+ * Все команды. name — главное имя (по-русски), aliases — другие написания, usage — как писать (первая строка —
+ * главная форма), about — что делает. observe — только смотрит, ничего не меняет.
  */
-async function runCommand(bot, line, log) {
-  const [rawName, ...args] = String(line).trim().slice(1).split(/\s+/);
-  const name = (rawName || '').toLowerCase();
-  if (!bot || !bot.entity) {
-    log('warn', 'Команда не выполнена: бот не в мире');
-    return true;
-  }
-  if (!bot.actions) {
-    log('warn', 'Команда не выполнена: действия работают только со своей физикой бота');
-    return true;
-  }
-  const a = bot.actions;
-  try {
-    switch (name) {
-      case '':
-      case 'help':
-      case 'помощь':
-        log('info', 'Команды бота (пишутся в строке чата, на сервер не уходят):');
-        for (const line of HELP) log('info', line);
-        return true;
-      case 'pos': {
-        const p = bot.entity.position;
-        const v = bot.serverView;
-        log('info', `Бот: ${round(p.x, 2)} ${round(p.y, 2)} ${round(p.z, 2)}, взгляд ${round(f3Yaw(v.yaw))} / ${round(f3Pitch(v.pitch))}` +
-          `${a.current ? `, сейчас: ${a.current}` : ''}`);
-        const hit = a.lookedAtBlock();
-        if (hit) log('info', `Смотрит на ${hit.block.name} в ${hit.position.x} ${hit.position.y} ${hit.position.z}`);
-        return true;
-      }
-      case 'look': {
-        if (args.length < 2) throw new CommandError('нужно два числа: поворот и наклон, например #look 90 0');
-        const yawF3 = parseCoord(args[0], f3Yaw(bot.serverView.yaw));
-        const pitchF3 = Math.max(-90, Math.min(90, parseCoord(args[1], f3Pitch(bot.serverView.pitch))));
-        await a.look(((180 - yawF3) * Math.PI) / 180, (-pitchF3 * Math.PI) / 180);
-        // Фактический взгляд: из-за шага мыши (0,15°) он может отличаться от заданного на долю градуса.
-        log('ok', `Повернулся: ${round(f3Yaw(bot.serverView.yaw))} / ${round(f3Pitch(bot.serverView.pitch))}`);
-        return true;
-      }
-      case 'goto': {
-        const base = bot.entity.position;
-        if (args.length < 3) throw new CommandError('нужны три координаты: x y z');
-        const target = new Vec3(parseCoord(args[0], base.x), parseCoord(args[1], base.y), parseCoord(args[2], base.z));
-        // Целые координаты — центр блока, как в игре.
-        for (const k of ['x', 'z']) if (/^-?\d+$/.test(args[k === 'x' ? 0 : 2])) target[k] += 0.5;
-        const dist = base.distanceTo(target);
-        if (dist > MAX_WALK) throw new CommandError(`слишком далеко (${Math.round(dist)} блоков): по прямой — не больше ${MAX_WALK}`);
-        const sprint = args.slice(3).some((w) => /^(бег|sprint|run)$/i.test(w));
-        log('info', `Иду к ${round(target.x)} ${round(target.y)} ${round(target.z)}${sprint ? ' бегом' : ''}…`);
-        await a.walkTo(target, { sprint });
-        log('ok', 'Дошёл');
-        return true;
-      }
-      case 'dig': {
-        const pos = parseBlockPos(args, bot.entity.position);
-        const res = await a.dig(pos);
-        log('ok', `Сломал блок ${pos.x} ${pos.y} ${pos.z} (грань: ${res.face}, ${res.ticks} тиков)`);
-        return true;
-      }
-      case 'place': {
-        const pos = parseBlockPos(args, bot.entity.position);
-        const res = await a.place(pos, { item: args[3] });
-        log('ok', `Поставил блок в ${pos.x} ${pos.y} ${pos.z} (опора: ${res.against.x} ${res.against.y} ${res.against.z}, грань: ${res.face})`);
-        return true;
-      }
-      case 'use': {
-        const pos = parseBlockPos(args, bot.entity.position);
-        const res = await a.activate(pos);
-        log('ok', `Нажал на ${res.block} в ${pos.x} ${pos.y} ${pos.z}`);
-        return true;
-      }
-      case 'equip': {
-        if (!args[0]) throw new CommandError('какой предмет? например #equip iron_pickaxe');
-        await a.equip(args[0]);
-        log('ok', `В руке: ${bot.heldItem ? bot.heldItem.name : 'ничего'}`);
-        return true;
-      }
-      case 'stop': {
-        const had = a.stop();
-        log(had ? 'ok' : 'info', had ? 'Остановлено' : 'Бот ничего не делал');
-        return true;
-      }
-      default:
-        log('warn', `Неизвестная команда «#${rawName}». Список: #help`);
-        return true;
-    }
-  } catch (err) {
-    if (err && (err.code === 'replaced' || err.code === 'stopped')) {
-      log('info', `#${name}: ${err.message}`);
-    } else {
-      log('error', `#${name}: ${err && err.message ? err.message : err}`);
-    }
-    return true;
-  }
+const COMMANDS = [
+  { name: 'помощь', aliases: ['help', 'команды', '?'], usage: ['#помощь'], about: 'список команд', observe: true, needsWorld: false, run: cmdHelp },
+  { name: 'где', aliases: ['pos', 'позиция', 'координаты'], usage: ['#где'], about: 'где бот, куда смотрит, здоровье, на какой блок смотрит', observe: true, run: cmdWhere },
+  {
+    name: 'смотри',
+    aliases: ['look', 'посмотри', 'повернись'],
+    usage: ['#смотри на <ник>', '#смотри вниз | вверх | прямо | налево | направо | назад', '#смотри север | юг | запад | восток', '#смотри X Y Z', '#смотри <поворот> <наклон>'],
+    about: 'повернуть голову: на игрока, в сторону, на блок или на угол (как в F3)',
+    run: cmdLook,
+  },
+  {
+    name: 'иди',
+    aliases: ['goto', 'go', 'подойди'],
+    usage: ['#иди ко мне', '#иди к <ник>', '#иди X Y Z [бегом]', '#иди вперёд 3 [бегом]'],
+    about: 'дойти по прямой (поиска пути пока нет — обходить ямы и стены не умеет)',
+    run: cmdGo,
+  },
+  { name: 'вперёд', aliases: ['forward'], usage: ['#вперёд 3 [бегом]'], about: 'пройти N блоков вперёд', run: walkCommand(0) },
+  { name: 'назад', aliases: ['back'], usage: ['#назад 2'], about: 'развернуться и пройти N блоков', run: walkCommand(180) },
+  { name: 'налево', aliases: ['влево', 'left'], usage: ['#налево 2'], about: 'повернуть налево и пройти N блоков', run: walkCommand(-90) },
+  { name: 'направо', aliases: ['вправо', 'right'], usage: ['#направо 2'], about: 'повернуть направо и пройти N блоков', run: walkCommand(90) },
+  {
+    name: 'копай',
+    aliases: ['dig', 'сломай', 'ломай'],
+    usage: ['#копай', '#копай впереди | под | над', '#копай X Y Z'],
+    about: 'сломать блок: на который смотрит, рядом или по координатам',
+    run: cmdDig,
+  },
+  {
+    name: 'поставь',
+    aliases: ['place', 'построй'],
+    usage: ['#поставь [предмет]', '#поставь впереди [предмет]', '#поставь X Y Z [предмет]'],
+    about: 'поставить блок туда, куда смотрит (или впереди, или по координатам); предмет — например, земля',
+    run: cmdPlace,
+  },
+  { name: 'нажми', aliases: ['use', 'используй'], usage: ['#нажми', '#нажми X Y Z'], about: 'нажать на блок: дверь, рычаг, кнопку (сундук откроет и закроет)', run: cmdUse },
+  { name: 'открой', aliases: ['open'], usage: ['#открой', '#открой X Y Z'], about: 'открыть ближайший сундук, показать, что внутри, и закрыть', run: cmdOpen },
+  { name: 'возьми', aliases: ['equip', 'вруку'], usage: ['#возьми <предмет>'], about: 'взять в руку; можно по-русски: земля, булыжник, доски, кирка, меч…', run: cmdEquip },
+  { name: 'инвентарь', aliases: ['inv', 'инв'], usage: ['#инвентарь'], about: 'что у бота в руке и в инвентаре', observe: true, run: cmdInventory },
+  { name: 'рядом', aliases: ['near', 'кто'], usage: ['#рядом'], about: 'игроки и сундуки поблизости', observe: true, run: cmdNearby },
+  { name: 'стоп', aliases: ['stop', 'хватит', 'стой'], usage: ['#стоп'], about: 'остановить действие', run: cmdStop },
+];
+
+function findCommand(word) {
+  const w = norm(word);
+  return COMMANDS.find((c) => norm(c.name) === w || c.aliases.some((a) => norm(a) === w)) || null;
 }
 
-module.exports = { runCommand, parseCoord, parseBlockPos, HELP, f3Yaw, f3Pitch };
+/** Описание всех команд (для ИИ и справки): имя, другие имена, как писать, что делает. */
+function catalog() {
+  return COMMANDS.map(({ name, aliases, usage, about, observe }) => ({ name, aliases: [...aliases], usage: [...usage], about, observe: Boolean(observe) }));
+}
+
+/**
+ * Выполнить строку с командой. log(level, text) — консоль панели (каждая строка ответа отдельно).
+ * @returns {Promise<{ ok: boolean, message: string | string[], data?: object, code?: string }>}
+ */
+async function runCommand(bot, line, log = () => {}) {
+  const tokens = String(line === undefined ? '' : line).trim().replace(/^#\s*/, '').split(/\s+/).filter(Boolean);
+  const cmd = findCommand(tokens[0] || 'помощь');
+  let result;
+  if (!cmd) {
+    result = { ok: false, code: 'unknown', message: `Неизвестная команда «#${tokens[0]}». Список: #помощь` };
+  } else if (cmd.needsWorld !== false && (!bot || !bot.entity)) {
+    result = { ok: false, code: 'not_ready', message: 'Команда не выполнена: бот не в мире' };
+  } else if (cmd.needsWorld !== false && (!bot.actions || !bot.serverView)) {
+    result = { ok: false, code: 'unsupported', message: 'Команда не выполнена: действия работают только со своей физикой бота' };
+  } else {
+    const args = tokens.slice(1);
+    try {
+      result = await cmd.run({ bot, args, words: args.map(norm) });
+    } catch (err) {
+      const code = err && err.code ? err.code : 'failed';
+      result = { ok: false, code, message: `#${cmd.name}: ${err && err.message ? err.message : err}` };
+    }
+  }
+  let level = 'ok';
+  if (!result.ok) level = ['unknown', 'not_ready', 'unsupported'].includes(result.code) ? 'warn' : ['replaced', 'stopped'].includes(result.code) ? 'info' : 'error';
+  else if (cmd.observe) level = 'info';
+  for (const text of [].concat(result.message)) log(level, text);
+  return result;
+}
+
+module.exports = { runCommand, catalog, findCommand, findItem, parseCoord, parseBlockPos, f3Yaw, f3Pitch, COMMANDS };

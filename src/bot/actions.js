@@ -234,8 +234,12 @@ function inject(bot, { random, now }) {
     for (const entry of entries) entry.controller.abort(reason);
   }
 
-  /** Действия идут по одному: новое прерывает то, что идёт сейчас (и то, что ждало очереди). */
-  function run(name, fn) {
+  /**
+   * Действия идут по одному: новое прерывает то, что идёт сейчас (и то, что ждало очереди). Открытое окно
+   * (сундук, меню) перед действием закрывается: человек с открытым окном не ходит, не смотрит по сторонам и не
+   * ломает блоки — и античиты это проверяют.
+   */
+  function run(name, fn, { keepWindow = false } = {}) {
     abortAll(new ActionError(`прервано: новое действие «${name}»`, 'replaced'));
     const controller = new AbortController();
     const entry = { name, controller };
@@ -245,6 +249,7 @@ function inject(bot, { random, now }) {
         if (controller.signal.aborted) throw abortError(controller.signal);
         ensureInWorld();
         current = entry;
+        if (!keepWindow) await closeWindowIfOpen(controller.signal);
         return await fn(controller.signal);
       } finally {
         if (current === entry) current = null;
@@ -265,6 +270,14 @@ function inject(bot, { random, now }) {
   function releaseControls() {
     if (typeof bot.setControlState !== 'function') return;
     for (const c of ['forward', 'back', 'left', 'right', 'jump', 'sprint']) bot.setControlState(c, false);
+  }
+
+  /** Закрыть сундук или меню, если открыто, и чуть подождать — как человек, нажавший Esc. */
+  async function closeWindowIfOpen(signal) {
+    const window = bot.currentWindow;
+    if (!window || typeof bot.closeWindow !== 'function') return;
+    bot.closeWindow(window);
+    await waitTicks(2 + Math.floor(random() * 3), signal);
   }
 
   // ---------- что знает сервер ----------
@@ -651,9 +664,9 @@ function inject(bot, { random, now }) {
     return run('взять в руку', (signal) => equipItem(name, signal));
   }
 
-  /** Подождать (миллисекунды); прерывается, как любое действие. */
+  /** Подождать (миллисекунды); прерывается, как любое действие. Открытое окно не трогает. */
   function wait(ms) {
-    return run('ждать', (signal) => waitTicks(Math.max(1, Math.round(ms / 50)), signal));
+    return run('ждать', (signal) => waitTicks(Math.max(1, Math.round(ms / 50)), signal), { keepWindow: true });
   }
 
   // Чат — своя очередь, не мешает действиям: сообщения не чаще раза в 1,5–2 секунды.
@@ -700,4 +713,4 @@ function inject(bot, { random, now }) {
   };
 }
 
-module.exports = { createActionsPlugin, ActionError, raycastBlocks, lookVector, anglesTo, rayBox, FACE_NAMES, BLOCK_REACH };
+module.exports = { createActionsPlugin, ActionError, raycastBlocks, lookVector, anglesTo, rayBox, FACE_NAMES, FACE_VECTORS, BLOCK_REACH };

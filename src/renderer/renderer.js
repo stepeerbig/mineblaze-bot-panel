@@ -185,7 +185,7 @@ function applyState(next) {
   el.chatInput.disabled = !canChat;
   el.chatSend.disabled = !canChat;
   el.chatInput.placeholder = canChat
-    ? 'Сообщение или команда (/…), Enter — отправить'
+    ? 'Сообщение, команда серверу (/…) или боту (#помощь), Enter — отправить'
     : 'Бот не в сети';
 }
 

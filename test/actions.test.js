@@ -1,7 +1,7 @@
 'use strict';
 
-// Безопасные действия (src/bot/actions.js) и команды панели (src/bot/commands.js) на поддельном боте:
-// проверяем не только итог, но и то, что увидит сервер — пакеты, их порядок внутри тиков, паузы.
+// Безопасные действия (src/bot/actions.js) на поддельном боте: проверяем не только итог, но и то, что увидит
+// сервер — пакеты, их порядок внутри тиков, паузы. Команды из строки чата — в commands.test.js.
 
 const test = require('node:test');
 const assert = require('node:assert');
@@ -10,7 +10,6 @@ const { Vec3 } = require('vec3');
 const { fakeClock, makeWorld, physicsBot, autoServer, teleport, take, runFor, VERSION } = require('./fake-bot');
 
 const { lookVector } = require(path.join(__dirname, '..', 'src', 'bot', 'actions.js'));
-const { runCommand, parseCoord, parseBlockPos, f3Yaw } = require(path.join(__dirname, '..', 'src', 'bot', 'commands.js'));
 
 /** Бот стоит в 0.5 64 0.5 на камне и смотрит на юг (+z). */
 function setup({ random = 0.5 } = {}) {
@@ -228,38 +227,17 @@ test('без своей физики действия честно отказы�
   assert.equal(res.error.code, 'unsupported');
 });
 
-// ---------- команды панели ----------
-
-test('команды: координаты как в игре — числа и «~» от бота', () => {
-  assert.equal(parseCoord('10', 0), 10);
-  assert.equal(parseCoord('-3,5', 0), -3.5);
-  assert.equal(parseCoord('~', 7), 7);
-  assert.equal(parseCoord('~-2', 7), 5);
-  assert.throws(() => parseCoord('abc', 0), /непонятная координата/);
-  assert.throws(() => parseCoord('~x', 0), /непонятная координата/);
-  assert.deepEqual(parseBlockPos(['~1', '~', '~-1'], new Vec3(0.5, 64, 0.5)), new Vec3(1, 64, -1));
-  assert.throws(() => parseBlockPos(['1', '2'], new Vec3(0, 0, 0)), /три координаты/);
-});
-
-test('команды: #look, #pos, #goto и ошибки — понятными строками в консоли', async () => {
+test('открытое окно (сундук) перед действием закрывается — с открытым окном человек не ходит', async () => {
   const { clock, bot } = setup();
-  const logs = [];
-  const log = (level, text) => logs.push(`${level}:${text}`);
-  const look = runCommand(bot, '#look 90 10', log);
-  assert.ifError((await runFor(clock, look)).error);
-  // 10° вниз точно не получить: ближайшее на сетке шагов мыши — 10,05°.
-  assert.ok(logs.some((l) => /^ok:Повернулся: 90\.0 \/ 10\.[01]$/.test(l)), logs.join('\n'));
-  assert.ok(Math.abs(f3Yaw(bot.serverView.yaw) - 90) < 0.2, 'смотрит на запад, как «90» в F3');
-  await runCommand(bot, '#pos', log);
-  assert.ok(logs.some((l) => /^info:Бот: 0\.50 64\.00 0\.50, взгляд 90\.0 \/ 10\.[01]/.test(l)));
-  await runCommand(bot, '#goto 1000 64 0', log);
-  assert.ok(logs.some((l) => l.startsWith('error:#goto: слишком далеко')));
-  await runCommand(bot, '#dig 1 2', log);
-  assert.ok(logs.includes('error:#dig: нужны три координаты: x y z'));
-  await runCommand(bot, '#нет-такой', log);
-  assert.ok(logs.some((l) => l.startsWith('warn:Неизвестная команда «#нет-такой»')));
-  await runCommand(bot, '#help', log);
-  assert.ok(logs.some((l) => l.startsWith('info:#goto')));
-  await runCommand(bot, '#stop', log);
-  assert.ok(logs.includes('info:Бот ничего не делал'));
+  const closed = [];
+  bot.currentWindow = { title: 'chest' };
+  bot.closeWindow = (w) => {
+    closed.push(w.title);
+    bot.currentWindow = null;
+  };
+  assert.ifError((await runFor(clock, bot.actions.walkTo(new Vec3(0.5, 64, 2.5)))).error);
+  assert.deepEqual(closed, ['chest']);
+  bot.currentWindow = { title: 'barrel' };
+  assert.ifError((await runFor(clock, bot.actions.wait(100))).error);
+  assert.deepEqual(closed, ['chest'], '«ждать» окно не трогает');
 });

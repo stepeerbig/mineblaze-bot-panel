@@ -23,11 +23,13 @@ const path = require('path');
 const { performance } = require('perf_hooks');
 const { BotManager } = require('../src/bot-manager');
 const { DEFAULT_CONFIG } = require('../src/config');
+const { runCommand } = require('../src/bot/commands');
 
 const SERVER_DIR = path.join(__dirname, 'server');
 const LOG_FILE = path.join(SERVER_DIR, 'logs', 'latest.log');
 const JOURNAL_DIR = path.join(SERVER_DIR, 'journals');
 const BOT_NAME = 'StandBot';
+const HELPER_NAME = 'Helper'; // второй игрок в сценарии — для команд по нику
 
 const ARGS = process.argv.slice(2);
 const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--scenario', '--electron']);
@@ -184,9 +186,10 @@ async function stopServer(child) {
 }
 
 /**
- * Сценарий «бот действует»: площадку готовит консоль сервера (ровный каменный пол, воздух над ним, камень для
- * копания, кирка и булыжник), дальше бот всё делает через безопасные действия (src/bot/actions.js).
- * cmd(text) — команда в консоль тестового сервера.
+ * Сценарий «бот действует» — теми же командами, что пишут в строке чата панели (src/bot/commands.js).
+ * Площадку готовит консоль сервера: ровный каменный пол, воздух над ним, камень для копания, сундук с алмазами,
+ * кирка и земля. Для команд по нику рядом ставится второй игрок — такой же бот Helper.
+ * cmd(text) — команда в консоль тестового сервера. Возвращает число команд, которые не выполнились.
  */
 async function runScenario(manager, cmd) {
   if (!cmd) throw new Error('для сценария сервер должна запускать сама проверка: закрой окно тестового сервера и запусти снова');
@@ -194,49 +197,71 @@ async function runScenario(manager, cmd) {
   await wait(3000); // как человек: постоять после входа
   const bot = manager.getBot();
   if (!bot || !bot.actions) throw new Error('у бота нет безопасных действий (они работают только со своей физикой)');
-  for (const c of [
-    'difficulty peaceful',
-    'time set day',
-    `execute at ${BOT_NAME} run fill ~-6 ~-1 ~-6 ~6 ~-1 ~6 minecraft:stone`,
-    `execute at ${BOT_NAME} run fill ~-6 ~ ~-6 ~6 ~4 ~6 minecraft:air`,
-    `execute at ${BOT_NAME} run setblock ~ ~ ~3 minecraft:stone`,
-    `give ${BOT_NAME} minecraft:iron_pickaxe`,
-    `give ${BOT_NAME} minecraft:cobblestone 16`,
-  ]) cmd(c);
-  await wait(2500);
-  const o = bot.entity.position.floored();
-  const at = (dx, dy, dz) => o.offset(dx, dy, dz);
-  const center = (dx, dz) => o.offset(dx + 0.5, 0, dz + 0.5);
-  const a = bot.actions;
-  const step = async (name, fn) => {
-    const started = Date.now();
-    try {
-      await fn();
-      console.log(`  [сценарий] ${name}: да (${((Date.now() - started) / 1000).toFixed(1)} с)`);
-    } catch (err) {
-      console.log(`  [сценарий] ${name}: НЕ ВЫШЛО — ${err && err.message ? err.message : err}`);
-    }
-  };
-  const deg = (yaw, pitch) => [((180 - yaw) * Math.PI) / 180, (-pitch * Math.PI) / 180]; // углы как в F3
-  await step('посмотреть по сторонам', async () => {
-    for (const [yaw, pitch] of [[90, 10], [-120, -20], [30, 35], [180, 0]]) {
-      await a.look(...deg(yaw, pitch));
-      await wait(300 + Math.random() * 400);
-    }
+
+  const helper = new BotManager({ config: { ...manager.config, username: HELPER_NAME }, authCacheDir: path.join(os.tmpdir(), 'mineblaze-stand-auth') });
+  const helperOnline = new Promise((resolve) => {
+    const t = setTimeout(() => resolve(false), 30 * 1000);
+    helper.on('state', (s) => {
+      if (s === 'online') {
+        clearTimeout(t);
+        resolve(true);
+      }
+    });
   });
-  await step('обойти квадрат 4×4 (первая сторона — бегом)', async () => {
-    await a.walkTo(center(4, 0), { sprint: true });
-    await a.walkTo(center(4, -4));
-    await a.walkTo(center(0, -4));
-    await a.walkTo(center(0, 0));
-  });
-  await step('взять кирку', () => a.equip('iron_pickaxe'));
-  await step('сломать камень', () => a.dig(at(0, 0, 3)));
-  await step('взять булыжник', () => a.equip('cobblestone'));
-  await step('поставить блок на место камня', () => a.place(at(0, 0, 3)));
-  await step('поставить блок рядом', () => a.place(at(1, 0, 3)));
-  await step('взять кирку', () => a.equip('iron_pickaxe'));
-  await step('сломать поставленный блок', () => a.dig(at(1, 0, 3)));
+  helper.start();
+  try {
+    if (!(await helperOnline)) console.log(`  [сценарий] второй игрок ${HELPER_NAME} не зашёл`);
+    for (const c of [
+      'difficulty peaceful',
+      'time set day',
+      `execute at ${BOT_NAME} run fill ~-6 ~-1 ~-6 ~6 ~-1 ~6 minecraft:stone`,
+      `execute at ${BOT_NAME} run fill ~-6 ~ ~-6 ~6 ~4 ~6 minecraft:air`,
+      `execute at ${BOT_NAME} run setblock ~-3 ~ ~ minecraft:stone`,
+      `execute at ${BOT_NAME} run setblock ~2 ~ ~-2 minecraft:chest`,
+      `execute at ${BOT_NAME} run item replace block ~2 ~ ~-2 container.0 with minecraft:diamond 3`,
+      `give ${BOT_NAME} minecraft:iron_pickaxe`,
+      `give ${BOT_NAME} minecraft:dirt 16`,
+      `execute at ${BOT_NAME} run tp ${HELPER_NAME} ~4 ~ ~4`,
+    ]) cmd(c);
+    await wait(3000);
+    const o = bot.entity.position.floored();
+    const xyz = (dx, dy, dz) => `${o.x + dx} ${o.y + dy} ${o.z + dz}`;
+    let failed = 0;
+    for (const line of [
+      '#где',
+      '#инвентарь',
+      '#смотри налево',
+      '#смотри направо',
+      '#смотри вниз',
+      '#смотри прямо',
+      `#смотри на ${HELPER_NAME}`,
+      '#иди ко мне',
+      `#иди ${xyz(0, 0, 0)}`,
+      '#смотри юг',
+      '#вперёд 3',
+      '#назад 3 бегом',
+      '#возьми кирка',
+      `#смотри ${xyz(-3, 0, 0)}`,
+      '#копай',
+      `#поставь ${xyz(-3, 0, 0)} земля`,
+      `#копай ${xyz(-3, 0, 0)}`,
+      '#смотри юг',
+      '#поставь впереди земля',
+      '#копай впереди',
+      '#открой',
+      '#рядом',
+    ]) {
+      const started = Date.now();
+      const r = await runCommand(bot, line);
+      if (!r.ok) failed += 1;
+      const text = [].concat(r.message).join(' | ');
+      console.log(`  [сценарий] ${line} → ${r.ok ? 'да' : 'НЕТ'} (${((Date.now() - started) / 1000).toFixed(1)} с): ${text}`);
+      await wait(300 + Math.random() * 500); // человек между командами тоже не мгновенен
+    }
+    return failed;
+  } finally {
+    helper.stop();
+  }
 }
 
 /** Бот заходит через настоящий Electron: самопроверка панели с сервером (см. MBP_SELFTEST_* в src/main.js). */
@@ -342,9 +367,9 @@ function runBot(host, port, version, cmd) {
         if (SCENARIO) {
           console.log('Бот в мире: готовлю площадку и действую…');
           runScenario(manager, cmd).then(
-            () => {
+            (failed) => {
               console.log(`Сценарий закончен, бот стоит ещё ${STAY_MS / 1000} с…`);
-              stayTimer = setTimeout(() => finish(null), STAY_MS);
+              stayTimer = setTimeout(() => finish(failed ? `сценарий: не выполнено команд — ${failed}` : null), STAY_MS);
             },
             (err) => finish(`сценарий: ${err.message}`),
           );

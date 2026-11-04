@@ -122,16 +122,33 @@ function physicsBot({ clock, world, tickEnd = true, actions = false, random = 0.
   return bot;
 }
 
-/** «Сервер» для действий: ломает блок по концу копания (или сразу, если блок ломается мгновенно) и ставит блок. */
-function autoServer(bot, world) {
+/**
+ * «Сервер» для действий: ломает блок по концу копания (или сразу, если блок ломается мгновенно), ставит блок,
+ * а нажатие на сундук открывает окно (содержимое — chests[«x,y,z»] или пусто).
+ */
+function autoServer(bot, world, { chests = {} } = {}) {
   const write = bot._client.write;
+  bot.currentWindow = null;
+  bot.closeWindow = (window) => {
+    if (bot.currentWindow !== window) return;
+    bot.currentWindow = null;
+    write('close_window', { windowId: 1 });
+  };
   bot._client.write = (name, params) => {
     write(name, params);
     if (name === 'block_dig') {
       const block = world.blockAt(params.location);
       if (params.status === 2 || (params.status === 0 && bot.digTime(block) <= 50)) world.set(params.location, 'air');
-    } else if (name === 'block_place' && bot.heldItem) {
-      world.set(new Vec3(params.location.x, params.location.y, params.location.z).plus(FACE_VECTORS[params.direction]), bot.heldItem.name);
+    } else if (name === 'block_place') {
+      const loc = new Vec3(params.location.x, params.location.y, params.location.z);
+      const clicked = world.get(loc);
+      if (/chest|barrel|shulker_box/.test(clicked)) {
+        const items = chests[`${loc.x},${loc.y},${loc.z}`] || [];
+        bot.currentWindow = { title: clicked, containerItems: () => items.map((it) => ({ ...it })) };
+        bot.emit('windowOpen', bot.currentWindow);
+      } else if (bot.heldItem) {
+        world.set(loc.plus(FACE_VECTORS[params.direction]), bot.heldItem.name);
+      }
     }
   };
 }
