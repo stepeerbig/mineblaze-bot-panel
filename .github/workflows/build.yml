@@ -1,0 +1,91 @@
+# Сборка exe на серверах GitHub.
+# - Каждый пуш в main и каждый pull request: тесты + exe (вкладка Actions → запуск → Artifacts, хранится 14 дней).
+# - Тег вида v1.2.0: то же самое + выпуск на странице Releases. Версия в package.json должна совпадать с тегом.
+# - Можно запустить вручную: Actions → «Сборка exe» → Run workflow.
+name: Сборка exe
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore: # правки только документации и тестового стенда exe не меняют (на теги фильтр не действует)
+      - '**.md'
+      - 'test-server/**'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'test-server/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Версия в package.json совпадает с тегом
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ("v$pkg" -ne $env:TAG) { throw "Тег $env:TAG не совпадает с версией в package.json ($pkg)" }
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: Установка зависимостей
+        run: npm ci --no-audit --no-fund
+
+      # Новые npm могут не запустить install-скрипт electron, и тогда сам Electron не скачивается.
+      - name: Electron
+        run: |
+          if (-not (Test-Path node_modules/electron/dist/electron.exe)) { node node_modules/electron/install.js }
+          if (-not (Test-Path node_modules/electron/dist/electron.exe)) { throw 'Electron не скачался' }
+
+      - name: Тесты
+        run: npm test
+
+      - name: Сборка exe
+        run: npm run dist -- --publish never
+
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/MineBlazeBotPanel.exe
+          archive: false # скачивается сразу exe, без zip
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: MineBlazeBotPanel.exe
+
+      - name: Выпуск на странице Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" MineBlazeBotPanel.exe --clobber
+          else
+            gh release create "$TAG" MineBlazeBotPanel.exe --title "MineBlaze Bot Panel $TAG" --generate-notes
+          fi

@@ -22,4 +22,15 @@ if errorlevel 1 (
   )
 )
 
+rem Newer npm versions may skip install scripts, so Electron itself is never downloaded.
+if not exist node_modules\electron\dist\electron.exe (
+  echo Downloading Electron...
+  call node node_modules\electron\install.js
+  if not exist node_modules\electron\dist\electron.exe (
+    echo [ERROR] Electron could not be downloaded. Check your internet connection and try again.
+    pause
+    exit /b 1
+  )
+)
+
 call npm start

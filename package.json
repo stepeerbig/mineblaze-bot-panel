@@ -10,7 +10,8 @@
   "scripts": {
     "start": "electron .",
     "test": "node --test",
-    "dist": "electron-builder --win portable --x64"
+    "dist": "electron-builder --win portable --x64",
+    "stand:check": "node test-server/check.js"
   },
   "dependencies": {
     "express": "^4.22.3",
