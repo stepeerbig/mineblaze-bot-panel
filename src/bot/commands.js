@@ -8,6 +8,7 @@
 
 const { Vec3 } = require('vec3');
 const { FACE_VECTORS } = require('./actions');
+const { chatToText } = require('../chat-utils');
 
 const MAX_WALK = 64; // по прямой дальше не ходим (поиска пути пока нет)
 const MAX_STEPS = 32; // «#вперёд N»: не больше
@@ -125,6 +126,89 @@ function resolveMe(bot) {
   return near[0].entity;
 }
 
+// ---------- сущности (NPC, мобы, надписи) и меню ----------
+
+/** Текст из чего угодно похожего на сообщение чата (JSON, NBT, ChatMessage) — без §-кодов. */
+function textOf(value) {
+  if (value === undefined || value === null) return '';
+  try {
+    const raw = typeof value === 'object' && typeof value.toString === 'function' && value.json !== undefined ? value.toString() : chatToText(value);
+    return String(raw || '').replace(/§[0-9a-fk-orx#]/gi, '').replace(/\s+/g, ' ').trim();
+  } catch (_) {
+    return '';
+  }
+}
+
+// Надписи и «подставки», а не сами NPC.
+const DISPLAY_TYPES = new Set(['text_display', 'item_display', 'block_display', 'armor_stand', 'marker', 'area_effect_cloud', 'item']);
+
+/** Как сущность называется в игре: ник игрока, имя над головой или текст надписи. */
+function entityLabel(e) {
+  if (e.type === 'player' && e.username) return e.username;
+  let name = '';
+  try {
+    const custom = typeof e.getCustomName === 'function' ? e.getCustomName() : null;
+    if (custom) name = textOf(custom);
+  } catch (_) {
+    /* у сущности нет имени */
+  }
+  if (!name && DISPLAY_TYPES.has(e.name) && Array.isArray(e.metadata)) {
+    // Текст надписи (text_display) лежит среди её данных — берём самый длинный текст.
+    for (const v of e.metadata) {
+      const isText = (typeof v === 'string' && /^[{["]/.test(v)) || (v && typeof v === 'object' && !Array.isArray(v) && ('text' in v || 'translate' in v || 'extra' in v || v.type === 'compound' || v.type === 'string'));
+      if (!isText) continue;
+      const t = textOf(v);
+      if (t && t.length > name.length && !/^[\d.\s-]+$/.test(t)) name = t;
+    }
+  }
+  return name;
+}
+
+function entitiesNear(bot, radius) {
+  const me = bot.entity.position;
+  return Object.values(bot.entities || {})
+    .filter((e) => e && e !== bot.entity && e.position && e.position.distanceTo(me) <= radius)
+    .map((e) => ({ entity: e, dist: e.position.distanceTo(me), label: entityLabel(e) }))
+    .sort((a, b) => a.dist - b.dist);
+}
+
+/**
+ * Сущность по имени: «@123» — по номеру из #сущности; иначе — по имени (ник, имя над головой) или по надписи
+ * над NPC (тогда берётся сущность прямо под надписью).
+ */
+function findEntity(bot, query) {
+  const q = norm(query);
+  const all = entitiesNear(bot, 24);
+  if (/^@\d+$/.test(q)) {
+    const e = bot.entities && bot.entities[Number(q.slice(1))];
+    if (!e) throw new CommandError(`сущности ${query} рядом нет — номера показывает #сущности`);
+    return e;
+  }
+  const named = all.filter((x) => x.label && norm(x.label).includes(q));
+  const direct = named.find((x) => !DISPLAY_TYPES.has(x.entity.name));
+  if (direct) return direct.entity;
+  for (const sign of named) {
+    const p = sign.entity.position;
+    const under = all
+      .filter((x) => !DISPLAY_TYPES.has(x.entity.name) && x.entity.type !== 'object')
+      .map((x) => ({ x, d: Math.hypot(x.entity.position.x - p.x, x.entity.position.z - p.z) }))
+      .filter(({ x, d }) => d < 1.2 && x.entity.position.y <= p.y + 0.5 && x.entity.position.y >= p.y - 4)
+      .sort((a, b) => a.d - b.d)[0];
+    if (under) return under.x.entity;
+  }
+  throw new CommandError(`рядом нет «${query}» — посмотри, кто есть: #сущности`);
+}
+
+const itemTitle = (it) => textOf(it.customName) || it.displayName || it.name;
+const itemLore = (it) => (Array.isArray(it.customLore) ? it.customLore : it.customLore ? [it.customLore] : []).map(textOf).filter(Boolean);
+const windowTitle = (w) => textOf(w.title) || w.type || 'меню';
+
+/** Ждать до секунды, пока не откроется новое меню (не то, что было). */
+async function waitNewWindow(bot, before) {
+  for (let i = 0; i < 20 && (!bot.currentWindow || bot.currentWindow === before); i += 1) await bot.actions.wait(50);
+  return bot.currentWindow && bot.currentWindow !== before ? bot.currentWindow : null;
+}
+
 function directionTo(bot, pos) {
   const d = pos.minus(bot.entity.position);
   return cardinalOf(f3Yaw(Math.atan2(-d.x, -d.z))).name;
@@ -208,10 +292,22 @@ function findItem(bot, query) {
 
 const isContainer = (name) => /^(chest|trapped_chest|barrel|ender_chest)$|shulker_box$/.test(name || '');
 
-/** Блоки вокруг бота (куб radius), подходящие под match, — от ближнего к дальнему. */
+/**
+ * Блоки вокруг бота (куб radius), подходящие под match, — от ближнего к дальнему. В настоящем боте — быстрым
+ * поиском mineflayer по палитрам чанков (перебор тысяч блоков по одному подвешивал тик на ~0,1 с).
+ */
 function scanBlocks(bot, radius, match) {
-  const c = bot.entity.position.floored();
   const eye = bot.entity.position.offset(0, 1.62, 0);
+  if (typeof bot.findBlocks === 'function' && bot.registry) {
+    const ids = bot.registry.blocksArray.filter((b) => match(b)).map((b) => b.id);
+    if (!ids.length) return [];
+    return bot
+      .findBlocks({ matching: ids, maxDistance: radius, count: 64 })
+      .map((pos) => ({ block: bot.blockAt(pos), pos, dist: eye.distanceTo(pos.offset(0.5, 0.5, 0.5)) }))
+      .filter((x) => x.block)
+      .sort((a, b) => a.dist - b.dist);
+  }
+  const c = bot.entity.position.floored();
   const found = [];
   for (let x = -radius; x <= radius; x += 1) {
     for (let y = -radius; y <= radius; y += 1) {
@@ -326,6 +422,14 @@ async function goToPlayer(bot, e, sprint) {
   return { ok: true, message: `Подошёл к ${e.username}`, data: { player: e.username, position: plain(bot.entity.position) } };
 }
 
+async function goToEntity(bot, e, sprint, query) {
+  const label = entityLabel(e) || query || e.name;
+  const dist = bot.entity.position.distanceTo(e.position);
+  if (dist > MAX_WALK) throw new CommandError(`${label} слишком далеко (${Math.round(dist)} блоков)`);
+  await bot.actions.walkTo(e.position.clone(), { range: 2, sprint }); // на расстояние вытянутой руки
+  return { ok: true, message: `Подошёл к ${label}`, data: { entity: label, id: e.id, position: plain(bot.entity.position) } };
+}
+
 async function walkDirection(bot, turn, tokens, sprint) {
   const n = tokens.find((t) => /^\d+$/.test(t));
   const steps = n === undefined ? 1 : Math.min(MAX_STEPS, Math.max(1, parseInt(n, 10)));
@@ -342,7 +446,20 @@ async function cmdGo({ bot, args, words }) {
   const rw = rest.map(norm);
   if (!rest.length) throw new CommandError('куда идти? Например: #иди ко мне, #иди к Steve, #вперёд 3, #иди X Y Z');
   if ((rw[0] === 'ко' && rw[1] === 'мне') || rw[0] === 'сюда') return goToPlayer(bot, resolveMe(bot), sprint);
-  if (rw[0] === 'к' && rest[1]) return goToPlayer(bot, findPlayer(bot, rest[1]), sprint);
+  if (rw[0] === 'к' && rest[1]) {
+    // Игрок по нику, а если такого нет — NPC по имени («#иди к Фермер»).
+    const target = rest.slice(1).join(' ');
+    const player = otherPlayers(bot).find((x) => norm(x.username) === norm(target));
+    if (player) return goToPlayer(bot, player, sprint);
+    let entity = null;
+    try {
+      entity = findEntity(bot, target);
+    } catch (_) {
+      /* такой сущности рядом нет — тогда это ник игрока */
+    }
+    if (entity) return goToEntity(bot, entity, sprint, target);
+    return goToPlayer(bot, findPlayer(bot, target), sprint);
+  }
   if (rw[0] in TURN_WORDS) return walkDirection(bot, TURN_WORDS[rw[0]], rest.slice(1), sprint);
   if (isCoords(rest)) return goToPoint(bot, parseWalkPoint(rest, bot.entity.position), sprint);
   if (/^[a-z0-9_]{3,16}$/i.test(rest[0])) return goToPlayer(bot, findPlayer(bot, rest[0]), sprint);
@@ -406,9 +523,75 @@ async function useBlock(bot, pos) {
   };
 }
 
+/** Нажать на NPC (сущность) по имени; меню, если открылось, остаётся открытым — дальше #окно и #клик. */
+async function useEntity(bot, query) {
+  const e = findEntity(bot, query);
+  const label = entityLabel(e) || query; // имя может быть только в надписи над NPC
+  const before = bot.currentWindow;
+  await bot.actions.interact(e);
+  const w = await waitNewWindow(bot, before);
+  if (!w) return { ok: true, message: `Нажал на ${label} (меню не открылось)`, data: { entity: label, id: e.id, window: null } };
+  return {
+    ok: true,
+    message: `Нажал на ${label}: открылось меню «${windowTitle(w)}» — #окно покажет, что в нём`,
+    data: { entity: label, id: e.id, window: windowTitle(w) },
+  };
+}
+
 async function cmdUse({ bot, args }) {
-  const pos = isCoords(args) ? parseBlockPos(args, bot.entity.position) : lookedAtOrThrow(bot).position;
-  return useBlock(bot, pos);
+  if (isCoords(args)) return useBlock(bot, parseBlockPos(args, bot.entity.position));
+  if (args.length) return useEntity(bot, args.join(' '));
+  return useBlock(bot, lookedAtOrThrow(bot).position);
+}
+
+async function cmdEntities({ bot }) {
+  const list = entitiesNear(bot, 10).slice(0, 20);
+  if (!list.length) return { ok: true, message: 'Рядом (до 10 блоков) никого и ничего нет', data: { entities: [] } };
+  return {
+    ok: true,
+    message: ['Рядом (номер, вид, имя, расстояние):', ...list.map((x) => `@${x.entity.id} ${x.entity.name || x.entity.type}${x.label ? ` «${x.label}»` : ''} — ${round(x.dist)} бл.`)],
+    data: { entities: list.map((x) => ({ id: x.entity.id, type: x.entity.name || x.entity.type, name: x.label || null, distance: Math.round(x.dist * 10) / 10, position: plain(x.entity.position) })) },
+  };
+}
+
+async function cmdWindow({ bot }) {
+  const w = bot.currentWindow;
+  if (!w) throw new CommandError('меню не открыто — сначала нажми на NPC или сундук: #нажми Фермер');
+  const end = Number.isInteger(w.inventoryStart) ? w.inventoryStart : w.slots.length;
+  const slots = [];
+  for (let i = 0; i < end; i += 1) {
+    const it = w.slots[i];
+    if (it) slots.push({ slot: i, item: it.name, count: it.count || 1, name: itemTitle(it), lore: itemLore(it) });
+  }
+  const title = windowTitle(w);
+  return {
+    ok: true,
+    message: [`Меню «${title}»: предметов ${slots.length}`, ...slots.map((s) => `[${s.slot}] ${s.name}${s.count > 1 ? ` ×${s.count}` : ''} (${s.item})${s.lore.length ? ` — ${s.lore.join(' / ')}` : ''}`)],
+    data: { title, slots },
+  };
+}
+
+async function cmdClick({ bot, args, words }) {
+  const n = parseInt(args[0], 10);
+  if (!Number.isInteger(n)) throw new CommandError('по какой ячейке? Номер — из #окно, например: #клик 13');
+  const before = bot.currentWindow;
+  if (!before) throw new CommandError('меню не открыто — сначала нажми на NPC: #нажми Фермер');
+  const item = before.slots[n];
+  await bot.actions.clickSlot(n, { button: words.some((w) => w === 'правой' || w === 'right') ? 1 : 0 });
+  const next = await waitNewWindow(bot, before);
+  let after = 'меню закрылось';
+  if (next) after = `открылось меню «${windowTitle(next)}» — #окно покажет, что в нём`;
+  else if (bot.currentWindow === before) after = 'меню то же';
+  return {
+    ok: true,
+    message: `Клик по [${n}] ${item ? itemTitle(item) : 'пустой ячейке'}: ${after}`,
+    data: { slot: n, item: item ? itemTitle(item) : null, window: bot.currentWindow ? windowTitle(bot.currentWindow) : null },
+  };
+}
+
+async function cmdClose({ bot }) {
+  const r = await bot.actions.closeMenu();
+  return { ok: true, message: r.closed ? 'Меню закрыто' : 'Меню и так не открыто', data: r };
 }
 
 async function cmdOpen({ bot, args }) {
@@ -487,7 +670,7 @@ const COMMANDS = [
   {
     name: 'иди',
     aliases: ['goto', 'go', 'подойди'],
-    usage: ['#иди ко мне', '#иди к <ник>', '#иди X Y Z [бегом]', '#иди вперёд 3 [бегом]'],
+    usage: ['#иди ко мне', '#иди к <ник или имя NPC>', '#иди X Y Z [бегом]', '#иди вперёд 3 [бегом]'],
     about: 'дойти по прямой (поиска пути пока нет — обходить ямы и стены не умеет)',
     run: cmdGo,
   },
@@ -509,7 +692,17 @@ const COMMANDS = [
     about: 'поставить блок туда, куда смотрит (или впереди, или по координатам); предмет — например, земля',
     run: cmdPlace,
   },
-  { name: 'нажми', aliases: ['use', 'используй'], usage: ['#нажми', '#нажми X Y Z'], about: 'нажать на блок: дверь, рычаг, кнопку (сундук откроет и закроет)', run: cmdUse },
+  {
+    name: 'нажми',
+    aliases: ['use', 'используй'],
+    usage: ['#нажми Фермер', '#нажми @<номер из #сущности>', '#нажми', '#нажми X Y Z'],
+    about: 'нажать на NPC (меню останется открытым) или на блок: дверь, рычаг, кнопку (сундук откроет и закроет)',
+    run: cmdUse,
+  },
+  { name: 'окно', aliases: ['menu', 'меню', 'window'], usage: ['#окно'], about: 'что в открытом меню: номера ячеек, названия, описания (квесты)', observe: true, run: cmdWindow },
+  { name: 'клик', aliases: ['click', 'кликни'], usage: ['#клик <ячейка> [правой]'], about: 'кликнуть по ячейке открытого меню (номер — из #окно)', run: cmdClick },
+  { name: 'закрой', aliases: ['close', 'esc'], usage: ['#закрой'], about: 'закрыть открытое меню', run: cmdClose },
+  { name: 'сущности', aliases: ['entities', 'нпс', 'npc'], usage: ['#сущности'], about: 'кто и что рядом: NPC, мобы, надписи — с номерами для #нажми @номер', observe: true, run: cmdEntities },
   { name: 'открой', aliases: ['open'], usage: ['#открой', '#открой X Y Z'], about: 'открыть ближайший сундук, показать, что внутри, и закрыть', run: cmdOpen },
   { name: 'возьми', aliases: ['equip', 'вруку'], usage: ['#возьми <предмет>'], about: 'взять в руку; можно по-русски: земля, булыжник, доски, кирка, меч…', run: cmdEquip },
   { name: 'инвентарь', aliases: ['inv', 'инв'], usage: ['#инвентарь'], about: 'что у бота в руке и в инвентаре', observe: true, run: cmdInventory },

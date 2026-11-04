@@ -126,17 +126,31 @@ function physicsBot({ clock, world, tickEnd = true, actions = false, random = 0.
  * «Сервер» для действий: ломает блок по концу копания (или сразу, если блок ломается мгновенно), ставит блок,
  * а нажатие на сундук открывает окно (содержимое — chests[«x,y,z»] или пусто).
  */
-function autoServer(bot, world, { chests = {} } = {}) {
+function autoServer(bot, world, { chests = {}, npcs = {}, onClick = null } = {}) {
   const write = bot._client.write;
   bot.currentWindow = null;
+  bot.clicks = [];
+  const open = (window) => {
+    bot.currentWindow = window;
+    bot.emit('windowOpen', window);
+  };
   bot.closeWindow = (window) => {
     if (bot.currentWindow !== window) return;
     bot.currentWindow = null;
     write('close_window', { windowId: 1 });
   };
+  // Клик в меню: записываем; onClick(window, slot) может вернуть новое меню (сервер его откроет).
+  bot.clickWindow = async (slot, mouseButton, mode) => {
+    bot.clicks.push({ window: bot.currentWindow && bot.currentWindow.id, slot, mouseButton, mode });
+    write('window_click', { windowId: bot.currentWindow && bot.currentWindow.id, slot, mouseButton, mode });
+    const next = onClick ? onClick(bot.currentWindow, slot) : null;
+    if (next) open(next);
+  };
   bot._client.write = (name, params) => {
     write(name, params);
-    if (name === 'block_dig') {
+    if (name === 'use_entity' && params.mouse === 0 && npcs[params.target]) {
+      open(npcs[params.target]());
+    } else if (name === 'block_dig') {
       const block = world.blockAt(params.location);
       if (params.status === 2 || (params.status === 0 && bot.digTime(block) <= 50)) world.set(params.location, 'air');
     } else if (name === 'block_place') {

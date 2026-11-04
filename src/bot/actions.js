@@ -638,6 +638,88 @@ function inject(bot, { random, now }) {
     });
   }
 
+  /**
+   * Нажать правой кнопкой на сущность (NPC, жителя): взгляд на неё, и только когда голова остановилась — нажатие.
+   * Как у клиента: сначала «нажать в точку» (точка попадания взгляда на сущности), затем «нажать».
+   */
+  function interact(entity) {
+    return run('нажать на сущность', async (signal) => {
+      if (!entity || !entity.position) throw new ActionError('не на что нажимать');
+      const boxOf = () => {
+        const w = (entity.width || 0.6) / 2;
+        const p = entity.position;
+        return [p.x - w, p.y, p.z - w, p.x + w, p.y + (entity.height || 1.8), p.z + w];
+      };
+      await standStill(signal);
+      for (let i = 0; i < LOOK_TIMEOUT_TICKS; i += 1) {
+        if (bot.entities && !bot.entities[entity.id]) throw new ActionError('сущность пропала');
+        const eye = eyePosition();
+        if (eye.distanceTo(closestPointOnBox(boxOf(), eye)) > ENTITY_REACH) throw new ActionError('слишком далеко — подойди ближе');
+        const a = anglesTo(eye, entity.position.offset(0, (entity.height || 1.8) * 0.6, 0));
+        bot.look(a.yaw, a.pitch, true);
+        if (bot.serverView.lookSettled && ticks() - lastUseTick >= USE_DELAY_TICKS) {
+          const done = await inTick(() => {
+            const from = eyePosition();
+            const dir = currentLook();
+            const t = rayBox(from, dir, boxOf());
+            if (t === null || t > ENTITY_REACH) return false;
+            const hit = from.plus(dir.scaled(t)).minus(entity.position);
+            const sneaking = Boolean(bot.getControlState('sneak'));
+            bot._client.write('use_entity', { target: entity.id, mouse: 2, x: hit.x, y: hit.y, z: hit.z, hand: 0, sneaking });
+            bot._client.write('use_entity', { target: entity.id, mouse: 0, hand: 0, sneaking });
+            lastUseTick = ticks();
+            return true;
+          }, signal);
+          if (done) return { target: entity.username || (entity.getCustomName && entity.getCustomName() ? String(entity.getCustomName()) : entity.name) };
+        } else {
+          await inTick(() => {}, signal);
+        }
+      }
+      throw new ActionError('не удалось навести взгляд на сущность');
+    });
+  }
+
+  // Когда открылось меню: первый клик — не раньше, чем человек успел бы его рассмотреть.
+  let windowOpenedTick = -Infinity;
+  let lastClickTick = -Infinity;
+  bot.on('windowOpen', () => {
+    windowOpenedTick = ticks();
+  });
+
+  /**
+   * Клик по ячейке открытого меню (сундук, меню NPC): с паузой после открытия и между кликами, стоя на месте.
+   * @param {number} slot    номер ячейки (как в #окно)
+   * @param {object} [opts]  button: 0 — левая, 1 — правая
+   */
+  function clickSlot(slot, { button = 0 } = {}) {
+    return run('клик в меню', async (signal) => {
+      const window = bot.currentWindow;
+      if (!window) throw new ActionError('меню не открыто');
+      if (!Number.isInteger(slot) || slot < 0 || slot >= window.slots.length) throw new ActionError(`в меню нет ячейки ${slot}`);
+      await standStill(signal);
+      const minGap = Math.max(windowOpenedTick + 6, lastClickTick + 4) + Math.floor(random() * 5);
+      while (ticks() < minGap) await inTick(() => {}, signal);
+      if (bot.currentWindow !== window) throw new ActionError('меню закрылось');
+      try {
+        await bot.clickWindow(slot, button, 0);
+      } catch (err) {
+        throw new ActionError(`клик не удался: ${err && err.message ? err.message : err}`);
+      }
+      lastClickTick = ticks();
+      await waitTicks(2, signal);
+      return { slot };
+    }, { keepWindow: true });
+  }
+
+  /** Закрыть открытое меню (как Esc). */
+  function closeMenu() {
+    return run('закрыть меню', async (signal) => {
+      const had = Boolean(bot.currentWindow);
+      await closeWindowIfOpen(signal);
+      return { closed: had };
+    }, { keepWindow: true });
+  }
+
   /** Взять предмет в руку: из быстрой панели — сменой ячейки, из инвентаря — переносом, стоя на месте. */
   async function equipItem(name, signal) {
     const wanted = String(name).replace(/^minecraft:/, '');
@@ -699,6 +781,9 @@ function inject(bot, { random, now }) {
     place,
     activate,
     attack,
+    interact,
+    clickSlot,
+    closeMenu,
     equip,
     wait,
     chat,

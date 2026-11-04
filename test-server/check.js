@@ -222,6 +222,13 @@ async function runScenario(manager, cmd) {
       `give ${BOT_NAME} minecraft:iron_pickaxe`,
       `give ${BOT_NAME} minecraft:dirt 16`,
       `execute at ${BOT_NAME} run tp ${HELPER_NAME} ~4 ~ ~4`,
+      // NPC с меню — житель-торговец (как Фермер на спавне MineBlaze, только меню — обычная торговля).
+      `execute at ${BOT_NAME} run summon villager ~2 ~ ~2 {NoAI:1b,Invulnerable:1b,PersistenceRequired:1b,CustomName:"Farmer",` +
+        'VillagerData:{profession:"minecraft:farmer",level:2,type:"minecraft:plains"},' +
+        'Offers:{Recipes:[{buy:{id:"minecraft:emerald",count:1},sell:{id:"minecraft:bread",count:6},maxUses:99}]}}',
+      // Меню-сундук у сущности — как меню NPC на MineBlaze: вагонетка с сундуком.
+      `execute at ${BOT_NAME} run summon chest_minecart ~-2 ~ ~2 {CustomName:"Market",` +
+        'Items:[{Slot:0b,id:"minecraft:diamond",count:3},{Slot:4b,id:"minecraft:emerald",count:5}]}',
     ]) cmd(c);
     await wait(3000);
     const o = bot.entity.position.floored();
@@ -250,6 +257,17 @@ async function runScenario(manager, cmd) {
       '#копай впереди',
       '#открой',
       '#рядом',
+      '#сущности',
+      '#иди к Farmer',
+      '#нажми Farmer',
+      '#окно',
+      '#закрой',
+      '#иди к Market',
+      '#нажми Market',
+      '#окно',
+      '#клик 4',
+      '#закрой',
+      '#инвентарь',
     ]) {
       const started = Date.now();
       const r = await runCommand(bot, line);

@@ -12,11 +12,12 @@ const { fakeClock, makeWorld, physicsBot, autoServer, teleport, take, runFor, VE
 const { runCommand, catalog, COMMANDS, parseCoord, parseBlockPos } = require(path.join(__dirname, '..', 'src', 'bot', 'commands.js'));
 
 /** Бот стоит в 0.5 64 0.5 на камне, смотрит на юг (+z). players: [{ name, at: [x, y, z] }], inventory: [[имя, кол-во]]. */
-function setup({ players = [], farPlayers = [], chests = {}, inventory = [] } = {}) {
+function setup({ players = [], farPlayers = [], chests = {}, inventory = [], entities = [], npcs = {}, onClick = null } = {}) {
   const clock = fakeClock();
   const world = makeWorld(require('prismarine-registry')(VERSION));
   const bot = physicsBot({ clock, world, actions: true });
-  autoServer(bot, world, { chests });
+  autoServer(bot, world, { chests, npcs, onClick });
+  for (const e of entities) bot.entities[e.id] = e;
   bot.emit('login');
   teleport(bot);
   clock.advance(100);
@@ -176,6 +177,75 @@ test('команды: #возьми — по-русски выбирает лу�
   assert.equal((await run('#возьми planks')).data.item, 'oak_planks');
   assert.equal(bot.heldItem.name, 'oak_planks');
   assert.match((await run('#возьми')).message, /что взять\?/);
+});
+
+test('команды: NPC — #сущности, #нажми по имени (и по надписи над ним), #окно с описаниями, #клик, #закрой', async () => {
+  const json = (text) => JSON.stringify({ text });
+  const slots = (filled) => {
+    const s = new Array(90).fill(null);
+    for (const [i, it] of Object.entries(filled)) s[i] = it;
+    return s;
+  };
+  const farmerMenu = () => ({
+    id: 5,
+    title: json('Фермер › Уровень 3'),
+    inventoryStart: 54,
+    slots: slots({
+      20: { name: 'hay_block', count: 3, customName: json('Покупка'), customLore: [json('Вам доступны товары 3 уровня')] },
+      24: { name: 'experience_bottle', count: 1, customName: '{"text":"Улучшения","color":"green"}', customLore: [json('Повышайте уровень доверия фермера'), json('Вам доступны товары 3 уровня')] },
+    }),
+  });
+  const questsMenu = () => ({
+    id: 6,
+    title: json('Фермер › Уровень 2 → 4'),
+    inventoryStart: 54,
+    slots: slots({ 10: { name: 'cookie', count: 1, customName: json('Какао для настроения.'), customLore: [json('• Награда: 32 печенья'), json('Передайте какао-бобы или печенье: 0/96')] } }),
+  });
+  const villager = (id, x, z, name) => ({
+    id, type: 'mob', name: 'villager', position: new Vec3(x, 64, z), height: 1.95, width: 0.6,
+    getCustomName: () => (name ? { json: { text: name }, toString: () => name } : null),
+  });
+  const { run, bot, logs } = setup({
+    entities: [
+      villager(201, 0.5, 2.5, null), // имя — только в надписи над ним
+      { id: 202, type: 'object', name: 'text_display', position: new Vec3(0.5, 66.4, 2.5), metadata: [0, 0, null, json('Фермер')] },
+      villager(203, 3.5, 2.5, 'Оружейник'),
+    ],
+    npcs: { 201: farmerMenu },
+    onClick: (window, slot) => (window.id === 5 && slot === 24 ? questsMenu() : null),
+  });
+
+  const list = await run('#сущности');
+  assert.deepEqual(list.data.entities.map((e) => [e.id, e.type, e.name]), [[201, 'villager', null], [202, 'text_display', 'Фермер'], [203, 'villager', 'Оружейник']]);
+  assert.ok(logs.includes('info:@202 text_display «Фермер» — 3.1 бл.'), logs.join('\n'));
+
+  const opened = await run('#нажми Фермер');
+  assert.equal(opened.ok, true, opened.message);
+  assert.equal(opened.message, 'Нажал на Фермер: открылось меню «Фермер › Уровень 3» — #окно покажет, что в нём');
+  const uses = take(bot).filter((p) => p.name === 'use_entity');
+  assert.deepEqual(uses.map((p) => [p.params.target, p.params.mouse]), [[201, 2], [201, 0]], 'как клиент: «нажать в точку», потом «нажать»');
+
+  const menu = await run('#окно');
+  assert.deepEqual(menu.message, [
+    'Меню «Фермер › Уровень 3»: предметов 2',
+    '[20] Покупка ×3 (hay_block) — Вам доступны товары 3 уровня',
+    '[24] Улучшения (experience_bottle) — Повышайте уровень доверия фермера / Вам доступны товары 3 уровня',
+  ]);
+  const click = await run('#клик 24');
+  assert.equal(click.message, 'Клик по [24] Улучшения: открылось меню «Фермер › Уровень 2 → 4» — #окно покажет, что в нём');
+  assert.deepEqual(bot.clicks.map((c) => [c.window, c.slot, c.mouseButton]), [[5, 24, 0]]);
+  const quests = await run('#окно');
+  assert.equal(quests.data.slots[0].name, 'Какао для настроения.');
+  assert.deepEqual(quests.data.slots[0].lore, ['• Награда: 32 печенья', 'Передайте какао-бобы или печенье: 0/96']);
+  assert.equal((await run('#клик 99')).ok, false, 'нет такой ячейки — отказ, а не клик');
+  assert.equal((await run('#закрой')).message, 'Меню закрыто');
+  assert.equal(bot.currentWindow, null);
+  assert.match((await run('#окно')).message, /меню не открыто/);
+
+  assert.equal((await run('#нажми Оружейник')).message, '#нажми: слишком далеко — подойди ближе', 'до него 3,2 блока, а дотянуться можно на 2,9');
+  assert.equal((await run('#иди к Оружейник')).message, 'Подошёл к Оружейник');
+  assert.equal((await run('#нажми Оружейник')).message, 'Нажал на Оружейник (меню не открылось)');
+  assert.match((await run('#нажми Кузнец')).message, /рядом нет «Кузнец» — посмотри, кто есть: #сущности/);
 });
 
 test('команды: неизвестная — подсказка; #помощь работает и без мира; #стоп', async () => {
