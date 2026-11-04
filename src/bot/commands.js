@@ -922,7 +922,7 @@ async function cmdGuard({ bot, words }) {
     return { ok: true, message: 'Охрана выключена до следующего /home или /rtp', data: { armed: false } };
   }
   if (w) return { ok: false, code: 'bad_args', message: 'Так: #охрана, #охрана вкл или #охрана выкл' };
-  return { ok: true, message: guard.status(), data: { armed: guard.armed, active: guard.active, pvp: guard.pvp } };
+  return { ok: true, message: guard.status(), data: { armed: guard.armed, active: guard.active, pvp: Boolean(guard.inPvp) } };
 }
 
 /**

@@ -52,7 +52,8 @@ function setup(over = {}, timings = {}, extra = {}) {
   const mgr = new BotManager({
     config,
     authCacheDir: '/tmp/auth',
-    timings,
+    // Паузы между командами в чат проверяются отдельно (см. «очередь команд»); здесь команды уходят сразу.
+    timings: { commandGap: 0, ...timings },
     createBot: (opts) => {
       const b = new FakeBot(opts);
       bots.push(b);
@@ -913,10 +914,103 @@ test('охрана и режим бога в менеджере: /god после
   msg('| Окружающие игроки: [Игрок] Stranger(30m)');
   assert.equal(bot.sent.at(-1), '/spawn');
   assert.ok(lines(logs).includes('warn:Охрана: рядом чужой — Stranger (30 м). Ухожу на спавн (/spawn)'));
-  assert.ok(lines(logs).includes('info:Охрана выключена: бот ушёл на спавн'));
+  assert.ok(!lines(logs).some((l) => l.startsWith('info:Охрана выключена')), 'выключится, только когда бот правда на спавне');
+
+  // Сервер перенёс бота в мир спавна — охрана выключилась и молчит.
+  bot.worldName = 'lobby';
+  bot.emit('respawn');
+  assert.ok(lines(logs).includes('info:Охрана выключена: бот на спавне'));
   const sentAfter = bot.sent.length;
   seconds(15);
   assert.equal(bot.sent.length, sentAfter, 'на спавне охрана молчит');
+  mgr.shutdown();
+});
+
+test('очередь команд: не чаще раза в 1,5 с — /spawn охраны за /near не теряется; срочное — вперёд, повтор не копится', (t) => {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: 1000000 });
+  const { mgr, bots, logs, chats } = setup({ whitelist: '', godMode: false }, { commandGap: 1500 });
+  mgr.start();
+  const bot = bots[0];
+  goOnline(bot);
+  const ms = (n) => {
+    for (let i = 0; i < n; i += 100) t.mock.timers.tick(100);
+  };
+  const msg = (text) => bot.emit('message', { toString: () => text, toMotd: () => text }, 'system');
+
+  // Человек пишет две команды подряд: вторая ждёт 1,5 с, а в чате панели видна, когда правда ушла.
+  assert.equal(mgr.say('/rtp'), true);
+  assert.equal(mgr.say('/sethome home'), true);
+  assert.deepEqual(bot.sent, ['/rtp']);
+  assert.ok(!chats.some((c) => c.text === '› /sethome home'));
+  ms(1400);
+  assert.deepEqual(bot.sent, ['/rtp']);
+  ms(100);
+  assert.deepEqual(bot.sent, ['/rtp', '/sethome home']);
+  assert.ok(chats.some((c) => c.text === '› /sethome home'));
+
+  // /rtp сработал: другой мир — охрана включилась, /near — через 1,5 с после телепорта.
+  bot.worldName = 'world';
+  bot.emit('respawn');
+  ms(1500);
+  assert.equal(bot.sent.at(-1), '/near');
+  // Ответ пришёл сразу — чужой. Как на MineBlaze 4 ноября: /spawn сразу за /near сервер молча пропускал.
+  msg('| Окружающие игроки: [Игрок] kakajamba(0m)');
+  assert.equal(bot.sent.at(-1), '/near', '/spawn ждёт: 1,5 с после /near ещё не прошли');
+  mgr.say('/god'); // человек тоже что-то пишет — срочный /spawn охраны всё равно первый
+  ms(1500);
+  assert.deepEqual(bot.sent.slice(-1), ['/spawn']);
+  ms(1500);
+  assert.deepEqual(bot.sent.slice(-2), ['/spawn', '/god']);
+  assert.ok(lines(logs).includes('warn:Охрана: рядом чужой — kakajamba (0 м). Ухожу на спавн (/spawn)'));
+
+  // Сервер /spawn пропустил: телепорта нет — через 4 с после него охрана пишет /spawn ещё раз.
+  ms(2400);
+  assert.equal(bot.sent.filter((c) => c === '/spawn').length, 1);
+  ms(100);
+  assert.equal(bot.sent.filter((c) => c === '/spawn').length, 2);
+  assert.ok(lines(logs).includes('warn:Охрана: телепорта на спавн нет — /spawn ещё раз (попытка 2)'));
+  bot.worldName = 'lobby';
+  bot.emit('respawn');
+  assert.ok(lines(logs).includes('info:Охрана выключена: бот на спавне'));
+  ms(20000);
+  assert.equal(bot.sent.filter((c) => c === '/spawn').length, 2, 'на спавне — тишина');
+  assert.ok(!bot.sent.slice(bot.sent.lastIndexOf('/spawn')).includes('/near'));
+  mgr.shutdown();
+});
+
+test('очередь команд: одинаковые не копятся, ненужные не уходят, при переходе на другой сервер ждут', (t) => {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: 1000000 });
+  const { mgr, bots } = setup({ godMode: false }, { commandGap: 1500 });
+  mgr.start();
+  const bot = bots[0];
+  goOnline(bot);
+  const s = mgr.cur;
+  mgr.say('/a');
+  mgr._send(s, '/near', { quiet: true, key: 'near' });
+  mgr._send(s, '/near', { quiet: true, key: 'near' });
+  mgr._send(s, '/x', { check: () => false });
+  mgr._send(s, '/b');
+  t.mock.timers.tick(1500);
+  t.mock.timers.tick(1500);
+  t.mock.timers.tick(1500);
+  assert.deepEqual(bot.sent, ['/a', '/near', '/b'], 'второй /near заменил первый, /x уже не нужен');
+
+  // Прокси переводит бота на другой сервер: команда ждёт, пока переход не закончится.
+  mgr._send(s, '/c');
+  assert.deepEqual(bot.sent.slice(-1), ['/c'], 'очередь пуста и пауза прошла — сразу');
+  s.switching = true;
+  mgr.say('/d');
+  t.mock.timers.tick(3000);
+  assert.deepEqual(bot.sent.slice(-1), ['/c']);
+  s.switching = false;
+  t.mock.timers.tick(500);
+  assert.deepEqual(bot.sent.slice(-1), ['/d']);
+
+  // Часы Windows перевели на час назад: очередь не встаёт на час.
+  t.mock.timers.tick(1500);
+  s.lastSentAt = Date.now() + 3600 * 1000;
+  mgr.say('/e');
+  assert.deepEqual(bot.sent.slice(-1), ['/e']);
   mgr.shutdown();
 });
 

@@ -56,7 +56,11 @@ const DEFAULT_TIMINGS = Object.freeze({
   msaTimeout: 15 * 60 * 1000, // вход через Microsoft: время, чтобы ввести код в браузере
   joinFirst: 1500, // пауза после появления в мире перед первой командой
   joinStep: 1200, // пауза между командами после входа
+  // Между командами (и сообщениями) в чат. MineBlaze молча пропускает команду, пришедшую меньше чем через
+  // ~1 с после предыдущей: так терялся /spawn охраны сразу за /near и второй /god подряд.
+  commandGap: 1500,
 });
+const OUTBOX_SWITCH_WAIT_MS = 500; // пока прокси переводит бота на другой сервер, команды ждут
 
 // Автореконнект: первые попытки — с паузой из настроек, дальше пауза удваивается (но не больше минуты),
 // чтобы не долбить лежащий сервер и не попасть под защиту от частых подключений.
@@ -301,6 +305,9 @@ class BotManager extends EventEmitter {
     clearTimeout(s.loginTimer);
     clearTimeout(s.joinTimer);
     clearInterval(s.silenceTimer);
+    clearTimeout(s.outboxTimer);
+    s.outboxTimer = null;
+    if (s.outbox) s.outbox.length = 0;
     if (s.guard) s.guard.stop();
     if (s.god) s.god.stop();
   }
@@ -378,6 +385,9 @@ class BotManager extends EventEmitter {
       errorTimer: null,
       loginTimer: null,
       joinTimer: null,
+      outbox: [], // команды и сообщения, ждущие своей очереди (см. _send)
+      outboxTimer: null,
+      lastSentAt: 0,
     };
     const alive = () => this.cur === s;
 
@@ -509,6 +519,9 @@ class BotManager extends EventEmitter {
       if (!alive()) return;
       s.dead = true;
       this.log('warn', 'Бот погиб');
+      // Бой для бота кончился, а «Вы вышли из режима PvP» после гибели сервер может и не написать.
+      s.guard.onDeath();
+      s.god.onDeath();
     });
 
     // Без ответа на запрос ресурспака многие серверы не пускают дальше или кикают.
@@ -699,14 +712,71 @@ class BotManager extends EventEmitter {
     this._forceClose(s, 'timeout');
   }
 
-  /** Отправить в чат сервера. quiet — не показывать команду в чате панели (частые команды охраны). */
-  _send(s, msg, { quiet = false } = {}) {
+  /**
+   * Отправить в чат сервера — по очереди, не чаще раза в timings.commandGap: команду, пришедшую сразу за
+   * другой, MineBlaze молча пропускает (так терялся /spawn охраны сразу за /near).
+   *   quiet  — не показывать команду в чате панели (частые команды охраны);
+   *   urgent — вперёд очереди (/spawn охраны);
+   *   key    — одна такая в очереди: новая заменяет ждущую;
+   *   origin — кто отправил ('guard', 'god'; человек — никто): охране и режиму бога важно, чья команда;
+   *   check  — () => нужна ли ещё команда, когда до неё дойдёт очередь (false — не отправлять).
+   * true — отправлено или ждёт очереди; false — отправить не вышло.
+   */
+  _send(s, msg, { quiet = false, urgent = false, key = null, origin = null, check = null } = {}) {
+    const item = { msg, quiet, key, origin, check };
+    if (!s.outbox.length && !s.switching && this._gapLeft(s) === 0) return this._write(s, item);
+    const same = key ? s.outbox.findIndex((x) => x.key === key) : -1;
+    if (same >= 0) s.outbox.splice(same, 1);
+    if (urgent) s.outbox.unshift(item);
+    else s.outbox.push(item);
+    this._scheduleOutbox(s);
+    return true;
+  }
+
+  /** Сколько ещё ждать до следующей отправки, мс. Больше одной паузы — часы перевели назад: не ждём. */
+  _gapLeft(s) {
+    const left = s.lastSentAt + this.timings.commandGap - Date.now();
+    return left > 0 && left <= this.timings.commandGap ? left : 0;
+  }
+
+  _scheduleOutbox(s) {
+    if (s.outboxTimer || !s.outbox.length) return;
+    const wait = s.switching ? OUTBOX_SWITCH_WAIT_MS : this._gapLeft(s);
+    s.outboxTimer = later(() => {
+      s.outboxTimer = null;
+      this._drainOutbox(s);
+    }, wait);
+  }
+
+  _drainOutbox(s) {
+    if (this.cur !== s || s.stopping || !s.loggedIn) {
+      s.outbox.length = 0;
+      return;
+    }
+    while (s.outbox.length && !s.switching && this._gapLeft(s) === 0) {
+      const item = s.outbox.shift();
+      let needed = true;
+      if (item.check) {
+        try {
+          needed = Boolean(item.check());
+        } catch (_) {
+          needed = false;
+        }
+      }
+      if (needed) this._write(s, item); // не нужна (например, охрана уже выключилась) — просто пропускаем
+    }
+    this._scheduleOutbox(s);
+  }
+
+  /** Сама отправка: в чат сервера, строка «› /команда» в чат панели, охране и режиму бога — что ушло. */
+  _write(s, { msg, quiet, origin }) {
     try {
       s.bot.chat(msg);
     } catch (err) {
       this.log('error', `Не удалось отправить сообщение: ${describeError(err)}`);
       return false;
     }
+    s.lastSentAt = Date.now();
     if (msg.startsWith('/')) {
       // Ответ на команду сервер пришлёт сам, а саму команду покажем в чате (пароли скрыты).
       if (!quiet) {
@@ -714,8 +784,8 @@ class BotManager extends EventEmitter {
         this.emit('chat', { time: Date.now(), text: shown, motd: shown, position: 'self' });
       }
       // /home, /rtp, /spawn, /warp ah включают и выключают охрану — откуда бы ни пришли.
-      if (s.guard) s.guard.onCommand(msg);
-      if (s.god) s.god.onCommand(msg);
+      if (s.guard) s.guard.onCommand(msg, { origin });
+      if (s.god) s.god.onCommand(msg, { origin });
     }
     return true;
   }

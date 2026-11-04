@@ -60,7 +60,7 @@ function setup(config = {}) {
     getBot: () => bot,
     send: (cmd, opts) => {
       sent.push({ cmd, quiet: Boolean(opts && opts.quiet) });
-      guard.onCommand(cmd); // как BotManager._send
+      guard.onCommand(cmd, opts); // как BotManager, когда команда уходит на сервер
       return true;
     },
     log: (level, text) => logs.push(`${level}:${text}`),
@@ -116,7 +116,7 @@ test('охрана: после /home ждёт телепорта, потом /ne
   assert.match(t.guard.status(), /Охрана следит: \/near раз в 5 с; белый список: 1 ник; последний \/near 0 с назад: никого/);
 });
 
-test('охрана: чужой в /near — стоп действий и сразу /spawn, охрана выключается', () => {
+test('охрана: чужой в /near — стоп действий и /spawn; телепорта нет — /spawn ещё раз; выключается только на спавне', () => {
   const t = setup();
   t.guard.onCommand('/rtp');
   teleport(t, -2763, 64, -2680);
@@ -124,10 +124,25 @@ test('охрана: чужой в /near — стоп действий и сра�
   assert.deepEqual(t.cmds(), ['/spawn']);
   assert.equal(t.stopped(), 1, 'текущее действие прервано');
   assert.ok(t.logs.includes('warn:Охрана: рядом чужой — xDeadForFantasy (50 м). Ухожу на спавн (/spawn)'));
-  assert.ok(t.logs.includes('info:Охрана выключена: бот ушёл на спавн'));
+  assert.equal(t.guard.armed, true, 'команда ушла, но телепорта ещё не было — охрана не выключается');
+  assert.match(t.guard.status(), /^Охрана уводит бота на спавн: жду телепорта после \/spawn;/);
+
+  // Сервер команду пропустил (MineBlaze так делает с командой сразу за другой): через 4 с — ещё раз.
+  t.timers.advance(3999);
+  assert.deepEqual(t.cmds(), ['/spawn']);
+  t.timers.advance(1);
+  assert.deepEqual(t.cmds(), ['/spawn', '/spawn']);
+  assert.ok(t.logs.includes('warn:Охрана: телепорта на спавн нет — /spawn ещё раз (попытка 2)'));
+  t.guard.onChat('| Окружающие игроки: [Игрок] xDeadForFantasy(50m)');
+  assert.deepEqual(t.cmds(), ['/spawn', '/spawn'], 'уже уходит — новые ответы /near лишних /spawn не дают');
+
+  // Телепорт в мир спавна — охрана выключилась и больше ничего не пишет.
+  t.bot.worldName = 'lobby';
+  t.guard.onTeleport();
+  assert.ok(t.logs.includes('info:Охрана выключена: бот на спавне'));
   assert.equal(t.guard.armed, false);
   t.timers.advance(20000);
-  assert.deepEqual(t.cmds(), ['/spawn'], 'после ухода на спавн /near больше не шлёт');
+  assert.deepEqual(t.cmds(), ['/spawn', '/spawn'], 'на спавне ни /near, ни /spawn');
 });
 
 test('охрана: /near показал псевдоним — свой, если настоящий ник (из Tab) в белом списке', () => {
@@ -169,27 +184,88 @@ test('охрана: игрока видно глазами — не ждёт /ne
   assert.ok(t.logs.includes('warn:Охрана: рядом чужой — Griefer (30 м, виден). Ухожу на спавн (/spawn)'));
 });
 
-test('охрана: в бою (PvP) телепорт запрещён — /spawn сразу после выхода из боя', () => {
+test('охрана: в бою (PvP) телепорт запрещён — /near не пишет, /spawn сразу после выхода из боя', () => {
   const t = setup();
   t.guard.onCommand('/home home');
   teleport(t);
   t.guard.onChat('| Вы вошли в режим PvP! Не выходите из игры, иначе будете наказаны!');
+  t.timers.advance(10000);
+  assert.deepEqual(t.cmds(), [], 'в бою /near бесполезен — сервер ответит «нельзя во время PvP»');
+  assert.match(t.guard.status(), /идёт бой \(PvP\): сервер не выполняет команды/);
   t.guard.onChat('| Окружающие игроки: [Игрок] Griefer(5m)');
   assert.ok(!t.cmds().includes('/spawn'));
   assert.ok(t.logs.some((l) => l.startsWith('warn:Охрана: рядом чужой — Griefer (5 м), но идёт бой (PvP)')));
   t.guard.onChat('| Вы вышли из режима PvP! Можете использовать команды и выходить из игры.');
-  assert.ok(t.cmds().includes('/spawn'));
+  assert.deepEqual(t.cmds(), ['/spawn']);
+
+  // Как 4 ноября: /spawn ушёл, а бой начался тут же — сервер отказал. В бою не долбит, после боя — сразу.
+  const u = setup();
+  u.guard.onCommand('/rtp');
+  teleport(u);
+  u.guard.onChat('| Окружающие игроки: [Игрок] kakajamba(0m)');
+  assert.deepEqual(u.cmds(), ['/spawn']);
+  u.guard.onChat('| Вы вошли в режим PvP! Не выходите из игры, иначе будете наказаны!');
+  u.guard.onChat('| Вы не можете использовать команды во время PvP!');
+  assert.ok(u.logs.includes('warn:Охрана: идёт бой (PvP) — сервер не выполнил /spawn. /spawn — сразу после боя'));
+  u.timers.advance(30000);
+  assert.deepEqual(u.cmds(), ['/spawn']);
+  u.guard.onChat('| Вы вышли из режима PvP! Можете использовать команды и выходить из игры.');
+  assert.deepEqual(u.cmds(), ['/spawn', '/spawn']);
+
+  // Конца боя не видно (сообщение потерялось) — через минуту без признаков боя пробует сама.
+  const v = setup();
+  v.guard.onCommand('/rtp');
+  teleport(v);
+  v.guard.onChat('| Вы вошли в режим PvP! Не выходите из игры, иначе будете наказаны!');
+  v.guard.onChat('| Окружающие игроки: [Игрок] kakajamba(3m)');
+  v.timers.advance(59999);
+  assert.deepEqual(v.cmds(), []);
+  v.timers.advance(1);
+  assert.deepEqual(v.cmds(), ['/spawn']);
+
+  // Погиб в бою — бой для него кончился.
+  const w = setup();
+  w.guard.onChat('| Вы вошли в режим PvP! Не выходите из игры, иначе будете наказаны!');
+  assert.equal(w.guard.inPvp, true);
+  w.guard.onDeath();
+  assert.equal(w.guard.inPvp, false);
 });
 
-test('охрана: /spawn, /warp ah и выключатель в настройках', () => {
+test('охрана: /warp ah и /spawn человека — выключается после телепорта; телепорта нет — следит дальше', () => {
   const t = setup();
   t.guard.onCommand('/home home');
   t.guard.onCommand('/warp ah');
+  assert.equal(t.guard.armed, true, 'до телепорта не выключается');
+  t.bot.worldName = 'lobby';
+  t.guard.onTeleport();
   assert.equal(t.guard.armed, false);
   assert.ok(t.logs.includes('info:Охрана выключена: бот ушёл на /warp ah'));
   t.guard.onCommand('/spawner'); // магазин спавнеров — не /spawn
   t.guard.onCommand('/homes');
   assert.equal(t.guard.armed, false, '/homes — список домов, не телепорт');
+
+  // /spawn человека сервер пропустил: через 4 с охрана снова следит и сразу проверяет /near.
+  const u = setup();
+  u.guard.onCommand('/home home');
+  teleport(u);
+  u.timers.advance(1500);
+  assert.deepEqual(u.cmds(), ['/near']);
+  u.guard.onCommand('/spawn');
+  u.timers.advance(3999);
+  assert.deepEqual(u.cmds(), ['/near'], 'пока ждёт телепорта — /near не пишет');
+  u.timers.advance(1);
+  assert.ok(u.logs.includes('warn:Охрана: после /spawn телепорта не было — охрана работает дальше'));
+  assert.deepEqual(u.cmds(), ['/near', '/near']);
+  assert.equal(u.guard.active, true);
+
+  // Телепорт на другой конец того же мира после /spawn — тоже ушёл.
+  const w = setup();
+  w.guard.onCommand('/home home');
+  teleport(w);
+  w.guard.onCommand('/spawn');
+  w.bot.entity.position = new Vec3(0, 70, 0);
+  w.guard.onTeleport();
+  assert.ok(w.logs.includes('info:Охрана выключена: бот на спавне'));
 
   t.cfg.guard = false;
   t.guard.onCommand('/home home');
@@ -249,9 +325,9 @@ function godSetup(config = {}, { remembered = null, gameMode = 'survival' } = {}
   const cfg = { godMode: true, ...config };
   const bot = { game: { gameMode } };
   const god = new GodKeeper({
-    send: (cmd) => {
+    send: (cmd, opts) => {
       sent.push(cmd);
-      god.onCommand(cmd);
+      god.onCommand(cmd, opts); // как BotManager, когда команда уходит на сервер
       return true;
     },
     log: (level, text) => logs.push(`${level}:${text}`),
@@ -341,6 +417,68 @@ test('режим бога: нет прав — не долбит; три неу�
   off.god.schedule(0);
   off.timers.advance(1000);
   assert.deepEqual(off.sent, []);
+});
+
+test('режим бога: в бою (PvP) /god не проходит — пишет сразу после боя', () => {
+  const g = godSetup({}, { remembered: true });
+  g.god.onHealth(20, 20);
+  g.god.onChat('| Вы вошли в режим PvP! Не выходите из игры, иначе будете наказаны!');
+  g.god.onHealth(14, 20); // бьют: в бою режима бога нет
+  assert.deepEqual(g.sent, [], 'в бою сервер команды не выполняет — не пишем');
+  assert.ok(g.logs.includes('warn:Режим бога, похоже, выключен (бот теряет здоровье) — идёт бой (PvP), /god сразу после боя'));
+  g.timers.advance(30000);
+  assert.deepEqual(g.sent, []);
+  g.god.onChat('| Вы вышли из режима PvP! Можете использовать команды и выходить из игры.');
+  g.timers.advance(1500);
+  assert.deepEqual(g.sent, ['/god']);
+  g.god.onChat('| Режим Бога включен.');
+  assert.ok(g.logs.includes('ok:Режим бога включён'));
+
+  // /god ушёл, а бой уже идёт: сервер ответил «нельзя во время PvP» — это ответ, а не тишина: повтор после боя.
+  const d = godSetup();
+  d.god.schedule(0);
+  d.timers.advance(0);
+  assert.deepEqual(d.sent, ['/god']);
+  d.god.onChat('| Вы не можете использовать команды во время PvP!');
+  assert.ok(d.logs.includes('warn:Режим бога: идёт бой (PvP), сервер не выполняет команды — /god сразу после боя'));
+  d.timers.advance(20000);
+  assert.deepEqual(d.sent, ['/god']);
+  d.god.onChat('| Вы вышли из режима PvP! Можете использовать команды и выходить из игры.');
+  d.timers.advance(1500);
+  assert.deepEqual(d.sent, ['/god', '/god']);
+  assert.ok(!d.logs.some((l) => l.includes('ничего понятного не ответил')));
+
+  // Погиб в бою: «вышли из PvP» сервер не пишет — /god после возрождения.
+  const e = godSetup();
+  e.god.onChat('| Вы вошли в режим PvP! Не выходите из игры, иначе будете наказаны!');
+  e.god.onHealth(20, 20);
+  e.god.onHealth(6, 20);
+  e.god.onDeath();
+  e.timers.advance(1500);
+  assert.deepEqual(e.sent, ['/god']);
+});
+
+test('режим бога: человек сам написал /god — убыль сразу после него не повод переключать снова', () => {
+  // 4 ноября: /god из панели → «Режим Бога включен.» → тут же «убыль» — бот написал /god ещё раз (выключил бы).
+  const h = godSetup();
+  h.god.onHealth(16, 17);
+  h.god.onCommand('/god'); // человек из панели
+  h.god.onChat('| Режим Бога включен.');
+  h.god.onHealth(20, 20);
+  h.god.onHealth(20, 19);
+  assert.deepEqual(h.sent, []);
+  h.timers.advance(10000);
+  h.god.onHealth(20, 18); // а через 10 с убыль — уже признак
+  assert.deepEqual(h.sent, ['/god']);
+
+  // Ответа на /god человека нет (сервер пропустил) — бот не застревает «в ожидании» и дальше следит за уроном.
+  const q = godSetup({}, { remembered: true });
+  q.god.onHealth(20, 20);
+  q.god.onCommand('/god');
+  q.timers.advance(15000);
+  assert.deepEqual(q.sent, [], 'за человека /god не повторяет');
+  q.god.onHealth(15, 20);
+  assert.deepEqual(q.sent, ['/god']);
 });
 
 test('режим бога: сообщение игрока в чате — не ответ сервера', () => {
