@@ -9,6 +9,7 @@
 const { Vec3 } = require('vec3');
 const { FACE_VECTORS } = require('./actions');
 const { chatToText } = require('../chat-utils');
+const { parseQuestMenu, parseOffer, describeQuest, matchesQuery } = require('./quests');
 
 const MAX_WALK = 64; // по прямой дальше не ходим (поиска пути пока нет)
 const MAX_STEPS = 32; // «#вперёд N»: не больше
@@ -25,6 +26,14 @@ const toDeg = (rad) => (rad * 180) / Math.PI;
 const toRad = (deg) => (deg * Math.PI) / 180;
 const clampPitch = (p) => Math.max(-90, Math.min(90, p));
 const fmtPos = (p) => `${p.x} ${p.y} ${p.z}`;
+/** 1 раз, 2 раза, 5 раз. */
+const plural = (n, one, few, many) => {
+  const a = Math.abs(n) % 100;
+  const b = a % 10;
+  if (a > 10 && a < 20) return many;
+  if (b > 1 && b < 5) return few;
+  return b === 1 ? one : many;
+};
 const plain = (v) => ({ x: v.x, y: v.y, z: v.z });
 // Углы как в F3: поворот 0 — юг, 90 — запад, 180 — север, -90 — восток; наклон вниз — плюс.
 const f3Yaw = (yawRad) => ((((180 - toDeg(yawRad) + 180) % 360) + 360) % 360) - 180;
@@ -221,9 +230,9 @@ const itemTitle = (it) => textOf(it.customName) || it.displayName || it.name;
 const itemLore = (it) => (Array.isArray(it.customLore) ? it.customLore : it.customLore ? [it.customLore] : []).map(textOf).filter(Boolean);
 const windowTitle = (w) => textOf(w.title) || w.type || 'меню';
 
-/** Ждать до секунды, пока не откроется новое меню (не то, что было). */
-async function waitNewWindow(bot, before) {
-  for (let i = 0; i < 20 && (!bot.currentWindow || bot.currentWindow === before); i += 1) await bot.actions.wait(50);
+/** Ждать (по умолчанию до секунды), пока не откроется новое меню (не то, что было). */
+async function waitNewWindow(bot, before, ms = 1000) {
+  for (let i = 0; i < ms / 50 && (!bot.currentWindow || bot.currentWindow === before); i += 1) await bot.actions.wait(50);
   return bot.currentWindow && bot.currentWindow !== before ? bot.currentWindow : null;
 }
 
@@ -620,6 +629,214 @@ async function cmdClose({ bot }) {
   return { ok: true, message: r.closed ? 'Меню закрыто' : 'Меню и так не открыто', data: r };
 }
 
+// ---------- задания и покупки у NPC (Фермер, Алхимик, Оружейник — /warp ah) ----------
+
+const QUEST_NPC = 'Фермер';
+const NPC_REACH = 2.5; // ближе — можно нажимать (дотянуться можно на 2,9 от глаз)
+const MENU_WAIT_MS = 2000; // меню NPC сервер присылает не сразу
+const AFTER_CLICK_MS = 400; // после клика сервер пересобирает меню несколькими пакетами
+const MAX_BUY = 20;
+
+/** Ячейки меню (без инвентаря игрока) в виде для разбора: { slot, title, lore, icon, count }. */
+function menuSlots(w) {
+  const end = Number.isInteger(w.inventoryStart) ? w.inventoryStart : w.slots.length;
+  const out = [];
+  for (let i = 0; i < end; i += 1) {
+    const it = w.slots[i];
+    if (it) out.push({ slot: i, title: itemTitle(it), lore: itemLore(it), icon: it.name, count: it.count || 1 });
+  }
+  return out;
+}
+
+const findButton = (w, re) => {
+  const s = menuSlots(w).find((x) => re.test(x.title));
+  return s ? s.slot : null;
+};
+
+/** Сколько у бота предметов из списка (пока открыто меню — по его части с инвентарём игрока). */
+function countItems(bot, ids) {
+  const w = bot.currentWindow;
+  const slots = w && Number.isInteger(w.inventoryStart) ? w.slots.slice(w.inventoryStart) : bot.inventory ? bot.inventory.slots : [];
+  return slots.filter((it) => it && ids.includes(it.name)).reduce((n, it) => n + (it.count || 1), 0);
+}
+
+/** Открыть меню NPC: подойти, если далеко, и нажать. Уже открытое меню этого NPC — оставить. */
+async function openNpcMenu(bot, npc) {
+  const cur = bot.currentWindow;
+  if (cur && norm(windowTitle(cur)).includes(norm(npc))) return cur;
+  if (cur) await bot.actions.closeMenu();
+  let e;
+  try {
+    e = findEntity(bot, npc);
+  } catch (err) {
+    throw new CommandError(`рядом нет «${npc}» — сначала /warp ah (NPC стоят там), потом #сущности покажет, кто есть`);
+  }
+  if (bot.entity.position.distanceTo(e.position) > NPC_REACH) await goToEntity(bot, e, false, npc);
+  const before = bot.currentWindow;
+  await bot.actions.interact(e);
+  const w = await waitNewWindow(bot, before, MENU_WAIT_MS);
+  if (!w) throw new CommandError(`${npc} не открыл меню`);
+  return w;
+}
+
+/** Открыть меню NPC и перейти в нужный раздел (кнопка по названию), если его ячеек ещё не видно. */
+async function openNpcSection(bot, npc, isSection, buttonRe, what) {
+  const w = await openNpcMenu(bot, npc);
+  if (isSection(w)) return w;
+  const btn = findButton(w, buttonRe);
+  if (btn === null) throw new CommandError(`в меню «${windowTitle(w)}» нет кнопки «${what}»`);
+  await bot.actions.clickSlot(btn);
+  const next = await waitNewWindow(bot, w, MENU_WAIT_MS);
+  if (!next || !isSection(next)) throw new CommandError(`раздел «${what}» не открылся`);
+  return next;
+}
+
+const hasQuests = (w) => parseQuestMenu(menuSlots(w)).quests.length > 0;
+const hasOffers = (w) => menuSlots(w).some((s) => parseOffer(s));
+const openQuests = (bot, npc) => openNpcSection(bot, npc, hasQuests, /улучшени|задани|квест/i, 'Улучшения');
+const openShop = (bot, npc) => openNpcSection(bot, npc, hasOffers, /покупк|купить|магазин/i, 'Покупка');
+const readQuests = (bot) => (bot.currentWindow ? parseQuestMenu(menuSlots(bot.currentWindow)) : { quests: [], level: null });
+
+/** Кликнуть по ячейке меню и дождаться, пока сервер пересоберёт меню. */
+async function clickAndSettle(bot, slot) {
+  await bot.actions.clickSlot(slot);
+  await bot.actions.wait(AFTER_CLICK_MS);
+  if (!bot.currentWindow) throw new CommandError('меню закрылось');
+}
+
+const quote = (q) => `«${q.title}»`;
+
+/** «#квесты [взять|сдать] [NPC]» — разобрать слова. */
+function questArgs(args, words) {
+  const ACTIONS = { взять: 'take', возьми: 'take', прими: 'take', принять: 'take', take: 'take', сдать: 'give', сдай: 'give', отдать: 'give', отдай: 'give', give: 'give', deliver: 'give' };
+  let action = 'show';
+  const rest = [];
+  args.forEach((a, i) => {
+    if (action === 'show' && ACTIONS[words[i]]) action = ACTIONS[words[i]];
+    else rest.push(a);
+  });
+  return { action, npc: rest.join(' ') || QUEST_NPC };
+}
+
+/** Закрыть меню после дела (как человек: посмотрел — закрыл); ошибка закрытия не важнее ответа. */
+async function closeAfter(bot) {
+  if (!bot.currentWindow) return;
+  try {
+    await bot.actions.closeMenu();
+  } catch (_) {
+    /* например, действие прервали #стоп */
+  }
+}
+
+async function cmdQuests({ bot, args, words }) {
+  const { action, npc } = questArgs(args, words);
+  try {
+    await openQuests(bot, npc);
+    if (action === 'take') return await takeQuests(bot, npc);
+    if (action === 'give') return await giveQuests(bot, npc);
+    return showQuests(bot, npc);
+  } finally {
+    await closeAfter(bot);
+  }
+}
+
+function showQuests(bot, npc) {
+  const title = windowTitle(bot.currentWindow);
+  const { quests, level } = readQuests(bot);
+  const taken = quests.filter((q) => q.taken).length;
+  const done = quests.filter((q) => q.done).length;
+  const lines = [`Задания (${title}): ${quests.length}, взято ${taken}, выполнено ${done}`, ...quests.map(describeQuest)];
+  if (level) lines.push(`Уровень: ${level.text || level.title}${level.ready ? ' — можно повышать' : ''}`);
+  return { ok: true, message: lines, data: { npc, title, quests, level } };
+}
+
+async function takeQuests(bot, npc) {
+  const took = [];
+  const failed = [];
+  const tried = new Set();
+  for (;;) {
+    const next = readQuests(bot).quests.find((q) => !q.taken && !tried.has(q.slot));
+    if (!next) break;
+    tried.add(next.slot);
+    await clickAndSettle(bot, next.slot);
+    const after = readQuests(bot).quests.find((q) => q.slot === next.slot);
+    (after && after.taken ? took : failed).push(next);
+  }
+  const lines = [];
+  if (took.length) lines.push(`Взял задания: ${took.map(quote).join(', ')}`);
+  if (failed.length) lines.push(`Не взялись (сервер не отметил): ${failed.map(quote).join(', ')}`);
+  if (!took.length && !failed.length) lines.push('Все задания уже взяты');
+  return { ok: failed.length === 0, code: failed.length ? 'partial' : undefined, message: lines, data: { npc, took: took.map((q) => q.slot), failed: failed.map((q) => q.slot) } };
+}
+
+async function giveQuests(bot, npc) {
+  const gave = [];
+  const nothing = [];
+  const lines = [];
+  for (const q of readQuests(bot).quests) {
+    if (q.kind !== 'deliver' || !q.taken || q.done) continue;
+    if (q.items.length && countItems(bot, q.items) === 0) {
+      nothing.push(q);
+      continue;
+    }
+    await clickAndSettle(bot, q.slot);
+    const after = readQuests(bot).quests.find((x) => x.slot === q.slot) || q;
+    if (after.have > q.have || after.done) {
+      gave.push({ slot: q.slot, title: q.title, from: q.have, to: after.have, need: q.need });
+      lines.push(`Сдал в ${quote(q)}: ${q.have} → ${after.have} из ${q.need}${after.done ? ' — выполнено' : ''}`);
+    } else {
+      lines.push(`${quote(q)}: сервер ничего не взял (нужно: ${q.items.join(', ') || q.goal})`);
+    }
+  }
+  if (!gave.length && !lines.length) {
+    lines.push(nothing.length
+      ? `Сдавать нечего: в инвентаре нет нужного (${nothing.map((q) => `${quote(q)} — ${q.items.join('/')}`).join('; ')})`
+      : 'Сдавать нечего: нет взятых заданий «Передайте…»');
+  }
+  return { ok: true, message: lines, data: { npc, gave } };
+}
+
+/** «#купи сено 2 у Фермер» — купить у NPC в разделе «Покупка». */
+async function cmdBuy({ bot, args, words }) {
+  const at = words.indexOf('у');
+  const npc = at >= 0 ? args.slice(at + 1).join(' ') : QUEST_NPC;
+  const head = at >= 0 ? args.slice(0, at) : args;
+  const numIdx = head.findIndex((a) => /^\d+$/.test(a));
+  const times = numIdx >= 0 ? Math.min(MAX_BUY, Math.max(1, parseInt(head[numIdx], 10))) : 1;
+  const query = head.filter((_, i) => i !== numIdx).join(' ');
+  if (!query) throw new CommandError('что купить? Например: #купи сено 2 (или #купи сено 2 у Алхимик)');
+  try {
+    await openShop(bot, npc);
+    const offers = menuSlots(bot.currentWindow).map(parseOffer).filter(Boolean);
+    const offer = offers.find((o) => matchesQuery(o.title, query) || matchesQuery(o.icon, query));
+    if (!offer) throw new CommandError(`у ${npc} нет «${query}». Есть: ${offers.map((o) => o.title).join(', ') || 'ничего'}`);
+    let bought = 0;
+    let note = '';
+    for (let i = 0; i < times; i += 1) {
+      const before = parseOffer(menuSlots(bot.currentWindow).find((s) => s.slot === offer.slot) || { lore: [] });
+      if (before && before.left === 0) {
+        note = 'товар закончился';
+        break;
+      }
+      await clickAndSettle(bot, offer.slot);
+      const after = parseOffer(menuSlots(bot.currentWindow).find((s) => s.slot === offer.slot) || { lore: [] });
+      // Покупку подтверждает «Осталось»: уменьшилось — куплено. Если счётчика нет, верим клику.
+      if (before && after && before.left !== null && after.left !== null && after.left >= before.left) {
+        note = 'сервер не продал (не хватило денег?)';
+        break;
+      }
+      bought += 1;
+    }
+    const price = offer.price !== null ? ` по ${offer.price}` : '';
+    const msg = bought
+      ? `Купил «${offer.title}»${offer.count > 1 ? ` (×${offer.count})` : ''} ${bought} ${plural(bought, 'раз', 'раза', 'раз')}${price}${note ? `; дальше ${note}` : ''}`
+      : `Не купил «${offer.title}»: ${note || 'сервер не продал'}`;
+    return { ok: bought > 0, code: bought ? undefined : 'not_bought', message: msg, data: { npc, item: offer.title, bought, price: offer.price } };
+  } finally {
+    await closeAfter(bot);
+  }
+}
+
 async function cmdOpen({ bot, args }) {
   if (isCoords(args)) return useBlock(bot, parseBlockPos(args, bot.entity.position));
   const near = scanBlocks(bot, OPEN_RANGE + 1, (b) => isContainer(b.name)).filter((c) => c.dist <= OPEN_RANGE + 0.5);
@@ -752,6 +969,20 @@ const COMMANDS = [
   { name: 'инвентарь', aliases: ['inv', 'инв'], usage: ['#инвентарь'], about: 'что у бота в руке и в инвентаре', observe: true, run: cmdInventory },
   { name: 'рядом', aliases: ['near', 'кто'], usage: ['#рядом'], about: 'игроки и сундуки поблизости', observe: true, run: cmdNearby },
   { name: 'стоп', aliases: ['stop', 'хватит', 'стой'], usage: ['#стоп'], about: 'остановить действие', run: cmdStop },
+  {
+    name: 'квесты',
+    aliases: ['quests', 'задания'],
+    usage: ['#квесты', '#квесты взять', '#квесты сдать', '#квесты Алхимик', '#квесты взять Оружейник'],
+    about: 'задания NPC (по умолчанию Фермер, бот должен быть у /warp ah): показать; взять все новые; сдать предметы из инвентаря',
+    run: cmdQuests,
+  },
+  {
+    name: 'купи',
+    aliases: ['buy', 'купить'],
+    usage: ['#купи сено 2', '#купи <товар> [сколько раз] [у <NPC>]'],
+    about: 'купить у NPC в разделе «Покупка» (по умолчанию у Фермера); каждая покупка проверяется по «Осталось»',
+    run: cmdBuy,
+  },
   {
     name: 'охрана',
     aliases: ['guard'],

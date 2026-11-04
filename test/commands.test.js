@@ -278,6 +278,93 @@ test('команды: NPC — #сущности, #нажми по имени (и
   assert.match((await run('#нажми Кузнец')).message, /рядом нет «Кузнец» — посмотри, кто есть: #сущности/);
 });
 
+test('команды: #квесты у Фермера — показать, взять все новые, сдать из инвентаря; #купи — по «Осталось»', async () => {
+  const json = (text) => JSON.stringify({ text });
+  const state = { wheat: 0, taken: { 14: false, 21: false }, left: 6, money: 20000 };
+  let bot = null;
+  const quest = (title, icon, lore) => ({ name: icon, count: 1, customName: json(title), customLore: lore.map(json) });
+  const questSlot = {
+    11: () => quest('Грядки без истерики.', 'wheat', ['▪ Награда: 24 хлеба', 'Передайте пшеницу, морковь,', `картофель или свёклу: ${state.wheat}/224`]),
+    14: () => quest('Посиди у костра.', 'clock', ['▪ Награда: 2 500 монет', 'Проведите на сервере: 0 м./3 ч.', ...(state.taken[14] ? [] : ['Нажмите, чтобы взять задание'])]),
+    21: () => quest('Ночная прополка.', 'string', ['▪ Награда: 24 нити', 'Убейте пауков: 0/20', ...(state.taken[21] ? [] : ['Нажмите, чтобы взять задание'])]),
+  };
+  const hay = () => ({
+    name: 'hay_block', count: 32, customName: json('Тюк сена'),
+    customLore: [json('Лошадям нравится.'), json(`‖ Осталось › ${state.left}`), json('‖ Цена › 8400.0'), json('› Нажмите, чтобы купить')],
+  });
+  // Как в игре: под ячейками меню — инвентарь игрока (основной, потом хотбар).
+  const menu = (id, title, filled) => {
+    const w = { id, title: json(title), inventoryStart: 54, slots: new Array(90).fill(null) };
+    for (const [i, it] of Object.entries(filled)) w.slots[i] = it;
+    for (let j = 0; j < 36; j += 1) w.slots[54 + j] = bot.inventory.slots[9 + j] || null;
+    return w;
+  };
+  const mainMenu = () => menu(5, 'Фермер › Уровень 1', {
+    20: { name: 'hay_block', count: 1, customName: json('Покупка'), customLore: [json('Вам доступны товары 1 уровня')] },
+    22: { name: 'experience_bottle', count: 1, customName: json('Улучшения'), customLore: [json('Повышайте уровень доверия фермера')] },
+    24: { name: 'wheat', count: 1, customName: json('Продажа'), customLore: [json('Здесь вы можете продать предметы')] },
+  });
+  const questsMenu = () => menu(6, 'Фермер › Уровень 1 → 2', {
+    11: questSlot[11](), 14: questSlot[14](), 21: questSlot[21](),
+    36: { name: 'arrow', count: 1, customName: json('Назад') },
+    40: { name: 'sunflower', count: 1, customLore: [json('Ещё не все задания уровня'), json('выполнены до конца.')] },
+  });
+  const shopMenu = () => menu(7, 'Фермер › Покупка', { 12: hay() });
+  const onClick = (w, slot) => {
+    if (w.id === 5 && slot === 22) return questsMenu();
+    if (w.id === 5 && slot === 20) return shopMenu();
+    if (w.id === 6 && (slot === 14 || slot === 21)) state.taken[slot] = true; // сервер меняет ячейку на месте
+    if (w.id === 6 && slot === 11) {
+      for (let i = 0; i < bot.inventory.slots.length; i += 1) {
+        const it = bot.inventory.slots[i];
+        if (it && it.name === 'wheat') {
+          state.wheat += it.count;
+          bot.inventory.slots[i] = null;
+        }
+      }
+    }
+    if (w.id === 6 && questSlot[slot]) w.slots[slot] = questSlot[slot]();
+    if (w.id === 7 && slot === 12 && state.left > 0 && state.money >= 8400) {
+      state.left -= 1;
+      state.money -= 8400;
+      w.slots[12] = hay();
+    }
+    return null;
+  };
+  const npc = { id: 401, type: 'player', username: '#1479d9c455b1f85', position: new Vec3(0.5, 64, 2.5), height: 1.8, width: 0.6 };
+  const sign = { id: 402, type: 'object', name: 'armor_stand', position: new Vec3(0.5, 66.4, 2.5), getCustomName: () => ({ json: { text: 'Фермер' }, toString: () => 'Фермер' }) };
+  const s = setup({ entities: [npc, sign], npcs: { 401: mainMenu }, onClick, inventory: [['wheat', 40], ['dirt', 3]] });
+  bot = s.bot;
+
+  const shown = await s.run('#квесты');
+  assert.equal(shown.ok, true, [].concat(shown.message).join('\n'));
+  assert.deepEqual(shown.message, [
+    'Задания (Фермер › Уровень 1 → 2): 3, взято 1, выполнено 0',
+    '[11] Грядки без истерики. — Передайте пшеницу, морковь, картофель или свёклу (wheat, carrot, potato, beetroot): 0/224; награда: 24 хлеба',
+    '[14] Посиди у костра. — не взято, Проведите на сервере: 0 мин из 3 ч; награда: 2 500 монет',
+    '[21] Ночная прополка. — не взято, Убейте пауков: 0/20; награда: 24 нити',
+    'Уровень: Ещё не все задания уровня выполнены до конца.',
+  ]);
+  assert.equal(bot.currentWindow, null, 'посмотрел — закрыл меню');
+  assert.deepEqual(bot.clicks.map((c) => [c.window, c.slot]), [[5, 22]], 'в «Улучшения» — кликом по кнопке');
+
+  const took = await s.run('#квесты взять');
+  assert.deepEqual(took.message, ['Взял задания: «Посиди у костра.», «Ночная прополка.»']);
+  assert.deepEqual(state.taken, { 14: true, 21: true });
+  assert.deepEqual((await s.run('#квесты взять')).message, ['Все задания уже взяты']);
+
+  const gave = await s.run('#квесты сдать');
+  assert.deepEqual(gave.message, ['Сдал в «Грядки без истерики.»: 0 → 40 из 224']);
+  assert.equal(state.wheat, 40);
+  assert.deepEqual((await s.run('#квесты сдать')).message, ['Сдавать нечего: в инвентаре нет нужного («Грядки без истерики.» — wheat/carrot/potato/beetroot)']);
+
+  const bought = await s.run('#купи сено 3');
+  assert.equal(bought.message, 'Купил «Тюк сена» (×32) 2 раза по 8400; дальше сервер не продал (не хватило денег?)');
+  assert.deepEqual([state.left, state.money], [4, 3200]);
+  assert.equal(bot.currentWindow, null);
+  assert.match((await s.run('#купи торт')).message, /у Фермер нет «торт». Есть: Тюк сена/);
+});
+
 test('команды: #сущности — NPC-«игрок» со служебным ником называется по надписи над головой', async () => {
   const stand = (id, y, name) => ({
     id, type: 'object', name: 'armor_stand', position: new Vec3(4.5, y, 2.5),
