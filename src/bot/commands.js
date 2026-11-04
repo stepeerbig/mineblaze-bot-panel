@@ -671,7 +671,15 @@ async function openNpcMenu(bot, npc) {
   } catch (err) {
     throw new CommandError(`рядом нет «${npc}» — сначала /warp ah (NPC стоят там), потом #сущности покажет, кто есть`);
   }
-  if (bot.entity.position.distanceTo(e.position) > NPC_REACH) await goToEntity(bot, e, false, npc);
+  if (bot.entity.position.distanceTo(e.position) > NPC_REACH) {
+    try {
+      await goToEntity(bot, e, false, npc);
+    } catch (err) {
+      // NPC часто стоят за прилавком: вплотную не подойти («застрял»), но дотянуться можно — нажать всё равно
+      // попробуем. Прерывания (#стоп, новое действие, телепорт) — не про это: их пробрасываем.
+      if (!err || err.code !== 'stuck') throw err;
+    }
+  }
   const before = bot.currentWindow;
   await bot.actions.interact(e);
   const w = await waitNewWindow(bot, before, MENU_WAIT_MS);

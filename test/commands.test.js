@@ -365,6 +365,25 @@ test('команды: #квесты у Фермера — показать, вз
   assert.match((await s.run('#купи торт')).message, /у Фермер нет «торт». Есть: Тюк сена/);
 });
 
+test('команды: NPC за прилавком — вплотную не подойти, но дотянуться можно: меню всё равно открывается', async () => {
+  const json = (text) => JSON.stringify({ text });
+  const quests = () => ({
+    id: 8,
+    title: json('Фермер › Уровень 1 → 2'),
+    inventoryStart: 54,
+    slots: Object.assign(new Array(90).fill(null), {
+      11: { name: 'wheat', count: 1, customName: json('Грядки.'), customLore: [json('Передайте пшеницу: 0/224')] },
+    }),
+  });
+  const npc = { id: 501, type: 'mob', name: 'villager', position: new Vec3(0.5, 64, 4.5), height: 1.95, width: 0.6, getCustomName: () => ({ json: { text: 'Фермер' }, toString: () => 'Фермер' }) };
+  const s = setup({ entities: [npc], npcs: { 501: quests } });
+  for (let x = -3; x <= 3; x += 1) for (const y of [64, 65]) s.world.set(new Vec3(x, y, 2), 'stone'); // прилавок до потолка
+  const r = await s.run('#квесты');
+  assert.equal(r.ok, true, [].concat(r.message).join('\n'));
+  assert.ok(s.bot.entity.position.z < 2, 'за стену не прошёл');
+  assert.deepEqual(r.data.quests.map((q) => q.slot), [11]);
+});
+
 test('команды: #сущности — NPC-«игрок» со служебным ником называется по надписи над головой', async () => {
   const stand = (id, y, name) => ({
     id, type: 'object', name: 'armor_stand', position: new Vec3(4.5, y, 2.5),
