@@ -148,6 +148,11 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
   let respawnTimer = 0;
   let lastErrorAt = -Infinity;
   let tickCount = 0;
+  // Полёт, который включил сервер (пакет abilities: «Флай включен!» на спавне MineBlaze, /fly). mineflayer
+  // этот пакет не читает вовсе — сервер считал бота летящим, а бот слал «стою на земле». Как обычный клиент:
+  //  • после телепорта скорость нулевая — клиент висит на месте (не на земле), пока его не трогают;
+  //  • если он стоял на земле или пошёл — «приземляется»: выключает полёт и сообщает серверу (abilities).
+  let flying = false;
 
   // Взгляд в градусах игры, без сворачивания в круг (угол в пакетах меняется плавно, без скачков на 360°).
   // bot.entity.yaw/pitch — куда бот хочет смотреть (как в mineflayer), а здесь — куда он смотрит сейчас.
@@ -215,11 +220,28 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
       // Клавиши этого тика: по ним считается движение, они же уходят на сервер. Что поменяют обработчики
       // physicsTick, сработает в следующем тике — так же, как у обычного клиента.
       const controls = { ...controlState };
+      let hover = false;
+      if (flying && !(bot.game && bot.game.gameMode === 'spectator')) {
+        const wantsMove = controls.forward || controls.back || controls.left || controls.right || controls.jump || controls.sneak;
+        if (wantsMove || bot.entity.onGround) {
+          // «Приземлился» (или двойной пробел, чтобы пойти пешком): полёт выключен — сервер узнаёт первым.
+          flying = false;
+          client.write('abilities', { flags: 0 });
+        } else {
+          hover = true;
+        }
+      }
       if (bot.physicsEnabled) {
-        const state = new PlayerState(bot, controls);
-        state.yaw = conv.fromNotchianYaw(current.yaw); // движение — по настоящему взгляду, а не по целевому
-        state.pitch = conv.fromNotchianPitch(current.pitch);
-        physics.simulatePlayer(state, world).apply(bot);
+        if (hover) {
+          // Висит в воздухе, как обычный клиент в полёте без нажатых клавиш: ни скорости, ни земли под ногами.
+          bot.entity.velocity.set(0, 0, 0);
+          bot.entity.onGround = false;
+        } else {
+          const state = new PlayerState(bot, controls);
+          state.yaw = conv.fromNotchianYaw(current.yaw); // движение — по настоящему взгляду, а не по целевому
+          state.pitch = conv.fromNotchianPitch(current.pitch);
+          physics.simulatePlayer(state, world).apply(bot);
+        }
         bot.emit('physicsTick');
         bot.emit('physicTick'); // устаревшее имя, оставлено для старых плагинов
       }
@@ -416,6 +438,10 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
     get inputs() {
       return { ...sentInputs };
     },
+    /** Летит ли бот (по мнению сервера и клиента): полёт включил сервер, а бот ещё не «приземлился». */
+    get flying() {
+      return flying;
+    },
   };
 
   // ---------- управление ----------
@@ -542,6 +568,11 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
     setRotation(yawDeg, pitchDeg);
   });
 
+  // Сервер включил или выключил полёт (флаг 2 — «летит»).
+  bot._client.on('abilities', (packet) => {
+    flying = Boolean(packet && packet.flags & 2);
+  });
+
   // Телепорт: сервер поставил бота в точку (в том числе откат античитом). Подтверждаем, как обычный клиент.
   bot._client.on('position', (packet) => {
     bot.entity.height = 1.8;
@@ -614,6 +645,7 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
   });
   bot.on('login', () => {
     shouldUsePhysics = false;
+    flying = false; // новый сервер — новый игрок; полёт он включит сам, если нужно
     resetServerView();
     startTicking();
   });

@@ -8,7 +8,7 @@ const { createPhysicsPlugin } = require('./bot/physics');
 const { profileOptions, settingsPlugin, applyClientProfile } = require('./bot/client-profile');
 const { createActionsPlugin } = require('./bot/actions');
 const { windowClicksPlugin } = require('./bot/window-clicks');
-const { Guard, GodKeeper, parseNear } = require('./bot/guard');
+const { Guard, GodKeeper, worldNameOf } = require('./bot/guard');
 const { runCommand } = require('./bot/commands');
 
 // Что бот делает как обычный клиент, а не как mineflayer (см. src/bot/). Выключать нужно только для сравнения
@@ -148,6 +148,7 @@ class BotManager extends EventEmitter {
     this.reconnectTimer = null;
     this.attempt = 0;
     this.announced = null; // какой бот последним объявлен событием 'bot'
+    this.godMemory = new Map(); // ник → был ли включён режим бога (сервер помнит его и после перезахода)
   }
 
   /** Журнал пакетов последней сессии (или null, если бот ещё не запускался). */
@@ -429,8 +430,15 @@ class BotManager extends EventEmitter {
       },
       config: this.config,
     };
-    s.guard = new Guard({ ...guardCtx, getBot: () => (alive() && s.spawned && !s.stopping ? bot : null) });
-    s.god = new GodKeeper(guardCtx);
+    const getSpawnedBot = () => (alive() && s.spawned && !s.stopping ? bot : null);
+    s.guard = new Guard({ ...guardCtx, getBot: getSpawnedBot });
+    const godKey = String(cfg.username || '').toLowerCase();
+    s.god = new GodKeeper({
+      ...guardCtx,
+      getBot: getSpawnedBot,
+      remembered: this.godMemory.get(godKey) === true,
+      onState: (on) => this.godMemory.set(godKey, on),
+    });
     bot.guard = s.guard;
     bot.on('forcedMove', () => {
       if (alive()) s.guard.onTeleport();
@@ -438,6 +446,18 @@ class BotManager extends EventEmitter {
     bot.on('respawn', () => {
       if (alive()) s.guard.onTeleport();
     });
+    bot.on('health', () => {
+      if (alive() && s.spawned) s.god.onHealth(bot.health, bot.food);
+    });
+    // Имя мира (на MineBlaze спавн сервера режима — мир «lobby»): охране надо знать, на спавне ли бот.
+    if (bot._client && typeof bot._client.on === 'function') {
+      const onWorld = (packet) => {
+        const name = worldNameOf(packet);
+        if (name) bot.worldName = name;
+      };
+      bot._client.on('login', onWorld);
+      bot._client.on('respawn', onWorld);
+    }
     s.loginTimer = later(
       () => this._loginTimeout(s, `вход не завершился за ${Math.round(this.timings.loginTimeout / 1000)} с`),
       this.timings.loginTimeout,
@@ -563,12 +583,8 @@ class BotManager extends EventEmitter {
       }
       if (!String(text).trim() && !String(motd).trim() && !links.length) return;
       const shown = String(text);
-      // Ответ на /near охраны приходит каждые 5 секунд: в чат панели — только когда он изменился.
-      const nearReply = position !== 'chat' && s.guard.active && parseNear(shown) !== null;
-      if (!nearReply || shown !== s.lastNearShown) {
-        if (nearReply) s.lastNearShown = shown;
-        this.emit('chat', { time: Date.now(), text, motd: motd || text, position, links });
-      }
+      // Все сообщения — в чат панели (и ответ на /near охраны каждые 5 секунд: видно, что охрана работает).
+      this.emit('chat', { time: Date.now(), text, motd: motd || text, position, links });
       // В консоль — спрятанные ссылки и всё, что пришло до появления в мире (проверка при входе).
       const important = s.spawned ? links.filter((url) => !shown.includes(url)) : links;
       this._reportLinks(s, important, 'сообщение в чате');

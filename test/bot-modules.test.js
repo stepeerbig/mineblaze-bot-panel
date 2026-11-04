@@ -235,6 +235,47 @@ test('физика: стоящий бот — позиция раз в 20 тик
   assert.equal(bot.entity.onGround, true);
 });
 
+test('физика: полёт от сервера — после телепорта висит, как клиент; на земле или в движении «приземляется»', () => {
+  const clock = fakeClock();
+  const bot = physicsBot({ clock });
+  bot.emit('login');
+  // Спавн MineBlaze: телепорт, сразу «Флай включен!» (abilities: может летать + летит).
+  teleport(bot);
+  bot._client.emit('abilities', { flags: 6, flyingSpeed: 0.05, walkingSpeed: 0.1 });
+  take(bot);
+  clock.advance(2000);
+  let sent = take(bot);
+  assert.ok(!sent.some((p) => p.name === 'abilities'), 'висит: полёт не выключает');
+  const reminders = sent.filter((p) => p.name === 'position');
+  assert.ok(reminders.length >= 1 && reminders.every((p) => p.params.onGround === false && p.params.y === 64), 'висит на месте, не на земле');
+  assert.equal(bot.serverView.flying, true);
+
+  // Пошёл — сначала выключает полёт (сервер узнаёт в том же тике, до движения), потом идёт пешком.
+  bot.setControlState('forward', true);
+  clock.advance(100);
+  sent = take(bot);
+  const order = sent.map((p) => p.name);
+  assert.deepEqual(sent.find((p) => p.name === 'abilities').params, { flags: 0 });
+  assert.ok(order.indexOf('abilities') < order.indexOf('player_input'), 'полёт выключен раньше клавиш и движения');
+  assert.equal(bot.serverView.flying, false);
+  bot.setControlState('forward', false);
+  clock.advance(1000);
+  take(bot);
+
+  // Стоял на земле, и сервер включил полёт: обычный клиент в следующем тике «приземляется».
+  assert.equal(bot.entity.onGround, true);
+  bot._client.emit('abilities', { flags: 6, flyingSpeed: 0.05, walkingSpeed: 0.1 });
+  clock.advance(50);
+  sent = take(bot);
+  assert.deepEqual(sent.filter((p) => p.name === 'abilities').map((p) => p.params), [{ flags: 0 }]);
+
+  // Наблюдатель летает всегда — полёт не выключает.
+  bot.game = { gameMode: 'spectator' };
+  bot._client.emit('abilities', { flags: 7, flyingSpeed: 0.05, walkingSpeed: 0.1 });
+  clock.advance(500);
+  assert.ok(!take(bot).some((p) => p.name === 'abilities'));
+});
+
 test('физика: после подвисания догоняем не больше 10 тиков, потом снова ровно', () => {
   const clock = fakeClock();
   const bot = physicsBot({ clock });

@@ -197,6 +197,33 @@ test('охрана: /spawn, /warp ah и выключатель в настрой
   assert.equal(t.guard.status(), 'Охрана выключена в настройках');
 });
 
+test('охрана: на спавне (мир lobby) не включается; /rtp не сработал — через 12 с выключается, а не бежит на /spawn', () => {
+  const t = setup({ whitelist: '' });
+  t.bot.worldName = 'lobby';
+  t.bot.players = { griefbot5: { username: 'griefbot5', entity: { position: new Vec3(37, 65, 0) } } };
+  t.guard.onCommand('/rtp');
+  t.bot.entity.position = new Vec3(26.7, 63, -25.9); // сервер подвинул в пределах спавна
+  t.guard.onTeleport();
+  assert.equal(t.guard.active, false, 'всё ещё лобби — ждёт настоящего телепорта');
+  t.timers.advance(12000);
+  assert.equal(t.guard.armed, false);
+  assert.ok(t.logs.includes('info:Охрана выключена: телепорт не состоялся — бот на спавне'));
+  t.timers.advance(10000);
+  assert.deepEqual(t.cmds(), [], 'модератор на спавне — не повод писать /spawn');
+
+  // /rtp сработал: другой мир — охрана включилась; вернулся на спавн (сам или сервер вернул) — выключилась.
+  t.guard.onCommand('/rtp');
+  t.bot.worldName = 'overworld';
+  t.bot.entity.position = new Vec3(-3574, 91, -12602);
+  t.guard.onTeleport();
+  assert.equal(t.guard.active, true);
+  t.bot.worldName = 'lobby';
+  t.guard.onTeleport();
+  assert.equal(t.guard.armed, false);
+  assert.ok(t.logs.includes('info:Охрана выключена: бот на спавне'));
+  assert.equal(t.guard.activateNow('вручную'), false, '#охрана вкл на спавне не включает');
+});
+
 test('охрана: телепорта не было (дом рядом) — через 12 с проверяет и так; смена мира — тоже телепорт', () => {
   const t = setup();
   t.guard.onCommand('/home near');
@@ -214,11 +241,13 @@ test('охрана: телепорта не было (дом рядом) — ч�
   assert.equal(u.guard.active, true);
 });
 
-function godSetup(config = {}) {
+function godSetup(config = {}, { remembered = null, gameMode = 'survival' } = {}) {
   const timers = fakeTimers();
   const sent = [];
   const logs = [];
+  const states = [];
   const cfg = { godMode: true, ...config };
+  const bot = { game: { gameMode } };
   const god = new GodKeeper({
     send: (cmd) => {
       sent.push(cmd);
@@ -227,25 +256,65 @@ function godSetup(config = {}) {
     },
     log: (level, text) => logs.push(`${level}:${text}`),
     config: cfg,
+    getBot: () => bot,
+    remembered,
+    onState: (on) => states.push(on),
     timers,
   });
-  return { god, timers, sent, logs, cfg };
+  return { god, timers, sent, logs, cfg, bot, states };
 }
 
-test('режим бога: /god — переключатель: выключился — ещё раз, включился — всё', () => {
+test('режим бога: /god — переключатель: выключился — ещё раз (через 3 с), включился — всё; состояние запоминается', () => {
   const g = godSetup();
   g.god.schedule(3000);
   g.timers.advance(2999);
   assert.deepEqual(g.sent, []);
   g.timers.advance(1);
   assert.deepEqual(g.sent, ['/god']);
-  g.god.onChat('| Режим бога выключен!'); // был включён с прошлого раза
-  g.timers.advance(2000);
+  g.god.onChat('| Режим Бога выключено.'); // MineBlaze: был включён с прошлого раза — переключатель выключил
+  g.timers.advance(2900);
+  assert.deepEqual(g.sent, ['/god'], 'не чаще, чем раз в 3 с');
+  g.timers.advance(800);
   assert.deepEqual(g.sent, ['/god', '/god']);
-  g.god.onChat('| Режим бога включён!');
+  g.god.onChat('| Режим Бога включен.');
   assert.ok(g.logs.includes('ok:Режим бога включён'));
+  assert.deepEqual(g.states, [false, true]);
   g.timers.advance(60000);
   assert.deepEqual(g.sent, ['/god', '/god']);
+});
+
+test('режим бога: был включён в прошлой сессии — после входа не трогает; бот теряет здоровье или сытость — /god', () => {
+  const g = godSetup({}, { remembered: true });
+  g.god.schedule(3000);
+  g.timers.advance(10000);
+  assert.deepEqual(g.sent, [], 'включён по памяти — переключатель не трогаем');
+  g.god.onHealth(20, 20);
+  g.god.onHealth(20, 20);
+  g.god.onHealth(20, 19); // в режиме бога сытость не падает
+  assert.deepEqual(g.sent, ['/god']);
+  assert.ok(g.logs.some((l) => l.startsWith('warn:Режим бога, похоже, выключен')));
+  g.god.onChat('| Режим Бога включен.');
+  g.god.onHealth(20, 20); // сервер вернул сытость
+  g.god.onHealth(18, 20);
+  assert.deepEqual(g.sent, ['/god'], 'сразу после /god — не дёргаем снова');
+});
+
+test('режим бога: в лобби («приключение») /god не пишет; сервер не ответил — ещё одна попытка, потом подсказка', () => {
+  const lobby = godSetup({}, { gameMode: 'adventure' });
+  lobby.god.schedule(0);
+  lobby.timers.advance(10000);
+  assert.deepEqual(lobby.sent, []);
+
+  const g = godSetup();
+  g.god.schedule(0);
+  g.timers.advance(0);
+  assert.deepEqual(g.sent, ['/god']);
+  g.timers.advance(5000 + 3000); // ответа нет — ещё раз
+  assert.deepEqual(g.sent, ['/god', '/god']);
+  g.timers.advance(5000);
+  assert.ok(g.logs.some((l) => l.startsWith('warn:Режим бога: на /god сервер ничего понятного не ответил')));
+  g.timers.advance(30000);
+  assert.equal(g.sent.length, 2);
 });
 
 test('режим бога: нет прав — не долбит; три неудачи подряд — сдаётся; выключатель в настройках', () => {
@@ -263,7 +332,7 @@ test('режим бога: нет прав — не долбит; три неу�
   h.timers.advance(0);
   for (let i = 0; i < 5; i += 1) {
     h.god.onChat('| God mode disabled.');
-    h.timers.advance(2000);
+    h.timers.advance(4000);
   }
   assert.equal(h.sent.length, 3);
   assert.ok(h.logs.some((l) => l.includes('после трёх /god он всё ещё выключен')));

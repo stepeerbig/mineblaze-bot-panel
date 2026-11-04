@@ -36,8 +36,16 @@ const ARM_RE = /^\/(?:home|rtp)\b/i;
 const DISARM_RE = /^\/(?:spawn|warp\s+ah)\b/i;
 
 const VALID_NICK = /^[A-Za-z0-9_]{3,16}$/;
+// Мир спавна: на MineBlaze (сервер режима) спавн — отдельный мир «minecraft:lobby».
+const SPAWN_WORLD_RE = /(?:^|[:_/-])(?:lobby|spawn|hub)$/i;
 
 const norm = (name) => String(name || '').trim().replace(/^~/, '').toLowerCase();
+
+/** Имя мира из пакета login / respawn (1.20.5+ — worldState.name, раньше — worldName), без «minecraft:». */
+function worldNameOf(packet) {
+  const name = packet && ((packet.worldState && packet.worldState.name) || packet.worldName);
+  return typeof name === 'string' && name ? name.replace(/^minecraft:/, '') : null;
+}
 
 /** Ответ на /near → список {name, distance}; [] — «никого»; null — это не ответ на /near. */
 function parseNear(text) {
@@ -119,22 +127,39 @@ class Guard {
     const bot = this.getBot();
     this.armPos = bot && bot.entity && bot.entity.position ? bot.entity.position.clone() : null;
     this.armDim = bot && bot.game ? bot.game.dimension : null;
-    this.waitTimer = this._unref(this._setTimeout(() => this._activate('телепорта не заметил — проверяю и так'), TELEPORT_WAIT_MS));
+    this.armWorld = bot ? bot.worldName || null : null;
+    this.waitTimer = this._unref(this._setTimeout(() => {
+      // Телепорта не заметили. Бот всё ещё в мире спавна — значит, его и не было (например, сервер не ответил).
+      if (this.inSpawnWorld()) this.disarm('телепорт не состоялся — бот на спавне');
+      else this._activate('телепорта не заметил — проверяю и так');
+    }, TELEPORT_WAIT_MS));
     if (!wasArmed) this.log('info', `Охрана: бот уходит со спавна (${reason}) — начну проверять после телепорта`);
+  }
+
+  /** Бот в мире спавна (на MineBlaze — «lobby»): там охрана не нужна. Неизвестный мир — не спавн. */
+  inSpawnWorld() {
+    const bot = this.getBot();
+    return Boolean(bot && bot.worldName && SPAWN_WORLD_RE.test(bot.worldName));
   }
 
   /** Сервер переместил бота (телепорт или смена мира). */
   onTeleport() {
-    if (!this.armed || this.active) return;
+    if (!this.armed) return;
+    if (this.inSpawnWorld()) {
+      if (this.active) this.disarm('бот на спавне');
+      return; // ещё на спавне — ждём настоящего телепорта
+    }
+    if (this.active) return;
     const bot = this.getBot();
     const pos = bot && bot.entity && bot.entity.position;
     const dimChanged = Boolean(bot && bot.game && this.armDim && bot.game.dimension !== this.armDim);
-    if (dimChanged || !this.armPos || !pos || pos.distanceTo(this.armPos) > TELEPORT_MIN_DISTANCE) this._activate();
+    const worldChanged = Boolean(bot && bot.worldName && this.armWorld && bot.worldName !== this.armWorld);
+    if (dimChanged || worldChanged || !this.armPos || !pos || pos.distanceTo(this.armPos) > TELEPORT_MIN_DISTANCE) this._activate();
   }
 
-  /** Включить охрану сразу, без телепорта (#охрана вкл: бот уже на месте). */
+  /** Включить охрану сразу, без телепорта (#охрана вкл: бот уже на месте). false — выключена или бот на спавне. */
   activateNow(reason) {
-    if (!this.enabled) return false;
+    if (!this.enabled || this.inSpawnWorld()) return false;
     this.armed = true;
     this._activate(reason);
     return true;
@@ -247,11 +272,15 @@ class Guard {
 
   _near() {
     if (!this.active || !this.getBot()) return;
+    if (this.inSpawnWorld()) {
+      this.disarm('бот на спавне');
+      return;
+    }
     this.send('/near', { quiet: true });
   }
 
   _scanVisible() {
-    if (!this.active) return;
+    if (!this.active || this.inSpawnWorld()) return;
     const bot = this.getBot();
     if (!bot || !bot.players || !bot.entity) return;
     for (const p of Object.values(bot.players)) {
@@ -264,7 +293,7 @@ class Guard {
   }
 
   _escape(who) {
-    if (!this.enabled || !this.active) return;
+    if (!this.enabled || !this.active || this.inSpawnWorld()) return; // со спавна на спавн не бегаем
     if (this.pvp) {
       if (!this.escapePending) {
         this.log('warn', `Охрана: рядом чужой — ${who}, но идёт бой (PvP), сервер не даст телепортироваться. /spawn — сразу после боя`);
@@ -299,40 +328,71 @@ class Guard {
   }
 }
 
+const GOD_RETRY_MS = 3000; // повтор /god (на частые команды у сервера бывает задержка)
+const GOD_ANSWER_MS = 5000;
+const GOD_DAMAGE_REPEAT_MS = 10000;
+
 class GodKeeper {
   /**
+   * /god — переключатель, а режим бога сервер помнит и после перезахода. Поэтому:
+   *  • что сказал сервер последним, помним и между сессиями (remembered): включён — после входа не трогаем;
+   *  • бот теряет здоровье или сытость (в режиме бога так не бывает) — режим выключен: пишем /god;
+   *  • в лобби (режим «приключение») /god не пишем — там его нет, включим на сервере режима.
    * @param {object}   ctx
-   * @param {Function} ctx.send    (команда) → отправить
-   * @param {Function} ctx.log     (уровень, текст)
-   * @param {object}   ctx.config  живые настройки: godMode (вкл/выкл)
+   * @param {Function} ctx.send       (команда) → отправить
+   * @param {Function} ctx.log        (уровень, текст)
+   * @param {object}   ctx.config     живые настройки: godMode (вкл/выкл)
+   * @param {Function} [ctx.getBot]   бот (режим игры: в «приключении» /god не пишем)
+   * @param {boolean}  [ctx.remembered] режим был включён в прошлой сессии
+   * @param {Function} [ctx.onState]  (вкл/выкл) → запомнить для следующей сессии
    * @param {object}   [ctx.timers]
    */
-  constructor({ send, log, config, timers = {} }) {
+  constructor({ send, log, config, getBot = () => null, remembered = null, onState = () => {}, timers = {} }) {
     this.send = send;
     this.log = log;
     this.config = config;
+    this.getBot = getBot;
+    this.onState = onState;
     this._setTimeout = timers.setTimeout || setTimeout;
     this._clearTimeout = timers.clearTimeout || clearTimeout;
+    this.now = timers.now || Date.now;
     this.timer = null;
     this.answerTimer = null;
     this.waiting = false; // ждём ответа на свой /god
     this.attempts = 0;
-    this.on = null; // true/false — что сказал сервер последним; null — неизвестно
+    this.on = remembered === true ? true : null; // true/false — что сказал сервер последним; null — неизвестно
     this.gaveUp = false;
+    this.lastToggleAt = -Infinity;
+    this.prev = null; // { health, food } — прошлые значения
   }
 
   get enabled() {
     return this.config.godMode !== false;
   }
 
-  /** Проверить режим бога через ms (после входа или перехода на другой сервер). */
+  /** Проверить режим бога через ms (после входа или перехода на другой сервер). Включён — ничего не делаем. */
   schedule(ms) {
     this._clearTimeout(this.timer);
     this.attempts = 0;
     this.gaveUp = false;
-    this.on = null;
+    if (this.on === true) return;
     this.timer = this._setTimeout(() => this._toggle(), ms);
     if (this.timer && typeof this.timer.unref === 'function') this.timer.unref();
+  }
+
+  /** Здоровье или сытость изменились. Убыль при включённом режиме бога — значит, он на самом деле выключен. */
+  onHealth(health, food) {
+    const prev = this.prev;
+    this.prev = { health, food };
+    if (!prev || !this.enabled || this.waiting) return;
+    if (!(health < prev.health || food < prev.food)) return;
+    if (this.on === false) return; // и так знаем, что выключен (ждём повтора)
+    if (this.now() - this.lastToggleAt < GOD_DAMAGE_REPEAT_MS) return;
+    this.log('warn', 'Режим бога, похоже, выключен (бот теряет здоровье или сытость) — пишу /god');
+    this.on = false;
+    this.attempts = 0;
+    this.gaveUp = false;
+    this._toggle();
   }
 
   stop() {
@@ -364,32 +424,55 @@ class GodKeeper {
     this._clearTimeout(this.answerTimer);
     const rest = m[1] || line;
     if (GOD_OFF_RE.test(rest)) {
-      this.on = false;
+      this._setOn(false);
       if (!this.enabled || this.gaveUp) return;
       if (this.attempts >= 3) {
         this.gaveUp = true;
         this.log('warn', 'Режим бога: после трёх /god он всё ещё выключен — больше не пробую до следующего входа');
         return;
       }
-      this.timer = this._setTimeout(() => this._toggle(), 1200 + Math.floor(Math.random() * 600));
-      if (this.timer && typeof this.timer.unref === 'function') this.timer.unref();
+      this._later(() => this._toggle(), GOD_RETRY_MS + Math.floor(Math.random() * 600));
     } else if (GOD_ON_RE.test(rest)) {
       if (this.on !== true) this.log('ok', 'Режим бога включён');
-      this.on = true;
+      this._setOn(true);
     }
+  }
+
+  _setOn(on) {
+    this.on = on;
+    try {
+      this.onState(on);
+    } catch (_) {
+      /* память — не главное */
+    }
+  }
+
+  _later(fn, ms) {
+    this._clearTimeout(this.timer);
+    this.timer = this._setTimeout(fn, ms);
+    if (this.timer && typeof this.timer.unref === 'function') this.timer.unref();
   }
 
   _toggle() {
     if (!this.enabled || this.gaveUp || this.on === true) return;
+    const bot = this.getBot();
+    if (bot && bot.game && bot.game.gameMode === 'adventure') return; // лобби: /god там нет
     this.attempts += 1;
     this.waiting = true;
+    this.lastToggleAt = this.now();
     this.send('/god');
     this._clearTimeout(this.answerTimer);
     this.answerTimer = this._setTimeout(() => {
       if (!this.waiting) return;
       this.waiting = false;
-      this.log('warn', 'Режим бога: на /god сервер ничего понятного не ответил');
-    }, 5000);
+      // Ответа нет (например, сервер был занят телепортом). Раз включённым его не видели — пробуем ещё раз,
+      // а если и так нет — следим за уроном: он покажет, выключен ли режим.
+      if (this.attempts < 2 && this.on !== true) {
+        this._later(() => this._toggle(), GOD_RETRY_MS);
+        return;
+      }
+      this.log('warn', 'Режим бога: на /god сервер ничего понятного не ответил — проверь сам; если бот начнёт терять здоровье, бот напишет /god снова');
+    }, GOD_ANSWER_MS);
     if (this.answerTimer && typeof this.answerTimer.unref === 'function') this.answerTimer.unref();
   }
 }
@@ -403,4 +486,4 @@ function plural(n, one, few, many) {
   return many;
 }
 
-module.exports = { Guard, GodKeeper, parseNear, parseWhitelist, displayNameOf, NEAR_INTERVAL_MS };
+module.exports = { Guard, GodKeeper, parseNear, parseWhitelist, displayNameOf, worldNameOf, NEAR_INTERVAL_MS };

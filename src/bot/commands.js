@@ -911,7 +911,10 @@ async function cmdGuard({ bot, words }) {
   if (!guard) return { ok: false, code: 'unsupported', message: 'Охраны у этого бота нет' };
   const w = words[0] || '';
   if (['вкл', 'включи', 'on', 'да', 'следи'].includes(w)) {
-    if (!guard.activateNow('включена командой')) return { ok: false, code: 'disabled', message: 'Охрана выключена в настройках панели («Охрана и режим бога»)' };
+    if (!guard.enabled) return { ok: false, code: 'disabled', message: 'Охрана выключена в настройках панели («Охрана и режим бога»)' };
+    if (!guard.activateNow('включена командой')) {
+      return { ok: false, code: 'at_spawn', message: 'Бот на спавне — здесь охрана не нужна (включится сама после /home или /rtp)' };
+    }
     return { ok: true, message: guard.status(), data: { armed: true } };
   }
   if (['выкл', 'выключи', 'off', 'нет'].includes(w)) {
