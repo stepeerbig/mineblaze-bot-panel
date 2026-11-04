@@ -9,7 +9,9 @@
 const { Vec3 } = require('vec3');
 const { FACE_VECTORS } = require('./actions');
 const { chatToText } = require('../chat-utils');
-const { parseQuestMenu, parseOffer, describeQuest, matchesQuery } = require('./quests');
+const { parseQuestMenu, parseOffer, describeQuest, matchesQuery, deliverItems } = require('./quests');
+const { isStorageWindow } = require('./window-clicks');
+const { moveStacks, countIn, itemsIn, storageSlots, playerSlots } = require('./chests');
 
 const MAX_WALK = 64; // по прямой дальше не ходим (поиска пути пока нет)
 const MAX_STEPS = 32; // «#вперёд N»: не больше
@@ -861,7 +863,190 @@ async function cmdOpen({ bot, args }) {
   throw lastError;
 }
 
-async function cmdEquip({ bot, args }) {
+// ---------- склады: достать из сундука, положить в сундук ----------
+
+const STORAGE_WAIT_MS = 1500; // сундук сервер открывает не мгновенно
+const ALL_WORDS = new Set(['все', 'all', 'everything']); // norm() уже заменил «ё» на «е»
+// «Сундук», «бочка»… в команде — место, а не предмет: «#достань из сундука пшеницу».
+const CONTAINER_WORD = /^(сундук|бочк|бочон|ящик|шалкер|chest|barrel|shulker)/;
+// «#положи всё» — кроме того, чем бот работает и что на нём надето.
+const KEEP_RE = /_(?:pickaxe|axe|shovel|hoe|sword|helmet|chestplate|leggings|boots)$|^(?:shears|flint_and_steel|fishing_rod|brush|bow|crossbow|trident|mace|shield|elytra|totem_of_undying)$/;
+// Слово про группу предметов: «семена» — любые семена, «рыба» — любая рыба.
+const GROUP_WORDS = [
+  [/^(семен|семян)/, /_seeds$/],
+  [/^ягод/, /_berries$/],
+  [/^рыб/, /^(cod|salmon|tropical_fish|pufferfish)$/],
+];
+const STORAGE_NAMES = { chest: 'Сундук', trapped_chest: 'Сундук-ловушка', barrel: 'Бочка', ender_chest: 'Эндер-сундук' };
+const storageName = (name) => STORAGE_NAMES[name] || (/shulker_box$/.test(name) ? 'Шалкер' : name);
+const countsText = (map) => [...map.entries()].map(([n, c]) => `${n}×${c}`).join(', ');
+const countsData = (map) => [...map.entries()].map(([name, count]) => ({ name, count }));
+
+/**
+ * Подходит ли предмет под слова: точный id (wheat — только пшеница, без семян), по-русски (пшеница, земля,
+ * кирка, семена — любые семена) или, если слова незнакомые, часть id или названия.
+ */
+function itemTest(query, registry = null) {
+  const q = norm(query).replace(/^minecraft:/, '');
+  const id = q.replace(/\s+/g, '_');
+  if (registry && registry.itemsByName && registry.itemsByName[id]) return (it) => it.name === id;
+  const parts = q.split(/[\s_]+/);
+  const ru = deliverItems(q);
+  const groups = GROUP_WORDS.filter(([re]) => parts.some((p) => re.test(p))).map(([, m]) => m);
+  const word = ITEM_WORDS.find(([re]) => parts.some((p) => re.test(p)));
+  const byWord = !word ? () => false : Array.isArray(word[1]) ? (n) => word[1].includes(n) : (n) => word[1].test(n);
+  const known = ru.length > 0 || groups.length > 0 || Boolean(word);
+  return (it) =>
+    it.name === id || ru.includes(it.name) || groups.some((m) => m.test(it.name)) || byWord(it.name) ||
+    (!known && ((id.length >= 3 && it.name.includes(id)) || norm(itemTitle(it)).includes(q)));
+}
+
+/**
+ * Слова команды склада → { query, want, at }: что взять (пусто — всё), сколько (Infinity — всё), откуда
+ * (координаты сундука или null — ближайший). preps — предлоги перед местом: «из» для #достань, «в» для #положи.
+ */
+function storageArgs(args, words, preps) {
+  const rest = [];
+  let at = null;
+  for (let i = 0; i < args.length; i += 1) {
+    if (preps.includes(words[i])) {
+      const place = args.slice(i + 1);
+      if (isCoords(place)) {
+        at = place.slice(0, 3);
+        i += 3;
+      } else if (place.length && CONTAINER_WORD.test(words[i + 1])) {
+        i += 1;
+      } else if (place.length) {
+        throw new CommandError(`не понял, что за сундук: «${place.join(' ')}» — подойди к сундуку или укажи ${preps[0]} X Y Z`);
+      }
+      continue;
+    }
+    if (!CONTAINER_WORD.test(words[i])) rest.push(i);
+  }
+  // Координаты в конце и без предлога: «#положи всё 10 64 -3».
+  if (!at && rest.length >= 4 && isCoords(rest.slice(-3).map((i) => args[i]))) at = rest.splice(-3).map((i) => args[i]);
+  let want = Infinity;
+  const q = [];
+  for (const i of rest) {
+    if (want === Infinity && /^\d+$/.test(words[i])) want = Math.max(1, parseInt(words[i], 10));
+    else if (!ALL_WORDS.has(words[i])) q.push(args[i]);
+  }
+  return { query: q.join(' '), want, at };
+}
+
+/** Подойти к блоку, если до него не дотянуться: по прямой, на своей высоте; упёрся — всё равно попробуем нажать. */
+async function reachBlock(bot, pos) {
+  const eye = bot.entity.position.offset(0, 1.62, 0);
+  if (eye.distanceTo(pos.offset(0.5, 0.5, 0.5)) <= OPEN_RANGE) return;
+  try {
+    await bot.actions.walkTo(new Vec3(pos.x + 0.5, bot.entity.position.y, pos.z + 0.5), { range: 2.5 });
+  } catch (err) {
+    if (!err || err.code !== 'stuck') throw err;
+  }
+}
+
+/** Открыть сундук (по координатам или ближайший) и вернуть { window, pos, block }; окно остаётся открытым. */
+async function openStorage(bot, at) {
+  let list;
+  if (at) {
+    const pos = parseBlockPos(at, bot.entity.position);
+    const block = bot.blockAt(pos);
+    if (!block || !isContainer(block.name)) throw new CommandError(`в ${fmtPos(pos)} нет сундука${block ? ` (там ${block.name})` : ''}`);
+    const dist = bot.entity.position.distanceTo(pos.offset(0.5, 0.5, 0.5));
+    if (dist > MAX_WALK) throw new CommandError(`сундук в ${fmtPos(pos)} слишком далеко (${Math.round(dist)} блоков)`);
+    list = [{ pos, block }];
+  } else {
+    list = scanBlocks(bot, OPEN_RANGE + 1, (b) => isContainer(b.name)).filter((c) => c.dist <= OPEN_RANGE + 0.5).slice(0, 3);
+    if (!list.length) throw new CommandError(`рядом нет сундука (до ${OPEN_RANGE} блоков) — подойди ближе (например, /home у сундука) или укажи X Y Z`);
+  }
+  let lastError = null;
+  for (const c of list) {
+    try {
+      await reachBlock(bot, c.pos);
+      const before = bot.currentWindow;
+      await bot.actions.activate(c.pos);
+      const w = await waitNewWindow(bot, before, STORAGE_WAIT_MS);
+      if (!w) throw new CommandError(`${storageName(c.block.name)} в ${fmtPos(c.pos)} не открылся`);
+      if (!isStorageWindow(w)) {
+        await closeAfter(bot);
+        throw new CommandError(`в ${fmtPos(c.pos)} открылся не сундук, а «${windowTitle(w)}»`);
+      }
+      return { window: w, pos: c.pos, block: c.block };
+    } catch (err) {
+      if (err && (err.code === 'replaced' || err.code === 'stopped')) throw err;
+      lastError = err; // этот не открылся — пробуем следующий
+    }
+  }
+  throw lastError;
+}
+
+/** «#достань пшеница 224 [из X Y Z]» — взять из сундука в инвентарь (целыми стопками). */
+async function cmdTake({ bot, args, words }) {
+  if (!args.length) throw new CommandError('что достать? Например: #достань пшеница 224, #достань всё (из ближайшего сундука)');
+  const { query, want, at } = storageArgs(args, words, ['из', 'from']);
+  const test = query ? itemTest(query, bot.registry) : () => true;
+  const chest = await openStorage(bot, at);
+  try {
+    const w = chest.window;
+    const where = `${storageName(chest.block.name)} ${fmtPos(chest.pos)}`;
+    const data = { chest: { block: chest.block.name, position: plain(chest.pos) }, want: Number.isFinite(want) ? want : null };
+    if (!countIn(w, storageSlots(w), test)) {
+      const inside = countsText(itemsIn(w, storageSlots(w)));
+      return {
+        ok: false,
+        code: 'not_found',
+        message: `${where}: ${query ? `нет «${query}»` : 'пусто'}${query ? (inside ? `. Там: ${inside}` : ' — там пусто') : ''}`,
+        data: { ...data, moved: [], total: 0 },
+      };
+    }
+    const r = await moveStacks(bot, w, storageSlots(w), playerSlots(w), test, want);
+    const notes = [];
+    if (Number.isFinite(want) && r.total > want) notes.push(`просили ${want} — беру целыми стопками`);
+    if (Number.isFinite(want) && r.total < want && !r.full && !r.rejected) notes.push(`больше нет, просили ${want}`);
+    if (r.full) notes.push('инвентарь полон');
+    if (r.rejected) notes.push('сервер не дал взять');
+    const result = { ...data, moved: countsData(r.moved), total: r.total, full: r.full };
+    if (!r.total) return { ok: false, code: r.full ? 'full' : 'rejected', message: `${where}: ничего не достал — ${notes.join(', ')}`, data: result };
+    return { ok: true, message: `${where}: достал ${countsText(r.moved)}${notes.length ? ` (${notes.join('; ')})` : ''}`, data: result };
+  } finally {
+    await closeAfter(bot);
+  }
+}
+
+/** «#положи всё [в X Y Z]» — положить в сундук; «всё» — кроме инструментов, оружия и брони. */
+async function cmdPut({ bot, args, words }) {
+  if (!args.length) throw new CommandError('что положить? Например: #положи всё, #положи хлеб (в ближайший сундук)');
+  const { query, want, at } = storageArgs(args, words, ['в', 'во', 'into', 'to']);
+  const match = query ? itemTest(query, bot.registry) : null;
+  const test = match || ((it) => !KEEP_RE.test(it.name)); // названный предмет — любой, даже кирку
+  const inv = inventoryItems(bot);
+  const kept = new Map();
+  if (!match) for (const it of inv) if (KEEP_RE.test(it.name)) kept.set(it.name, (kept.get(it.name) || 0) + (it.count || 1));
+  if (!inv.some(test)) {
+    let why = 'инвентарь пуст';
+    if (match) why = `в инвентаре нет «${query}»`;
+    else if (kept.size) why = `в инвентаре только инструменты и броня (${countsText(kept)})`;
+    return { ok: false, code: 'not_found', message: `Класть нечего: ${why}`, data: { moved: [], total: 0 } };
+  }
+  const chest = await openStorage(bot, at);
+  try {
+    const w = chest.window;
+    const where = `${storageName(chest.block.name)} ${fmtPos(chest.pos)}`;
+    const r = await moveStacks(bot, w, playerSlots(w), storageSlots(w), test, want);
+    const notes = [];
+    if (r.full) notes.push('сундук полон');
+    if (r.rejected) notes.push('сервер не дал положить');
+    if (kept.size) notes.push(`оставил себе: ${countsText(kept)}`);
+    const result = { chest: { block: chest.block.name, position: plain(chest.pos) }, moved: countsData(r.moved), total: r.total, full: r.full };
+    if (!r.total) return { ok: false, code: r.full ? 'full' : 'rejected', message: `${where}: ничего не положил — ${notes.join(', ')}`, data: result };
+    return { ok: true, message: `${where}: положил ${countsText(r.moved)}${notes.length ? ` (${notes.join('; ')})` : ''}`, data: result };
+  } finally {
+    await closeAfter(bot);
+  }
+}
+
+async function cmdEquip({ bot, args, words }) {
+  if (words.includes('из') || words.includes('from')) return cmdTake({ bot, args, words }); // «#возьми пшеницу из сундука»
   if (!args.length) throw new CommandError('что взять? Например: #возьми кирка, #возьми земля, #возьми cobblestone');
   const item = findItem(bot, args.join(' '));
   await bot.actions.equip(item.name);
@@ -976,7 +1161,21 @@ const COMMANDS = [
   { name: 'закрой', aliases: ['close', 'esc'], usage: ['#закрой'], about: 'закрыть открытое меню', run: cmdClose },
   { name: 'сущности', aliases: ['entities', 'нпс', 'npc'], usage: ['#сущности'], about: 'кто и что рядом: NPC, мобы, надписи — с номерами для #нажми @номер', observe: true, run: cmdEntities },
   { name: 'открой', aliases: ['open'], usage: ['#открой', '#открой X Y Z'], about: 'открыть ближайший сундук, показать, что внутри, и закрыть', run: cmdOpen },
-  { name: 'возьми', aliases: ['equip', 'вруку'], usage: ['#возьми <предмет>'], about: 'взять в руку; можно по-русски: земля, булыжник, доски, кирка, меч…', run: cmdEquip },
+  {
+    name: 'достань',
+    aliases: ['withdraw', 'вынь', 'забери'],
+    usage: ['#достань пшеница 224', '#достань всё', '#достань <предмет> [сколько] [из X Y Z]'],
+    about: 'взять из ближайшего сундука (до 4 блоков) или из сундука по координатам — целыми стопками',
+    run: cmdTake,
+  },
+  {
+    name: 'положи',
+    aliases: ['deposit', 'сложи', 'убери'],
+    usage: ['#положи всё', '#положи хлеб', '#положи <предмет | всё> [сколько] [в X Y Z]'],
+    about: 'положить в ближайший сундук (или по координатам); «всё» — кроме инструментов, оружия и брони',
+    run: cmdPut,
+  },
+  { name: 'возьми', aliases: ['equip', 'вруку'], usage: ['#возьми <предмет>'], about: 'взять в руку; можно по-русски: земля, булыжник, доски, кирка, меч… («из сундука» — как #достань)', run: cmdEquip },
   { name: 'инвентарь', aliases: ['inv', 'инв'], usage: ['#инвентарь'], about: 'что у бота в руке и в инвентаре', observe: true, run: cmdInventory },
   { name: 'рядом', aliases: ['near', 'кто'], usage: ['#рядом'], about: 'игроки и сундуки поблизости', observe: true, run: cmdNearby },
   { name: 'стоп', aliases: ['stop', 'хватит', 'стой'], usage: ['#стоп'], about: 'остановить действие', run: cmdStop },
@@ -1044,4 +1243,4 @@ async function runCommand(bot, line, log = () => {}) {
   return result;
 }
 
-module.exports = { runCommand, catalog, findCommand, findItem, parseCoord, parseBlockPos, f3Yaw, f3Pitch, COMMANDS };
+module.exports = { runCommand, catalog, findCommand, findItem, itemTest, storageArgs, parseCoord, parseBlockPos, f3Yaw, f3Pitch, COMMANDS };

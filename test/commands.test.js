@@ -9,14 +9,14 @@ const path = require('node:path');
 const { Vec3 } = require('vec3');
 const { fakeClock, makeWorld, physicsBot, autoServer, teleport, take, runFor, VERSION } = require('./fake-bot');
 
-const { runCommand, catalog, COMMANDS, parseCoord, parseBlockPos } = require(path.join(__dirname, '..', 'src', 'bot', 'commands.js'));
+const { runCommand, catalog, COMMANDS, parseCoord, parseBlockPos, itemTest, storageArgs } = require(path.join(__dirname, '..', 'src', 'bot', 'commands.js'));
 
 /** Бот стоит в 0.5 64 0.5 на камне, смотрит на юг (+z). players: [{ name, at: [x, y, z] }], inventory: [[имя, кол-во]]. */
-function setup({ players = [], farPlayers = [], chests = {}, inventory = [], entities = [], npcs = {}, onClick = null } = {}) {
+function setup({ players = [], farPlayers = [], chests = {}, storage = {}, inventory = [], entities = [], npcs = {}, onClick = null } = {}) {
   const clock = fakeClock();
   const world = makeWorld(require('prismarine-registry')(VERSION));
   const bot = physicsBot({ clock, world, actions: true });
-  autoServer(bot, world, { chests, npcs, onClick });
+  autoServer(bot, world, { chests, storage, npcs, onClick });
   for (const e of entities) bot.entities[e.id] = e;
   bot.emit('login');
   teleport(bot);
@@ -197,6 +197,96 @@ test('команды: #открой — ближайший сундук: пок�
   assert.deepEqual(nearby.data.containers.map((c) => c.position), [{ x: 1, y: 64, z: 2 }]);
   assert.ok(logs.includes('info:Игроки: Steve — 6 бл. на юг'), logs.join('\n'));
   assert.ok(logs.some((l) => l.startsWith('info:Сундуки: chest в 1 64 2')));
+});
+
+const invCount = (bot, name) => bot.inventory.slots.slice(9, 45).filter((it) => it && it.name === name).reduce((n, it) => n + it.count, 0);
+const invNames = (bot) => [...new Set(bot.inventory.slots.slice(9, 45).filter(Boolean).map((it) => it.name))];
+
+test('команды: #достань — из ближайшего сундука целыми стопками, по-русски; #положи всё — кроме инструментов', async () => {
+  const { run, world, bot } = setup({
+    inventory: [['iron_pickaxe', 1], ['bread', 24], ['string', 24]],
+    storage: {
+      '1,64,2': {
+        items: [[0, 'wheat', 64], [1, 'hay_block', 32], [2, 'wheat', 64], [3, 'wheat', 64], [4, 'wheat', 64], [5, 'wheat', 30], [6, 'wheat_seeds', 64], [7, 'pumpkin_seeds', 10]],
+      },
+    },
+  });
+  assert.match((await run('#достань пшеница 100')).message, /рядом нет сундука/);
+  world.set(new Vec3(1, 64, 2), 'chest');
+
+  const took = await run('#достань пшеница 100');
+  assert.equal(took.ok, true, took.message);
+  assert.equal(took.message, 'Сундук 1 64 2: достал wheat×128 (просили 100 — беру целыми стопками)');
+  assert.equal(bot.currentWindow, null, 'сундук закрыт');
+  assert.equal(invCount(bot, 'wheat'), 128);
+  assert.ok(bot.clicks.length === 2 && bot.clicks.every((c) => c.mode === 1 && c.mouseButton === 0), 'по стопке — shift-клик');
+  assert.deepEqual(took.data.moved, [{ name: 'wheat', count: 128 }]);
+
+  assert.equal((await run('#достань семена')).message, 'Сундук 1 64 2: достал wheat_seeds×64, pumpkin_seeds×10');
+  const none = await run('#достань морковь');
+  assert.equal(none.ok, false);
+  assert.equal(none.message, 'Сундук 1 64 2: нет «морковь». Там: hay_block×32, wheat×158');
+
+  const put = await run('#положи всё');
+  assert.equal(put.ok, true, put.message);
+  assert.equal(put.message, 'Сундук 1 64 2: положил bread×24, string×24, pumpkin_seeds×10, wheat_seeds×64, wheat×128 (оставил себе: iron_pickaxe×1)');
+  assert.deepEqual(invNames(bot), ['iron_pickaxe']);
+  assert.equal((await run('#положи всё')).message, 'Класть нечего: в инвентаре только инструменты и броня (iron_pickaxe×1)');
+  assert.equal((await run('#положи кирка в 1 64 2')).message, 'Сундук 1 64 2: положил iron_pickaxe×1');
+  assert.deepEqual(invNames(bot), []);
+});
+
+test('команды: склад — инвентарь полон, сервер не дал, «#возьми … из сундука», сундук по координатам', async () => {
+  const { run, world, bot } = setup({
+    storage: { '1,64,2': { items: [[0, 'wheat', 64]] }, '-2,64,3': { items: [[0, 'diamond', 5]], reject: true } },
+  });
+  world.set(new Vec3(1, 64, 2), 'chest');
+  world.set(new Vec3(-2, 64, 3), 'barrel');
+  const Item = require('prismarine-item')(bot.registry);
+  for (let i = 9; i < 45; i += 1) bot.inventory.slots[i] = new Item(bot.registry.itemsByName.stone.id, 64);
+  const full = await run('#достань пшеница из 1 64 2');
+  assert.equal(full.ok, false);
+  assert.equal(full.message, 'Сундук 1 64 2: ничего не достал — инвентарь полон');
+  for (let i = 9; i < 45; i += 1) bot.inventory.slots[i] = null;
+
+  const guarded = await run('#возьми алмаз из -2 64 3');
+  assert.equal(guarded.ok, false);
+  assert.equal(guarded.message, 'Бочка -2 64 3: ничего не достал — сервер не дал взять');
+  assert.equal(bot.currentWindow, null);
+
+  const took = await run('#возьми пшеницу из сундука');
+  assert.equal(took.message, 'Сундук 1 64 2: достал wheat×64');
+  assert.match((await run('#достань пшеница из огорода')).message, /не понял, что за сундук: «огорода»/);
+  assert.match((await run('#достань пшеница из 0 64 9')).message, /в 0 64 9 нет сундука \(там air\)/);
+  assert.match((await run('#положи')).message, /что положить\?/);
+  assert.equal((await run('#положи алмаз')).message, 'Класть нечего: в инвентаре нет «алмаз»');
+});
+
+test('склад: разбор слов — что, сколько, откуда; предметы по-русски и по id', () => {
+  const norm = (s) => s.toLowerCase().replace(/ё/g, 'е');
+  const p = (line, preps) => {
+    const args = line.split(' ');
+    return storageArgs(args, args.map(norm), preps);
+  };
+  assert.deepEqual(p('пшеница 224 из 10 64 -3', ['из']), { query: 'пшеница', want: 224, at: ['10', '64', '-3'] });
+  assert.deepEqual(p('из сундука пшеницу', ['из']), { query: 'пшеницу', want: Infinity, at: null });
+  assert.deepEqual(p('всё', ['в']), { query: '', want: Infinity, at: null });
+  assert.deepEqual(p('всё 10 64 -3', ['в']), { query: '', want: Infinity, at: ['10', '64', '-3'] });
+  assert.throws(() => p('всё в огород', ['в']), /не понял, что за сундук/);
+
+  const registry = require('prismarine-registry')(VERSION);
+  const all = ['wheat', 'wheat_seeds', 'pumpkin_seeds', 'carrot', 'oak_planks', 'iron_pickaxe', 'cod', 'salmon', 'sweet_berries', 'leather', 'egg'];
+  const pick = (q) => all.filter((name) => itemTest(q, registry)({ name, displayName: name }));
+  assert.deepEqual(pick('пшеница'), ['wheat']);
+  assert.deepEqual(pick('wheat'), ['wheat'], 'точный id — без семян');
+  assert.deepEqual(pick('семена'), ['wheat_seeds', 'pumpkin_seeds']);
+  assert.deepEqual(pick('доски'), ['oak_planks']);
+  assert.deepEqual(pick('кирку'), ['iron_pickaxe']);
+  assert.deepEqual(pick('рыба'), ['cod', 'salmon']);
+  assert.deepEqual(pick('ягоды'), ['sweet_berries']);
+  assert.deepEqual(pick('кожа'), ['leather']);
+  assert.deepEqual(pick('яйца'), ['egg']);
+  assert.deepEqual(pick('seeds'), ['wheat_seeds', 'pumpkin_seeds'], 'незнакомое слово — по части id');
 });
 
 test('команды: #возьми — по-русски выбирает лучшую кирку, понимает «доски» и часть имени', async () => {

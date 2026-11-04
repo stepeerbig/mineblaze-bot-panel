@@ -4,9 +4,11 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const EventEmitter = require('events');
 const { crc32c, componentHash, toHashedSlot, nbtHash } = require('../src/bot/item-hash');
-const { windowClicksPlugin } = require('../src/bot/window-clicks');
+const { windowClicksPlugin, quickMove, isStorageWindow, sameStack } = require('../src/bot/window-clicks');
 
 const registry = require('prismarine-registry')('1.21.11');
+const windowsLib = require('prismarine-windows')(registry);
+const PItem = require('prismarine-item')(registry);
 const names = {
   enchantment: (id) => registry.enchantments[id].name,
   component: (id) => registry.protocol.types.SlotComponentType[1].mappings[id],
@@ -218,4 +220,85 @@ test('сервер поправил курсор (set_cursor_item) — бот в
   client.emit('set_cursor_item', { contents: { itemCount: 2, itemId: 908, addedComponentCount: 0, removedComponentCount: 0, components: [], removeComponents: [] } });
   assert.equal(bot.inventory.selectedItem.name, 'gold_ingot');
   assert.equal(bot.inventory.selectedItem.count, 2);
+});
+
+// ---------- shift-клик в сундуке: как в игре ----------
+
+const chestWindow = (type = 'minecraft:generic_9x3') => windowsLib.createWindow(1, type, 'Chest');
+const stack = (name, count, components = []) =>
+  PItem.fromNotch({ itemCount: count, itemId: registry.itemsByName[name].id, components, removeComponents: [] });
+const layout = (w) => w.slots.map((it, i) => it && `${i}:${it.name}×${it.count}`).filter(Boolean);
+const NAMED = [{ type: 'custom_name', data: str('Особая') }];
+
+test('shift-клик из сундука: в инвентарь с конца — сначала неполная стопка, остаток — в последнюю пустую ячейку', () => {
+  const w = chestWindow(); // сундук 0–26, инвентарь 27–53, быстрая панель 54–62
+  w.updateSlot(0, stack('wheat', 64));
+  w.updateSlot(30, stack('wheat', 60));
+  w.updateSlot(62, stack('stone', 64));
+  const changed = quickMove(w, 0);
+  assert.deepEqual(layout(w), ['30:wheat×64', '61:wheat×60', '62:stone×64']);
+  assert.deepEqual([...changed].sort((a, b) => a - b), [0, 30, 61]);
+});
+
+test('shift-клик в сундук: последняя ячейка сундука тоже (prismarine-windows её не видит), стопки по 16, компоненты', () => {
+  const fill = (w) => {
+    for (let i = 0; i < 26; i += 1) w.updateSlot(i, stack('stone', 64));
+    w.updateSlot(40, stack('wheat', 10));
+  };
+  const raw = chestWindow();
+  fill(raw);
+  raw.acceptClick({ mode: 1, slot: 40, mouseButton: 0, item: raw.slots[40] });
+  assert.equal(raw.slots[40] && raw.slots[40].name, 'wheat', 'prismarine-windows оставил пшеницу в инвентаре — игра положила бы в [26]');
+  const w = chestWindow();
+  fill(w);
+  quickMove(w, 40);
+  assert.equal(w.slots[26].name, 'wheat');
+  assert.equal(w.slots[40], null);
+
+  // Яйца — по 16: дополнили стопку, остаток — в первую пустую ячейку.
+  const eggs = chestWindow();
+  eggs.updateSlot(5, stack('egg', 12));
+  eggs.updateSlot(40, stack('egg', 10));
+  quickMove(eggs, 40);
+  assert.deepEqual(layout(eggs), ['0:egg×6', '5:egg×16']);
+
+  // С другим названием — другая стопка: не складываются.
+  const named = chestWindow();
+  named.updateSlot(0, stack('wheat', 10, NAMED));
+  named.updateSlot(40, stack('wheat', 10));
+  quickMove(named, 40);
+  assert.deepEqual(layout(named), ['0:wheat×10', '1:wheat×10']);
+  assert.ok(sameStack(stack('wheat', 1, NAMED), stack('wheat', 5, NAMED)));
+  assert.ok(!sameStack(stack('wheat', 1, NAMED), stack('wheat', 1)));
+
+  // Места нет — ничего не меняется.
+  const full = chestWindow();
+  for (let i = 0; i < 27; i += 1) full.updateSlot(i, stack('stone', 64));
+  full.updateSlot(40, stack('wheat', 10));
+  assert.deepEqual(quickMove(full, 40), []);
+  assert.equal(full.slots[40].count, 10);
+
+  // Шалкер в шалкер не кладётся.
+  const box = windowsLib.createWindow(2, 'minecraft:shulker_box', 'Shulker');
+  box.updateSlot(30, stack('shulker_box', 1));
+  assert.deepEqual(quickMove(box, 30), []);
+  box.updateSlot(31, stack('iron_pickaxe', 1));
+  quickMove(box, 31);
+  assert.equal(box.slots[0].name, 'iron_pickaxe');
+});
+
+test('плагин: у сундука shift-клик считается как в игре, обычный клик и инвентарь — как были', () => {
+  const { bot } = fakeBot();
+  const w = chestWindow();
+  for (let i = 0; i < 26; i += 1) w.updateSlot(i, stack('stone', 64));
+  w.updateSlot(40, stack('wheat', 10));
+  bot.emit('windowOpen', w);
+  // Так mineflayer.clickWindow считает shift-клик: acceptClick, потом разница ячеек уходит в пакет.
+  w.acceptClick({ mode: 1, slot: 40, mouseButton: 0, item: w.slots[40] });
+  assert.equal(w.slots[26].name, 'wheat');
+  w.acceptClick({ mode: 0, slot: 26, mouseButton: 0, item: w.slots[26] });
+  assert.equal(w.selectedItem.name, 'wheat', 'обычный клик — взял стопку на курсор');
+  assert.equal(isStorageWindow(w), true);
+  assert.equal(isStorageWindow(windowsLib.createWindow(0, 'minecraft:inventory', 'Inventory')), false);
+  assert.equal(isStorageWindow(windowsLib.createWindow(3, 'minecraft:crafting', 'Crafting')), false);
 });

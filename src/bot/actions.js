@@ -29,6 +29,9 @@ const FIRST_CLICK_JITTER = 8;
 const NEXT_CLICK_TICKS = 5;
 const NEXT_CLICK_JITTER = 6;
 const CLICK_REPLY_TICKS = 10;
+// Меню приходит двумя пакетами: само окно (bot.currentWindow уже есть) и его ячейки (тогда — windowOpen).
+// Кликать по ещё пустому окну нельзя — ждём ячейки столько.
+const WINDOW_READY_TICKS = 20;
 const WINDOW_PACKETS = ['set_slot', 'set_cursor_item', 'window_items', 'open_window', 'close_window', 'set_player_inventory'];
 const FULL_BLOCK = [[0, 0, 0, 1, 1, 1]];
 
@@ -688,10 +691,12 @@ function inject(bot, { random, now }) {
 
   // Когда открылось меню: первый клик — не раньше, чем человек успел бы его рассмотреть и довести мышь.
   let windowOpenedTick = -Infinity;
+  let openedWindow = null; // окно, ячейки которого уже пришли
   let lastClickTick = -Infinity;
   let lastWindowPacketTick = -Infinity; // последний ответ сервера про меню, ячейки или курсор
-  bot.on('windowOpen', () => {
+  bot.on('windowOpen', (window) => {
     windowOpenedTick = ticks();
+    openedWindow = window || null;
   });
   if (bot._client && typeof bot._client.on === 'function') {
     for (const name of WINDOW_PACKETS) {
@@ -706,12 +711,15 @@ function inject(bot, { random, now }) {
    * как у человека. После клика ждёт ответа сервера (он поправляет ячейки и курсор), чтобы следующий клик
    * исходил из того, что на самом деле лежит в меню.
    * @param {number} slot    номер ячейки (как в #окно)
-   * @param {object} [opts]  button: 0 — левая, 1 — правая
+   * @param {object} [opts]  button: 0 — левая, 1 — правая; mode: 0 — обычный клик, 1 — с Shift (перенос стопки)
    */
-  function clickSlot(slot, { button = 0 } = {}) {
+  function clickSlot(slot, { button = 0, mode = 0 } = {}) {
     return run('клик в меню', async (signal) => {
       const window = bot.currentWindow;
       if (!window) throw new ActionError('меню не открыто');
+      for (let i = 0; openedWindow !== window && i < WINDOW_READY_TICKS; i += 1) await inTick(() => {}, signal);
+      if (bot.currentWindow !== window) throw new ActionError('меню закрылось');
+      if (openedWindow !== window) throw new ActionError('меню не загрузилось: сервер не прислал его ячейки');
       if (!Number.isInteger(slot) || slot < 0 || slot >= window.slots.length) throw new ActionError(`в меню нет ячейки ${slot}`);
       await standStill(signal);
       const afterOpen = windowOpenedTick + FIRST_CLICK_TICKS + Math.floor(random() * (FIRST_CLICK_JITTER + 1));
@@ -721,7 +729,7 @@ function inject(bot, { random, now }) {
       if (bot.currentWindow !== window) throw new ActionError('меню закрылось');
       const sentTick = ticks();
       try {
-        await bot.clickWindow(slot, button, 0);
+        await bot.clickWindow(slot, button, mode);
       } catch (err) {
         throw new ActionError(`клик не удался: ${err && err.message ? err.message : err}`);
       }

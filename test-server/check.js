@@ -316,7 +316,8 @@ const CLICK_ITEMS = [
 
 /**
  * Проверка кликов в меню (--clicks). Бот открывает сундук с предметами из CLICK_ITEMS и каждый берёт в курсор,
- * а потом кладёт обратно (стак земли — ещё и правой кнопкой, половину). В пакете клика бот сообщает серверу
+ * а потом кладёт обратно (стак земли — ещё и правой кнопкой, половину); затем переносит стопки shift-кликом
+ * (как #достань и #положи) — куда легла стопка, бот считает сам, как игра. В пакете клика бот сообщает серверу
  * «отпечатки» предметов; если они посчитаны как в игре, серверу нечего поправлять, и он молчит. Поправка
  * (set_slot, set_cursor_item, window_items) — отпечаток не совпал. Возвращает число неудачных проверок.
  */
@@ -336,8 +337,14 @@ async function runClickCheck(manager, cmd) {
     `fill ${o.x - 3} ${o.y} ${o.z - 3} ${o.x + 3} ${o.y + 3} ${o.z + 3} minecraft:air`,
     `setblock ${at} minecraft:chest`,
     ...CLICK_ITEMS.map(([, item], i) => `item replace block ${at} container.${i} with ${item}`),
+    // Для shift-кликов: яйца (стопка по 16) и камень — сундук занят весь, кроме последней ячейки [26].
+    `item replace block ${at} container.11 with minecraft:egg 12`,
+    ...Array.from({ length: 14 }, (_, i) => `item replace block ${at} container.${12 + i} with minecraft:stone 64`),
     `clear ${BOT_NAME}`,
-    `give ${BOT_NAME} minecraft:iron_pickaxe[damage=5,enchantments={efficiency:2},custom_name="Кирка"]`,
+    `item replace entity ${BOT_NAME} container.0 with minecraft:iron_pickaxe[damage=5,enchantments={efficiency:2},custom_name="Кирка"]`,
+    `item replace entity ${BOT_NAME} container.9 with minecraft:wheat 60`,
+    `item replace entity ${BOT_NAME} container.10 with minecraft:egg 10`,
+    `item replace entity ${BOT_NAME} container.11 with minecraft:egg 4`,
   ]) cmd(c);
   await wait(2500);
 
@@ -350,7 +357,8 @@ async function runClickCheck(manager, cmd) {
   const answers = [];
   const onPacket = (data, meta) => {
     if (['set_slot', 'set_cursor_item', 'window_items'].includes(meta.name)) {
-      answers.push(`${meta.name}${data && data.slot !== undefined ? ` [${data.slot}]` : ''}`);
+      const win = data && data.windowId !== undefined ? ` окно ${data.windowId}` : '';
+      answers.push(`${meta.name}${win}${data && data.slot !== undefined ? ` [${data.slot}]` : ''}`);
     }
   };
   bot._client.on('packet', onPacket);
@@ -381,6 +389,27 @@ async function runClickCheck(manager, cmd) {
     console.log(`  [клики] [${slot}] ${label} (${item.name}${button ? ', правой' : ''}): ${what}`);
   };
 
+  // Shift-клик: куда ляжет стопка, бот считает сам (как игра); посчитал не так — сервер поправит ячейки.
+  // expect — [ячейка, предмет, сколько] после переноса.
+  const fmtSlot = (s) => `[${s}] ${window.slots[s] ? `${window.slots[s].name}×${window.slots[s].count}` : 'пусто'}`;
+  const shift = async (slot, label, expect) => {
+    const item = window.slots[slot];
+    if (!item) {
+      console.log(`  [shift] [${slot}] ${label}: предмета нет — НЕ ПРОВЕРЕНО`);
+      failed += 1;
+      return;
+    }
+    answers.length = 0;
+    await bot.actions.clickSlot(slot, { mode: 1 });
+    await wait(400);
+    const got = answers.splice(0);
+    const placed = expect.every(([s, name, count]) => window.slots[s] && window.slots[s].name === name && window.slots[s].count === count);
+    const ok = !got.length && placed && !window.selectedItem;
+    if (!ok) failed += 1;
+    const what = ok ? 'сервер согласен' : `ПОПРАВИЛ: ${got.join(', ') || 'нет'}; ячейки: ${expect.map(([s]) => fmtSlot(s)).join(', ')}`;
+    console.log(`  [shift] [${slot}] ${label} (${item.name}): ${what}`);
+  };
+
   try {
     for (let i = 0; i < CLICK_ITEMS.length; i += 1) await check(i, CLICK_ITEMS[i][0]);
     const dirt = CLICK_ITEMS.findIndex(([, item]) => item.startsWith('minecraft:dirt'));
@@ -388,6 +417,13 @@ async function runClickCheck(manager, cmd) {
     const pick = window.slots.findIndex((it, i) => i >= window.inventoryStart && it && it.name === 'iron_pickaxe');
     if (pick >= 0) await check(pick, 'своя кирка в инвентаре (название, износ, зачарование)');
     else console.log('  [клики] кирки в инвентаре нет — её не проверил');
+
+    const S = window.inventoryStart; // инвентарь в окне сундука: S… — основной, S+27… — быстрая панель
+    await shift(1, 'из сундука: к простой пшенице не ложится (другое название), — в последнюю пустую ячейку', [[S + 35, 'wheat', 1]]);
+    await shift(S + 1, 'в сундук: дополнить стопку яиц до 16, остаток — в первую пустую ячейку', [[11, 'egg', 16], [1, 'egg', 6]]);
+    await shift(S, 'в сундук: в его последнюю ячейку (prismarine-windows её не видит)', [[26, 'wheat', 60]]);
+    await shift(11, 'из сундука: дополнить стопку яиц в инвентаре, остаток — в последнюю пустую', [[S + 2, 'egg', 16], [S + 34, 'egg', 4]]);
+    await shift(26, 'из сундука: пшеница обратно', [[S + 33, 'wheat', 60]]);
   } finally {
     bot._client.removeListener('packet', onPacket);
     bot.removeListener('clickHashUnknown', onUnknown);

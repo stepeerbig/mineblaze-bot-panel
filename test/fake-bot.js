@@ -11,6 +11,7 @@ const { Vec3 } = require('vec3');
 const SRC = path.join(__dirname, '..', 'src', 'bot');
 const { createPhysicsPlugin } = require(path.join(SRC, 'physics.js'));
 const { createActionsPlugin } = require(path.join(SRC, 'actions.js'));
+const { quickMove } = require(path.join(SRC, 'window-clicks.js'));
 
 const VERSION = '1.21.11';
 const FACE_VECTORS = [new Vec3(0, -1, 0), new Vec3(0, 1, 0), new Vec3(0, 0, -1), new Vec3(0, 0, 1), new Vec3(-1, 0, 0), new Vec3(1, 0, 0)];
@@ -125,8 +126,11 @@ function physicsBot({ clock, world, tickEnd = true, actions = false, random = 0.
 /**
  * «Сервер» для действий: ломает блок по концу копания (или сразу, если блок ломается мгновенно), ставит блок,
  * а нажатие на сундук открывает окно (содержимое — chests[«x,y,z»] или пусто).
+ * storage[«x,y,z»] = { items: [[ячейка, имя, сколько]], type?, reject? } — настоящее окно-хранилище
+ * (prismarine-windows): shift-клик переносит стопку, как в игре (reject — сервер не даёт), при закрытии
+ * инвентарь из окна переписывается в bot.inventory, как у mineflayer.
  */
-function autoServer(bot, world, { chests = {}, npcs = {}, onClick = null } = {}) {
+function autoServer(bot, world, { chests = {}, storage = {}, npcs = {}, onClick = null } = {}) {
   const write = bot._client.write;
   bot.currentWindow = null;
   bot.clicks = [];
@@ -136,6 +140,10 @@ function autoServer(bot, world, { chests = {}, npcs = {}, onClick = null } = {})
   };
   bot.closeWindow = (window) => {
     if (bot.currentWindow !== window) return;
+    if (window.storageSpec) {
+      for (let i = 0; i < 36; i += 1) bot.inventory.slots[9 + i] = window.slots[window.inventoryStart + i] || null;
+      window.storageSpec.slots = window.slots.slice(0, window.inventoryStart); // сундук помнит, что в нём
+    }
     bot.currentWindow = null;
     write('close_window', { windowId: 1 });
   };
@@ -143,8 +151,27 @@ function autoServer(bot, world, { chests = {}, npcs = {}, onClick = null } = {})
   bot.clickWindow = async (slot, mouseButton, mode) => {
     bot.clicks.push({ window: bot.currentWindow && bot.currentWindow.id, slot, mouseButton, mode });
     write('window_click', { windowId: bot.currentWindow && bot.currentWindow.id, slot, mouseButton, mode });
+    const w = bot.currentWindow;
+    if (w && w.storageSpec) {
+      if (mode === 1 && !w.storageSpec.reject) quickMove(w, slot);
+      return;
+    }
     const next = onClick ? onClick(bot.currentWindow, slot) : null;
     if (next) open(next);
+  };
+  const openStorage = (spec, title) => {
+    const registry = bot.registry;
+    const Item = require('prismarine-item')(registry);
+    const make = (name, count) => new Item(registry.itemsByName[name].id, count);
+    const w = require('prismarine-windows')(registry).createWindow(7, spec.type || 'minecraft:generic_9x3', title);
+    w.storageSpec = spec;
+    if (spec.slots) spec.slots.forEach((it, slot) => it && w.updateSlot(slot, it));
+    else for (const [slot, name, count] of spec.items || []) w.updateSlot(slot, make(name, count));
+    for (let i = 0; i < 36; i += 1) {
+      const it = bot.inventory.slots[9 + i];
+      if (it) w.updateSlot(w.inventoryStart + i, it.type !== undefined ? it : make(it.name, it.count));
+    }
+    open(w);
   };
   bot._client.write = (name, params) => {
     write(name, params);
@@ -156,7 +183,10 @@ function autoServer(bot, world, { chests = {}, npcs = {}, onClick = null } = {})
     } else if (name === 'block_place') {
       const loc = new Vec3(params.location.x, params.location.y, params.location.z);
       const clicked = world.get(loc);
-      if (/chest|barrel|shulker_box/.test(clicked)) {
+      const spec = storage[`${loc.x},${loc.y},${loc.z}`];
+      if (spec && /chest|barrel|shulker_box/.test(clicked)) {
+        openStorage(spec, clicked);
+      } else if (/chest|barrel|shulker_box/.test(clicked)) {
         const items = chests[`${loc.x},${loc.y},${loc.z}`] || [];
         bot.currentWindow = { title: clicked, containerItems: () => items.map((it) => ({ ...it })) };
         bot.emit('windowOpen', bot.currentWindow);
