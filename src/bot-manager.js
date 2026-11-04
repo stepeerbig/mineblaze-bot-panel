@@ -6,6 +6,8 @@ const { parseJoinCommands, MAX_CHAT_LENGTH } = require('./config');
 const { PacketJournal, saveJournal } = require('./bot/packet-journal');
 const { createPhysicsPlugin } = require('./bot/physics');
 const { profileOptions, settingsPlugin, applyClientProfile } = require('./bot/client-profile');
+const { createActionsPlugin } = require('./bot/actions');
+const { runCommand } = require('./bot/commands');
 
 // Что бот делает как обычный клиент, а не как mineflayer (см. src/bot/). Выключать нужно только для сравнения
 // на тестовом стенде: physics — своя физика (ровные тики, движение по правилам клиента), tickEnd — пакет
@@ -192,13 +194,14 @@ class BotManager extends EventEmitter {
     return this.config.autoReconnect;
   }
 
-  /** Отправить сообщение или команду (/...) в чат сервера. */
+  /** Отправить сообщение или команду (/...) в чат сервера. Строка с «#» — команда боту (src/bot/commands.js). */
   say(text) {
     const msg = String(text === undefined || text === null ? '' : text)
       .replace(/[\r\n]+/g, ' ')
       .trim()
       .slice(0, MAX_CHAT_LENGTH);
     if (!msg) return false;
+    if (msg.startsWith('#')) return this._command(msg);
     const s = this.cur;
     if (!s || !s.loggedIn || s.stopping) {
       this.log('warn', 'Сообщение не отправлено: бот не в сети');
@@ -506,12 +509,25 @@ class BotManager extends EventEmitter {
     });
   }
 
+  /** Команда боту из строки чата («#goto 10 64 -5»): выполняется здесь, на сервер не уходит. */
+  _command(line) {
+    const shown = `› ${line}`;
+    this.emit('chat', { time: Date.now(), text: shown, motd: shown, position: 'self' });
+    runCommand(this.getBot(), line, (level, text) => this.log(level, text)).catch((err) => {
+      this.log('error', `${line}: ${describeError(err)}`);
+    });
+    return true;
+  }
+
   /** Опции createBot, чтобы бот вёл себя как обычный клиент (см. DEFAULT_COMPAT и src/bot/). */
   _compatOptions() {
     const c = this.compat;
     const out = {};
     const plugins = {};
-    if (c.physics) plugins.physics = createPhysicsPlugin({ tickEnd: c.tickEnd });
+    if (c.physics) {
+      plugins.physics = createPhysicsPlugin({ tickEnd: c.tickEnd });
+      plugins.actions = createActionsPlugin(); // безопасные действия: им нужна своя физика
+    }
     if (c.profile) {
       plugins.settings = settingsPlugin;
       Object.assign(out, profileOptions());

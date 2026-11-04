@@ -33,4 +33,6 @@ if not exist node_modules\electron\dist\electron.exe (
   )
 )
 
+rem Set by some tools (for example VS Code): Electron would start as plain Node and the panel would not open.
+set ELECTRON_RUN_AS_NODE=
 call npm start

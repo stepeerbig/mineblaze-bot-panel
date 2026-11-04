@@ -15,7 +15,7 @@ const { createSerializer, states } = require('minecraft-protocol');
 const SRC = path.join(__dirname, '..', 'src', 'bot');
 const { PacketJournal, saveJournal, compact } = require(path.join(SRC, 'packet-journal.js'));
 const { applyClientProfile, settingsPlugin, profileOptions, encodeString } = require(path.join(SRC, 'client-profile.js'));
-const { createPhysicsPlugin, MAX_CATCHUP_TICKS } = require(path.join(SRC, 'physics.js'));
+const { createPhysicsPlugin, MAX_CATCHUP_TICKS, MOUSE_STEP, TURN_SPEED } = require(path.join(SRC, 'physics.js'));
 
 // ---------- журнал пакетов ----------
 
@@ -192,87 +192,7 @@ test('профиль: пакеты собираются протоколом 1.2
 
 // ---------- физика ----------
 
-function fakeClock() {
-  let now = 0;
-  let nextId = 0;
-  const timers = new Map();
-  const clock = {
-    now: () => now,
-    setTimeout: (fn, ms) => {
-      nextId += 1;
-      timers.set(nextId, { fn, at: now + ms });
-      return nextId;
-    },
-    clearTimeout: (id) => timers.delete(id),
-    /** Время идёт, таймеры срабатывают точно в срок. */
-    advance(ms) {
-      const end = now + ms;
-      for (;;) {
-        let next = null;
-        for (const [id, t] of timers) if (t.at <= end && (!next || t.at < next.t.at)) next = { id, t };
-        if (!next) break;
-        timers.delete(next.id);
-        now = Math.max(now, next.t.at);
-        next.t.fn();
-      }
-      now = end;
-    },
-    /** Процесс «подвис»: время прошло, а таймеры не сработали. */
-    stall(ms) {
-      now += ms;
-    },
-  };
-  return clock;
-}
-
-function physicsBot({ clock, tickEnd = true } = {}) {
-  const registry = require('prismarine-registry')('1.21.11');
-  const Block = require('prismarine-block')(registry);
-  const stone = registry.blocksByName.stone.defaultState;
-  const air = registry.blocksByName.air.defaultState;
-  const bot = new EventEmitter();
-  bot.version = '1.21.11';
-  bot.registry = registry;
-  bot.supportFeature = registry.supportFeature;
-  const client = new EventEmitter();
-  client.state = 'play';
-  client.sent = [];
-  client.write = (name, params) => client.sent.push({ name, params });
-  bot._client = client;
-  bot.game = { gameMode: 'survival' };
-  bot.inventory = { slots: [] };
-  bot.isAlive = true;
-  bot.entity = {
-    id: 42, position: new Vec3(0.5, 80, 0.5), velocity: new Vec3(0, 0, 0), yaw: 0, pitch: 0, onGround: false,
-    height: 1.8, eyeHeight: 1.62, effects: {}, attributes: {}, isInWater: false, isInLava: false, isInWeb: false,
-    isCollidedHorizontally: false, isCollidedVertically: false, elytraFlying: false,
-  };
-  // Мир: камень ниже y=64, выше — воздух.
-  bot.blockAt = (pos) => {
-    const p = new Vec3(Math.floor(pos.x), Math.floor(pos.y), Math.floor(pos.z));
-    const block = Block.fromStateId(p.y < 64 ? stone : air, 0);
-    block.position = p;
-    return block;
-  };
-  createPhysicsPlugin({ tickEnd, clock })(bot, {});
-  return bot;
-}
-
-/** Телепорт от сервера в формате 1.21.11. */
-function teleport(bot, over = {}) {
-  bot._client.emit('position', {
-    teleportId: 3, x: 0.5, y: 64, z: 0.5, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0,
-    flags: { x: false, y: false, z: false, yaw: false, pitch: false, dx: false, dy: false, dz: false, yawDelta: false },
-    ...over,
-  });
-}
-
-const names = (bot) => bot._client.sent.map((p) => p.name);
-const take = (bot) => {
-  const out = bot._client.sent;
-  bot._client.sent = [];
-  return out;
-};
+const { fakeClock, physicsBot, teleport, names, take } = require('./fake-bot');
 
 test('физика: tick_end в конце каждого тика — ровно 20 в секунду, и только в игре', () => {
   const clock = fakeClock();
@@ -423,6 +343,83 @@ test('физика: поворот головы сервером (в том чи
   const look = take(bot).find((p) => p.name === 'look');
   assert.ok(Math.abs(look.params.yaw - 120) < 1e-3);
   assert.ok(Math.abs(look.params.pitch + 10) < 1e-3);
+});
+
+test('физика: поворот как у человека — шаги мыши по 0.15°, разгон, торможение, без перелёта', async () => {
+  for (const random of [0, 0.5, 0.99]) {
+    // Самая медленная, средняя и самая быстрая «рука».
+    const clock = fakeClock();
+    const bot = physicsBot({ clock, random });
+    bot.emit('login');
+    teleport(bot, { yaw: 10, pitch: 0 });
+    take(bot);
+    let done = false;
+    bot.look(bot.entity.yaw - Math.PI / 2, -0.3).then(() => {
+      done = true;
+    }); // 90° вправо и чуть вниз
+    const yaws = [10];
+    const pitches = [0];
+    for (let i = 0; i < 40 && !done; i += 1) {
+      clock.advance(50);
+      await Promise.resolve();
+      for (const p of take(bot)) {
+        if (p.name === 'look' || p.name === 'position_look') {
+          yaws.push(p.params.yaw);
+          pitches.push(p.params.pitch);
+        }
+      }
+    }
+    assert.ok(done, 'поворот закончился и промис выполнился');
+    const steps = yaws.slice(1).map((y, i) => y - yaws[i]);
+    for (const [i, d] of steps.entries()) {
+      const pd = pitches[i + 1] - pitches[i];
+      assert.ok(Math.abs(d / MOUSE_STEP - Math.round(d / MOUSE_STEP)) < 1e-3, `шаг ${d} кратен шагу мыши`);
+      assert.ok(Math.abs(pd / MOUSE_STEP - Math.round(pd / MOUSE_STEP)) < 1e-3, `шаг наклона ${pd} кратен шагу мыши`);
+      assert.ok(d > 0, 'без перелёта и возврата');
+      assert.ok(d <= TURN_SPEED * 1.25, `не быстрее предела: ${d}`);
+    }
+    assert.ok(steps.length >= 5 && steps.length <= 14, `90° — за ${steps.length} тиков (как рука, а не рывком)`);
+    const peak = steps.indexOf(Math.max(...steps));
+    assert.ok(peak > 0 && peak < steps.length - 1, 'сначала разгон, в конце торможение');
+    assert.ok(Math.abs(yaws[yaws.length - 1] - 100) < MOUSE_STEP, `итог около 100°: ${yaws[yaws.length - 1]}`);
+    assert.ok(bot.serverView.lookSettled);
+    bot.emit('end');
+  }
+});
+
+test('физика: на ходу движение идёт туда, куда бот смотрит сейчас, а не куда повернёт', () => {
+  const clock = fakeClock();
+  const bot = physicsBot({ clock });
+  bot.emit('login');
+  teleport(bot, { yaw: 0, pitch: 0 }); // смотрит на юг (+z)
+  clock.advance(100);
+  take(bot);
+  bot.look(bot.entity.yaw + Math.PI / 2, 0, true); // повернуть на 90° (к востоку, -x в формулах mineflayer — не важно)
+  bot.setControlState('forward', true);
+  const start = bot.entity.position.clone();
+  clock.advance(50);
+  const moved = bot.entity.position.minus(start);
+  const yawSent = take(bot).find((p) => p.name === 'position_look').params.yaw; // взгляд этого тика
+  const rad = (yawSent * Math.PI) / 180;
+  const dir = new Vec3(-Math.sin(rad), 0, Math.cos(rad)); // куда смотрит игрок с таким углом
+  const along = moved.x * dir.x + moved.z * dir.z;
+  const across = Math.abs(moved.x * dir.z - moved.z * dir.x);
+  assert.ok(along > 0 && across < along * 0.05, `сдвиг вдоль взгляда (${along.toFixed(4)}), поперёк — почти ноль (${across.toFixed(4)})`);
+});
+
+test('физика: клавиши, нажатые в обработчике тика, уходят и учитываются в следующем тике', () => {
+  const clock = fakeClock();
+  const bot = physicsBot({ clock });
+  bot.emit('login');
+  teleport(bot);
+  clock.advance(100);
+  take(bot);
+  bot.once('physicsTick', () => bot.setControlState('forward', true));
+  clock.advance(50);
+  assert.ok(!names(bot).includes('player_input'), 'в этом тике движение считалось без клавиши — и пакета нет');
+  take(bot);
+  clock.advance(50);
+  assert.equal(take(bot)[0].name, 'player_input');
 });
 
 test('физика: ошибка внутри тика не роняет бота и не отменяет tick_end', () => {

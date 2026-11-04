@@ -7,6 +7,10 @@
 //         npm run stand:check -- 300             — 300 секунд
 //         npm run stand:check -- --legacy        — бот как чистый mineflayer, без исправлений (сравнить «до/после»)
 //         npm run stand:check -- --no-tick-end   — без одного исправления: --no-tick-end, --no-physics, --no-profile
+//         npm run stand:check -- --scenario      — бот не стоит, а действует: смотрит по сторонам, обходит квадрат
+//                                                  (часть пути бегом), копает и ставит блоки (площадку готовит сам)
+//         npm run stand:check -- --electron      — бот заходит через настоящий Electron (как в панели: главный
+//                                                  процесс + процесс бота); --electron=<путь к exe> — через сборку
 // Перед первым запуском один раз открой test-server\start-test-server.bat: он скачает сервер и спросит про EULA.
 // Код выхода 0 — бот простоял всё время, его не кикнули, и ни Grim, ни сервер ничего не заметили.
 // Журнал пакетов каждой проверки: test-server\server\journals.
@@ -26,8 +30,13 @@ const JOURNAL_DIR = path.join(SERVER_DIR, 'journals');
 const BOT_NAME = 'StandBot';
 
 const ARGS = process.argv.slice(2);
-const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile']);
-const STAY_MS = Math.max(5, parseInt(ARGS.find((a) => /^\d+$/.test(a)), 10) || 60) * 1000;
+const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--scenario', '--electron']);
+const SCENARIO = ARGS.includes('--scenario');
+const ELECTRON_ARG = ARGS.find((a) => a === '--electron' || a.startsWith('--electron='));
+const ELECTRON = Boolean(ELECTRON_ARG);
+const ELECTRON_EXE = ELECTRON_ARG && ELECTRON_ARG.includes('=') ? ELECTRON_ARG.slice(ELECTRON_ARG.indexOf('=') + 1).replace(/^"|"$/g, '') : '';
+const ROOT = path.join(__dirname, '..');
+const STAY_MS = Math.max(5, parseInt(ARGS.find((a) => /^\d+$/.test(a)), 10) || (SCENARIO ? 10 : 60)) * 1000;
 const LEGACY = ARGS.includes('--legacy');
 const COMPAT = {
   physics: !LEGACY && !ARGS.includes('--no-physics'),
@@ -174,7 +183,101 @@ async function stopServer(child) {
   if (!ok) child.kill();
 }
 
-function runBot(host, port, version) {
+/**
+ * Сценарий «бот действует»: площадку готовит консоль сервера (ровный каменный пол, воздух над ним, камень для
+ * копания, кирка и булыжник), дальше бот всё делает через безопасные действия (src/bot/actions.js).
+ * cmd(text) — команда в консоль тестового сервера.
+ */
+async function runScenario(manager, cmd) {
+  if (!cmd) throw new Error('для сценария сервер должна запускать сама проверка: закрой окно тестового сервера и запусти снова');
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  await wait(3000); // как человек: постоять после входа
+  const bot = manager.getBot();
+  if (!bot || !bot.actions) throw new Error('у бота нет безопасных действий (они работают только со своей физикой)');
+  for (const c of [
+    'difficulty peaceful',
+    'time set day',
+    `execute at ${BOT_NAME} run fill ~-6 ~-1 ~-6 ~6 ~-1 ~6 minecraft:stone`,
+    `execute at ${BOT_NAME} run fill ~-6 ~ ~-6 ~6 ~4 ~6 minecraft:air`,
+    `execute at ${BOT_NAME} run setblock ~ ~ ~3 minecraft:stone`,
+    `give ${BOT_NAME} minecraft:iron_pickaxe`,
+    `give ${BOT_NAME} minecraft:cobblestone 16`,
+  ]) cmd(c);
+  await wait(2500);
+  const o = bot.entity.position.floored();
+  const at = (dx, dy, dz) => o.offset(dx, dy, dz);
+  const center = (dx, dz) => o.offset(dx + 0.5, 0, dz + 0.5);
+  const a = bot.actions;
+  const step = async (name, fn) => {
+    const started = Date.now();
+    try {
+      await fn();
+      console.log(`  [сценарий] ${name}: да (${((Date.now() - started) / 1000).toFixed(1)} с)`);
+    } catch (err) {
+      console.log(`  [сценарий] ${name}: НЕ ВЫШЛО — ${err && err.message ? err.message : err}`);
+    }
+  };
+  const deg = (yaw, pitch) => [((180 - yaw) * Math.PI) / 180, (-pitch * Math.PI) / 180]; // углы как в F3
+  await step('посмотреть по сторонам', async () => {
+    for (const [yaw, pitch] of [[90, 10], [-120, -20], [30, 35], [180, 0]]) {
+      await a.look(...deg(yaw, pitch));
+      await wait(300 + Math.random() * 400);
+    }
+  });
+  await step('обойти квадрат 4×4 (первая сторона — бегом)', async () => {
+    await a.walkTo(center(4, 0), { sprint: true });
+    await a.walkTo(center(4, -4));
+    await a.walkTo(center(0, -4));
+    await a.walkTo(center(0, 0));
+  });
+  await step('взять кирку', () => a.equip('iron_pickaxe'));
+  await step('сломать камень', () => a.dig(at(0, 0, 3)));
+  await step('взять булыжник', () => a.equip('cobblestone'));
+  await step('поставить блок на место камня', () => a.place(at(0, 0, 3)));
+  await step('поставить блок рядом', () => a.place(at(1, 0, 3)));
+  await step('взять кирку', () => a.equip('iron_pickaxe'));
+  await step('сломать поставленный блок', () => a.dig(at(1, 0, 3)));
+}
+
+/** Бот заходит через настоящий Electron: самопроверка панели с сервером (см. MBP_SELFTEST_* в src/main.js). */
+function runElectron(host, port, version) {
+  return new Promise((resolve) => {
+    const out = path.join(os.tmpdir(), `mbp-electron-check-${process.pid}.json`);
+    fs.rmSync(out, { force: true });
+    const env = {
+      ...process.env,
+      MBP_SELFTEST_OUT: out,
+      MBP_SELFTEST_SERVER: `${host}:${port}`,
+      MBP_SELFTEST_STAY: String(STAY_MS / 1000),
+      MBP_SELFTEST_VERSION: version,
+      MBP_SELFTEST_NICK: BOT_NAME,
+    };
+    delete env.ELECTRON_RUN_AS_NODE; // иначе Electron запустится как обычный Node (так бывает в терминале VS Code)
+    const file = ELECTRON_EXE ? path.resolve(ELECTRON_EXE) : path.join(ROOT, 'node_modules', 'electron', 'dist', 'electron.exe');
+    console.log(`Бот заходит через ${ELECTRON_EXE ? `сборку: ${file}` : 'Electron из node_modules (как npm start)'}…`);
+    const child = spawn(file, ELECTRON_EXE ? [] : [ROOT], { env, cwd: ROOT, stdio: 'ignore', windowsHide: true });
+    child.once('error', (err) => resolve({ problem: `не удалось запустить Electron: ${err.message}` }));
+    child.once('exit', (code) => {
+      let r = null;
+      try {
+        r = JSON.parse(fs.readFileSync(out, 'utf8'));
+      } catch (_) {
+        /* нет результата — ниже скажем */
+      }
+      fs.rmSync(out, { force: true });
+      const s = r && r.server;
+      if (s) for (const line of s.logs) console.log(`  [бот] ${line.replace(/^(\w+): /, '')}`);
+      let problem = null;
+      if (!r) problem = `Electron завершился (код ${code}) без результата`;
+      else if (r.error) problem = r.error;
+      else if (!s || !s.online) problem = 'бот не продержался на сервере всё время';
+      const kick = s ? s.logs.find((l) => l.startsWith('kick: ')) : null;
+      resolve({ online: Boolean(s && s.states.includes('online')), onlineMs: s ? s.stayMs : 0, kick: kick ? kick.slice(6) : null, problem, stats: s ? s.stats : null });
+    });
+  });
+}
+
+function runBot(host, port, version, cmd) {
   return new Promise((resolve) => {
     const config = {
       ...DEFAULT_CONFIG,
@@ -236,8 +339,19 @@ function runBot(host, port, version) {
         onlineAt = Date.now();
         onlineAtJournal = performance.timeOrigin + performance.now();
         clearTimeout(onlineTimer);
-        console.log(`Бот в мире, стоит ${STAY_MS / 1000} с…`);
-        stayTimer = setTimeout(() => finish(null), STAY_MS);
+        if (SCENARIO) {
+          console.log('Бот в мире: готовлю площадку и действую…');
+          runScenario(manager, cmd).then(
+            () => {
+              console.log(`Сценарий закончен, бот стоит ещё ${STAY_MS / 1000} с…`);
+              stayTimer = setTimeout(() => finish(null), STAY_MS);
+            },
+            (err) => finish(`сценарий: ${err.message}`),
+          );
+        } else {
+          console.log(`Бот в мире, стоит ${STAY_MS / 1000} с…`);
+          stayTimer = setTimeout(() => finish(null), STAY_MS);
+        }
       } else if (state === 'offline') {
         finish(result.online ? 'бот отключился раньше времени' : 'бот не смог войти');
       }
@@ -247,7 +361,11 @@ function runBot(host, port, version) {
 }
 
 async function main() {
-  const unknown = ARGS.filter((a) => a.startsWith('-') && !KNOWN_FLAGS.has(a));
+  const unknown = ARGS.filter((a) => a.startsWith('-') && !KNOWN_FLAGS.has(a) && !a.startsWith('--electron='));
+  if (ELECTRON && (SCENARIO || ARGS.some((a) => /^--(legacy|no-)/.test(a)))) {
+    console.error('--electron проверяет бота таким, какой он в панели: без --scenario, --legacy и --no-…');
+    return 2;
+  }
   if (unknown.length) {
     console.error(`Неизвестные параметры: ${unknown.join(' ')}. Есть: ${[...KNOWN_FLAGS].join(' ')} и число секунд.`);
     return 2;
@@ -279,16 +397,18 @@ async function main() {
     const grimLine = readLogFrom(0).split(/\r?\n/).find((line) => /Enabling GrimAC/i.test(line));
     console.log(grimLine ? `Античит: ${clean(grimLine).replace(/^.*Enabling /, '')}` : 'ВНИМАНИЕ: в логе сервера не видно, что Grim включился.');
     const fixes = Object.keys(COMPAT).filter((k) => COMPAT[k]);
-    console.log(`Бот: ${fixes.length ? `как обычный клиент (${fixes.join(', ')})` : 'чистый mineflayer, без исправлений'}`);
+    if (!ELECTRON) console.log(`Бот: ${fixes.length ? `как обычный клиент (${fixes.join(', ')})` : 'чистый mineflayer, без исправлений'}`);
 
     const offset = logSize();
-    const result = await runBot(host, port, version);
+    const cmd = server ? (text) => server.child.stdin.write(`${text}\n`) : null; // консоль — только у своего сервера
+    const result = ELECTRON ? await runElectron(host, port, version) : await runBot(host, port, version, cmd);
     await sleep(2000); // сервер успеет дописать лог
     const { checks, other } = summarize(readLogFrom(offset));
 
     console.log('');
     console.log('===== Итог =====');
-    console.log(`Бот в мире: ${result.online ? `${Math.round(result.onlineMs / 1000)} с из ${STAY_MS / 1000}` : 'не появился'}`);
+    const stayed = `${Math.round(result.onlineMs / 1000)} с${SCENARIO ? ' (сценарий и пауза после него)' : ` из ${STAY_MS / 1000}`}`;
+    console.log(`Бот в мире: ${result.online ? stayed : 'не появился'}`);
     if (result.kick) console.log(`Кик: ${result.kick}`);
     if (result.problem) console.log(`Проблема: ${result.problem}`);
     if (result.stats) {

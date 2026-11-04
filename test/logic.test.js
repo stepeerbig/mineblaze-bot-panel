@@ -801,11 +801,24 @@ function withWritingClient(mgr) {
   };
 }
 
+test('строка с «#» — команда боту: на сервер не уходит, видна в чате, ответ — в консоли', async () => {
+  const { mgr, bots, logs, chats } = setup();
+  mgr.start();
+  goOnline(bots[0]);
+  assert.equal(mgr.say('#pos'), true);
+  await tick();
+  assert.deepEqual(bots[0].sent, [], 'в чат сервера ничего не ушло');
+  assert.deepEqual(chats.filter((c) => c.position === 'self').map((c) => c.text), ['› #pos']);
+  assert.ok(lines(logs).includes('warn:Команда не выполнена: бот не в мире'), 'у подделки нет мира — честно об этом');
+  mgr.shutdown();
+});
+
 test('опции бота: своя физика, настройки и бренд как у обычного клиента; без исправлений — чистый mineflayer', () => {
   const { mgr, bots } = setup();
   mgr.start();
   const o = bots[0].opts;
   assert.equal(typeof o.plugins.physics, 'function', 'своя физика вместо встроенной');
+  assert.equal(typeof o.plugins.actions, 'function', 'безопасные действия');
   assert.equal(typeof o.plugins.settings, 'function', 'настройки не отправляются после каждого входа в мир');
   assert.equal(o.brand, 'vanilla');
   assert.equal(o.clientSettings.locale, 'ru_ru');

@@ -59,6 +59,18 @@ jobs:
       - name: Сборка exe
         run: npm run dist -- --publish never
 
+      # Собранная программа без окон запускает процесс бота, грузит его модули из app.asar,
+      # поднимает и закрывает экран бота (MBP_SELFTEST_OUT в src/main.js).
+      - name: Самопроверка собранной программы
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'selftest.json'
+          $env:MBP_SELFTEST_OUT = $out
+          Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath 'dist/win-unpacked/MineBlaze Bot Panel.exe' -PassThru -Wait
+          if (-not (Test-Path $out)) { throw "Самопроверка не записала результат (код выхода $($p.ExitCode))" }
+          Get-Content $out -Raw
+          if (-not (Get-Content $out -Raw | ConvertFrom-Json).ok) { throw 'Самопроверка не прошла' }
+
       - uses: actions/upload-artifact@v7
         with:
           path: dist/MineBlazeBotPanel.exe

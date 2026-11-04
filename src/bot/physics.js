@@ -9,13 +9,15 @@
 //  2. В конце каждого тика — пакет tick_end. Клиенты 1.21.2+ шлют его всегда; mineflayer не шлёт вовсе,
 //     и античит Grim с первых секунд ругается на TickTimer.
 //  3. Движение — по правилам обычного клиента: сдвиг меньше 0,0002 блока не отправляется, «напоминание» о позиции —
-//     раз в 20 тиков (по тикам, а не по часам), отдельный пакет — при смене «стоит на земле» или «упёрся в стену»;
-//     флаг упора в стену настоящий, а не всегда «нет».
+//     раз в 20 тиков (по тикам, а не по часам), отдельный пакет — при смене «стоит на земле» или «упёрся в стену».
 //  4. Нажатые клавиши (player_input) и начало/конец бега отправляются внутри тика, перед движением, и только когда
-//     изменились. Присед больше не «отпускает» остальные клавиши, а бег на 1.21.x — настоящий «начал бежать»
+//     изменились, — ровно те, по которым в этом тике считалось движение. Бег на 1.21.x — настоящий «начал бежать»
 //     (mineflayer шлёт номер 3, а это «прыжок на лошади»).
-//  5. Телепорт от сервера (в том числе откат античитом) — по правилам 1.21.2+: относительные координаты, поворот
-//     и скорость из пакета. Поворот головы в пакетах непрерывный — без скачков на 360°.
+//  5. Голова поворачивается как у человека: разгон и торможение, скорость немного разная от раза к разу, каждый
+//     шаг кратен шагу мыши (0,15° при чувствительности 100%) — по шагам античиты узнают «руку». Движение считается
+//     по настоящему взгляду в этом тике, а не по целевому (иначе на поворотах сервер видит расхождение).
+//  6. Телепорт от сервера (в том числе откат античитом) — по правилам 1.21.2+: относительные координаты, поворот
+//     и скорость из пакета. Угол в пакетах непрерывный — без скачков на 360°.
 
 const assert = require('assert');
 const { performance } = require('perf_hooks');
@@ -25,15 +27,18 @@ const math = require('mineflayer/lib/math');
 const conv = require('mineflayer/lib/conversions');
 const { createDoneTask, createTask } = require('mineflayer/lib/promise_utils');
 
-const PI = Math.PI;
-const PI_2 = Math.PI * 2;
 const TICK_MS = 50;
-const TICK_SECONDS = TICK_MS / 1000;
 const MAX_CATCHUP_TICKS = 10; // столько тиков подряд догоняет обычный клиент после подвисания
 const MIN_MOVE_SQ = 2.0e-4 * 2.0e-4; // меньший сдвиг обычный клиент не отправляет
 const POSITION_REMINDER_TICKS = 20; // позицию без движения клиент всё равно присылает раз в 20 тиков
 const DEAD_TICKS = 20; // после смерти движение шлём ещё 20 тиков (как mineflayer)
 const ERROR_REPORT_MS = 10 * 1000; // ошибку внутри тика сообщаем не чаще, чем раз в 10 с
+
+// Поворот головы. Шаг мыши при чувствительности 100% (по умолчанию в игре) — 0,15°.
+const MOUSE_STEP = 0.15;
+const TURN_SPEED = 24; // предельная скорость поворота, градусов за тик (~480°/с)
+const TURN_ACCEL = 7; // разгон и торможение, градусов за тик²
+const NEW_MOTION_DEG = 2; // цель сдвинулась сильнее — это новое «движение мыши» со своей скоростью
 
 const defaultClock = {
   now: () => performance.now(),
@@ -67,11 +72,27 @@ function entityActionId(bot, names, legacyId) {
   return legacyId;
 }
 
-function deltaYaw(yaw1, yaw2) {
-  let d = (yaw1 - yaw2) % PI_2;
-  if (d < -PI) d += PI_2;
-  else if (d > PI) d -= PI_2;
-  return d;
+/** Разница углов в градусах, сведённая к [-180, 180). */
+function wrapDegrees(d) {
+  return ((((d + 180) % 360) + 360) % 360) - 180;
+}
+
+/**
+ * Наибольшая скорость (за тик), с которой можно сделать шаг и потом затормозить по тикам с замедлением accel,
+ * не проскочив цель на расстоянии dist. Тормозной путь считается по тикам, а не по формуле непрерывного движения:
+ * та даёт заниженный путь, и голова проскакивала цель.
+ */
+function stopSpeed(dist, accel) {
+  let lo = 0;
+  let hi = dist;
+  for (let i = 0; i < 30; i += 1) {
+    const v = (lo + hi) / 2;
+    const n = Math.max(0, Math.ceil(v / accel) - 1); // сколько ещё тиков голова будет двигаться при торможении
+    const brake = n * v - (accel * n * (n + 1)) / 2;
+    if (v + brake <= dist) lo = v;
+    else hi = v;
+  }
+  return lo;
 }
 
 /** Поворот вектора скорости, как Vec3.xRot / Vec3.yRot в игре (углы в радианах). */
@@ -88,17 +109,18 @@ function rotateDelta(v, pitchRad, yawRad) {
 
 /**
  * Плагин физики для mineflayer: createBot({ plugins: { physics: createPhysicsPlugin() } }) заменяет встроенный.
- * @param {object}  [opts]
- * @param {boolean} [opts.tickEnd=true]  слать tick_end (выключается только для сравнения на тестовом стенде)
- * @param {object}  [opts.clock]         { now, setTimeout, clearTimeout } — подмена времени для тестов
+ * @param {object}   [opts]
+ * @param {boolean}  [opts.tickEnd=true]  слать tick_end (выключается только для сравнения на тестовом стенде)
+ * @param {object}   [opts.clock]         { now, setTimeout, clearTimeout } — подмена времени для тестов
+ * @param {Function} [opts.random]        источник случайности 0..1 (подмена для тестов)
  */
-function createPhysicsPlugin({ tickEnd = true, clock = defaultClock } = {}) {
+function createPhysicsPlugin({ tickEnd = true, clock = defaultClock, random = Math.random } = {}) {
   return function vanillaPhysics(bot, options) {
-    inject(bot, options || {}, { tickEnd, clock });
+    inject(bot, options || {}, { tickEnd, clock, random });
   };
 }
 
-function inject(bot, { physicsEnabled }, { tickEnd, clock }) {
+function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
   const world = { getBlock: (pos) => bot.blockAt(pos, false) };
   const physics = Physics(bot.registry, world);
 
@@ -117,9 +139,6 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock }) {
 
   const controlState = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false };
   let shouldUsePhysics = false; // движение считаем только после первой позиции от сервера
-  // Отправленный поворот головы в радианах, без сворачивания в круг: угол в пакетах меняется плавно.
-  let lastSentYaw = null;
-  let lastSentPitch = null;
   // Что сервер уже знает о боте (последние отправленные значения).
   const lastSent = { x: 0, y: 0, z: 0, yaw: 0, pitch: 0, onGround: false, horizontalCollision: false };
   let positionReminder = 0;
@@ -128,6 +147,17 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock }) {
   let deadTicks = DEAD_TICKS + 1;
   let respawnTimer = 0;
   let lastErrorAt = -Infinity;
+  let tickCount = 0;
+
+  // Взгляд в градусах игры, без сворачивания в круг (угол в пакетах меняется плавно, без скачков на 360°).
+  // bot.entity.yaw/pitch — куда бот хочет смотреть (как в mineflayer), а здесь — куда он смотрит сейчас.
+  const rot = { yaw: 0, pitch: 0 }; // текущий взгляд
+  const vel = { yaw: 0, pitch: 0 }; // скорость поворота, градусов за тик
+  const grid = { yaw: 0, pitch: 0 }; // от этого угла отсчитываются шаги мыши (последний телепорт)
+  const current = { yaw: 0, pitch: 0 }; // взгляд этого тика с учётом шага мыши — он и уходит на сервер
+  let rotationReady = false; // до первой позиции от сервера взгляда ещё нет
+  let settled = true; // голова не движется и смотрит туда, куда нужно
+  let motion = null; // текущее «движение мыши»: { yaw, pitch, speed, accel }
 
   // ---------- тики ----------
 
@@ -179,41 +209,120 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock }) {
     try {
       const pos = bot.entity.position;
       const ready = pos && Number.isFinite(pos.x) && bot.blockAt(pos) != null; // чанк под ботом загружен
-      if (ready && bot.physicsEnabled && shouldUsePhysics) {
-        physics.simulatePlayer(new PlayerState(bot, controlState), world).apply(bot);
+      if (!ready || !shouldUsePhysics) return;
+      tickCount += 1;
+      stepRotation();
+      // Клавиши этого тика: по ним считается движение, они же уходят на сервер. Что поменяют обработчики
+      // physicsTick, сработает в следующем тике — так же, как у обычного клиента.
+      const controls = { ...controlState };
+      if (bot.physicsEnabled) {
+        const state = new PlayerState(bot, controls);
+        state.yaw = conv.fromNotchianYaw(current.yaw); // движение — по настоящему взгляду, а не по целевому
+        state.pitch = conv.fromNotchianPitch(current.pitch);
+        physics.simulatePlayer(state, world).apply(bot);
         bot.emit('physicsTick');
         bot.emit('physicTick'); // устаревшее имя, оставлено для старых плагинов
       }
-      if (ready && shouldUsePhysics) {
-        sendInputs();
-        updatePosition();
-      }
+      sendInputs(controls);
+      updatePosition(controls);
     } finally {
       // Тик закончился — даже если внутри что-то упало: пропуск tick_end античит заметит сразу.
       if (sendTickEnd && client.state === 'play') client.write('tick_end', {});
     }
   }
 
+  // ---------- взгляд ----------
+
+  /** Куда бот хочет смотреть (bot.entity.yaw/pitch) — в градусах игры, ближайшим путём от текущего взгляда. */
+  function targetRotation() {
+    return {
+      yaw: rot.yaw + wrapDegrees(conv.toNotchianYaw(bot.entity.yaw) - rot.yaw),
+      pitch: math.clamp(-90, conv.toNotchianPitch(bot.entity.pitch), 90),
+    };
+  }
+
+  function stepRotation() {
+    const target = targetRotation();
+    const ex = target.yaw - rot.yaw;
+    const ey = target.pitch - rot.pitch;
+    const dist = Math.hypot(ex, ey);
+    if (dist <= MOUSE_STEP / 2 && Math.hypot(vel.yaw, vel.pitch) <= MOUSE_STEP) {
+      rot.yaw = target.yaw;
+      rot.pitch = target.pitch;
+      vel.yaw = 0;
+      vel.pitch = 0;
+      motion = null;
+    } else {
+      // Новое «движение мыши» — со своей скоростью и разгоном (люди каждый раз двигают немного по-разному).
+      if (!motion || Math.hypot(target.yaw - motion.yaw, target.pitch - motion.pitch) > NEW_MOTION_DEG) {
+        motion = { yaw: target.yaw, pitch: target.pitch, speed: TURN_SPEED * (0.8 + 0.4 * random()), accel: TURN_ACCEL * (0.85 + 0.3 * random()) };
+      }
+      motion.yaw = target.yaw;
+      motion.pitch = target.pitch;
+      // Желаемая скорость: не больше предельной, а у цели — такая, чтобы успеть затормозить.
+      const speed = Math.min(motion.speed, stopSpeed(dist, motion.accel));
+      const dirX = dist > 1e-9 ? ex / dist : 0; // уже на цели, но ещё по инерции — только тормозим
+      const dirY = dist > 1e-9 ? ey / dist : 0;
+      const dvx = dirX * speed - vel.yaw;
+      const dvy = dirY * speed - vel.pitch;
+      const dv = Math.hypot(dvx, dvy);
+      const k = dv > motion.accel ? motion.accel / dv : 1;
+      vel.yaw += dvx * k;
+      vel.pitch += dvy * k;
+      rot.yaw += vel.yaw;
+      rot.pitch = math.clamp(-90, rot.pitch + vel.pitch, 90);
+    }
+    // Шаг мыши: от последнего телепорта взгляд меняется только на целое число шагов.
+    current.yaw = grid.yaw + Math.round((rot.yaw - grid.yaw) / MOUSE_STEP) * MOUSE_STEP;
+    current.pitch = math.clamp(-90, grid.pitch + Math.round((rot.pitch - grid.pitch) / MOUSE_STEP) * MOUSE_STEP, 90);
+    const wasSettled = settled;
+    settled = vel.yaw === 0 && vel.pitch === 0 && Math.abs(target.yaw - rot.yaw) < 1e-9 && Math.abs(target.pitch - rot.pitch) < 1e-9;
+    if (settled && !wasSettled && !lookingTask.done) lookingTask.finish();
+  }
+
+  /** Сервер сам задал взгляд (телепорт, поворот): он применяется сразу, без плавного доворота. */
+  function setRotation(yawDeg, pitchDeg) {
+    rot.yaw = yawDeg;
+    rot.pitch = math.clamp(-90, pitchDeg, 90);
+    vel.yaw = 0;
+    vel.pitch = 0;
+    grid.yaw = rot.yaw;
+    grid.pitch = rot.pitch;
+    current.yaw = rot.yaw;
+    current.pitch = rot.pitch;
+    motion = null;
+    rotationReady = true;
+    bot.entity.yaw = conv.fromNotchianYaw(rot.yaw);
+    bot.entity.pitch = conv.fromNotchianPitch(rot.pitch);
+    settled = true;
+    if (!lookingTask.done) lookingTask.finish();
+  }
+
+  /** Текущий взгляд в градусах игры — непрерывный, как в последних пакетах. */
+  function currentYawDegrees() {
+    return rotationReady ? rot.yaw : conv.toNotchianYaw(bot.entity.yaw);
+  }
+
   // ---------- что уходит на сервер ----------
 
-  function sendInputs() {
+  function sendInputs(controls) {
     if (!inputPacket) return;
     const inputs = {
-      forward: controlState.forward,
-      backward: controlState.back,
-      left: controlState.left,
-      right: controlState.right,
-      jump: controlState.jump,
-      shift: controlState.sneak,
-      sprint: controlState.sprint,
+      forward: controls.forward,
+      backward: controls.back,
+      left: controls.left,
+      right: controls.right,
+      jump: controls.jump,
+      shift: controls.sneak,
+      sprint: controls.sprint,
     };
     if (Object.keys(inputs).every((k) => inputs[k] === sentInputs[k])) return;
     bot._client.write('player_input', { inputs });
     sentInputs = inputs;
   }
 
-  function sendSprintIfNeeded() {
-    const sprinting = controlState.sprint;
+  function sendSprintIfNeeded(controls) {
+    const sprinting = controls.sprint;
     if (sprinting === sentSprinting) return;
     bot._client.write('entity_action', { entityId: bot.entity.id, actionId: sprinting ? SPRINT_START : SPRINT_STOP, jumpBoost: 0 });
     sentSprinting = sprinting;
@@ -250,22 +359,16 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock }) {
     return deadTicks >= DEAD_TICKS;
   }
 
-  function updatePosition() {
+  function updatePosition(controls) {
     if (isEntityRemoved()) return;
     const pos = bot.entity.position;
     if (!Number.isFinite(pos.x)) return;
-
-    // Голова поворачивается не мгновенно, а с ограниченной скоростью — сервер и другие клиенты успевают за ней.
-    const maxYaw = TICK_SECONDS * physics.yawSpeed;
-    const maxPitch = TICK_SECONDS * physics.pitchSpeed;
-    lastSentYaw += math.clamp(-maxYaw, deltaYaw(bot.entity.yaw, lastSentYaw), maxYaw);
-    lastSentPitch += math.clamp(-maxPitch, bot.entity.pitch - (lastSentPitch || 0), maxPitch);
-    const yaw = Math.fround(conv.toNotchianYaw(lastSentYaw));
-    const pitch = Math.fround(conv.toNotchianPitch(lastSentPitch));
+    const yaw = Math.fround(current.yaw);
+    const pitch = Math.fround(current.pitch);
     const onGround = Boolean(bot.entity.onGround);
     const horizontalCollision = Boolean(bot.entity.isCollidedHorizontally);
 
-    sendSprintIfNeeded(); // обычный клиент сообщает о беге в начале отправки движения
+    sendSprintIfNeeded(controls); // обычный клиент сообщает о беге в начале отправки движения
     positionReminder += 1;
     const dx = pos.x - lastSent.x;
     const dy = pos.y - lastSent.y;
@@ -290,10 +393,30 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock }) {
     positionReminder = 0;
   }
 
-  /** Текущий поворот головы в градусах игры — непрерывный, как в последних пакетах. */
-  function currentYawDegrees() {
-    return lastSentYaw !== null ? conv.toNotchianYaw(lastSentYaw) : conv.toNotchianYaw(bot.entity.yaw);
-  }
+  // Что знает о боте сервер — для действий (src/bot/actions.js): по этому взгляду и положению он их проверяет.
+  bot.serverView = {
+    get position() {
+      return new Vec3(lastSent.x, lastSent.y, lastSent.z);
+    },
+    /** Взгляд этого тика (радианы, как bot.entity.yaw/pitch). */
+    get yaw() {
+      return conv.fromNotchianYaw(current.yaw);
+    },
+    get pitch() {
+      return conv.fromNotchianPitch(current.pitch);
+    },
+    /** Голова не движется и смотрит туда, куда нужно. */
+    get lookSettled() {
+      return settled && rotationReady;
+    },
+    /** Сколько тиков с движением прошло (счётчик для действий). */
+    get ticks() {
+      return tickCount;
+    },
+    get inputs() {
+      return { ...sentInputs };
+    },
+  };
 
   // ---------- управление ----------
 
@@ -345,26 +468,26 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock }) {
 
   let lookingTask = createDoneTask();
 
-  bot.on('move', () => {
-    if (!lookingTask.done && Math.abs(deltaYaw(bot.entity.yaw, lastSentYaw)) < 0.001) lookingTask.finish();
-  });
-
+  /**
+   * Повернуть голову (радианы, как в mineflayer). Голова поворачивается плавно, как у человека; промис
+   * выполняется, когда взгляд дошёл до цели. force (в mineflayer — «мгновенно») здесь значит «не ждать»:
+   * мгновенный поворот — верный признак бота, поэтому плавно всегда.
+   */
   bot.look = async (yaw, pitch, force) => {
     if (!lookingTask.done) lookingTask.finish(); // предыдущий поворот прерван новым
     lookingTask = createTask();
-    // Шаг поворота кратен шагу мыши при чувствительности 100%: часть античитов вычисляет его по поворотам.
-    const sensitivity = conv.fromNotchianPitch(0.15);
+    // Цель — на сетке шагов мыши относительно нынешней (как у mineflayer).
+    const sensitivity = conv.fromNotchianPitch(MOUSE_STEP);
     const yawChange = Math.round((yaw - bot.entity.yaw) / sensitivity) * sensitivity;
     const pitchChange = Math.round((pitch - bot.entity.pitch) / sensitivity) * sensitivity;
-    if (yawChange === 0 && pitchChange === 0) return;
-    bot.entity.yaw += yawChange;
-    bot.entity.pitch += pitchChange;
-    if (force) {
-      // Сразу к новому углу, но от прежнего (а не «с нуля»): иначе угол в пакете может скакнуть на 360°.
-      lastSentYaw = lastSentYaw === null ? bot.entity.yaw : lastSentYaw + deltaYaw(bot.entity.yaw, lastSentYaw);
-      lastSentPitch = bot.entity.pitch;
-      return;
+    if (yawChange === 0 && pitchChange === 0) {
+      if (settled) lookingTask.finish();
+    } else {
+      bot.entity.yaw += yawChange;
+      bot.entity.pitch += pitchChange;
+      settled = false;
     }
+    if (force) return;
     await lookingTask.promise;
   };
 
@@ -412,62 +535,54 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock }) {
     }
   });
 
-  // Сервер сам повернул голову бота (1.21.3+). Поворот бывает относительным.
+  // Сервер сам повернул голову бота (1.21.3+). Поворот бывает относительным. Обычный клиент применяет его сразу.
   bot._client.on('player_rotation', (packet) => {
     const yawDeg = packet.relativeYaw ? currentYawDegrees() + packet.yaw : packet.yaw;
-    const pitchDeg = math.clamp(-90, packet.relativePitch ? conv.toNotchianPitch(bot.entity.pitch) + packet.pitch : packet.pitch, 90);
-    bot.entity.yaw = conv.fromNotchianYaw(yawDeg);
-    bot.entity.pitch = conv.fromNotchianPitch(pitchDeg);
-    // Обычный клиент применяет такой поворот сразу: в следующем пакете уже новый угол, без плавного доворота.
-    lastSentYaw = PI - conv.toRadians(yawDeg);
-    lastSentPitch = bot.entity.pitch;
+    const pitchDeg = packet.relativePitch ? (rotationReady ? rot.pitch : conv.toNotchianPitch(bot.entity.pitch)) + packet.pitch : packet.pitch;
+    setRotation(yawDeg, pitchDeg);
   });
 
   // Телепорт: сервер поставил бота в точку (в том числе откат античитом). Подтверждаем, как обычный клиент.
   bot._client.on('position', (packet) => {
     bot.entity.height = 1.8;
-    const vel = bot.entity.velocity;
+    const vel3 = bot.entity.velocity;
     const pos = bot.entity.position;
     const flags = packet.flags;
+    const curYaw = currentYawDegrees();
+    const curPitch = rotationReady ? rot.pitch : conv.toNotchianPitch(bot.entity.pitch);
     let newYaw;
     let newPitch;
 
     if (typeof flags === 'object' && flags !== null && typeof packet.dx === 'number') {
       // 1.21.2+: в пакете есть и скорость; флаги говорят, что из этого относительное.
-      const curYaw = currentYawDegrees();
-      const curPitch = conv.toNotchianPitch(bot.entity.pitch);
       pos.set(flags.x ? pos.x + packet.x : packet.x, flags.y ? pos.y + packet.y : packet.y, flags.z ? pos.z + packet.z : packet.z);
       newYaw = (flags.yaw ? curYaw : 0) + packet.yaw;
       newPitch = math.clamp(-90, (flags.pitch ? curPitch : 0) + packet.pitch, 90);
-      let v = vel.clone();
+      let v = vel3.clone();
       if (flags.yawDelta) v = rotateDelta(v, conv.toRadians(curPitch - newPitch), conv.toRadians(curYaw - newYaw));
-      vel.set(flags.dx ? v.x + packet.dx : packet.dx, flags.dy ? v.y + packet.dy : packet.dy, flags.dz ? v.z + packet.dz : packet.dz);
+      vel3.set(flags.dx ? v.x + packet.dx : packet.dx, flags.dy ? v.y + packet.dy : packet.dy, flags.dz ? v.z + packet.dz : packet.dz);
     } else if (typeof flags === 'object' && flags !== null) {
       // 1.20.5–1.21.1: флаги объектом, скорости в пакете нет
-      vel.set(flags.x ? vel.x : 0, flags.y ? vel.y : 0, flags.z ? vel.z : 0);
+      vel3.set(flags.x ? vel3.x : 0, flags.y ? vel3.y : 0, flags.z ? vel3.z : 0);
       pos.set(flags.x ? pos.x + packet.x : packet.x, flags.y ? pos.y + packet.y : packet.y, flags.z ? pos.z + packet.z : packet.z);
-      newYaw = (flags.yaw ? currentYawDegrees() : 0) + packet.yaw;
-      newPitch = (flags.pitch ? conv.toNotchianPitch(bot.entity.pitch) : 0) + packet.pitch;
+      newYaw = (flags.yaw ? curYaw : 0) + packet.yaw;
+      newPitch = (flags.pitch ? curPitch : 0) + packet.pitch;
     } else {
       // старые версии: флаги битовой маской
-      vel.set(flags & 1 ? vel.x : 0, flags & 2 ? vel.y : 0, flags & 4 ? vel.z : 0);
+      vel3.set(flags & 1 ? vel3.x : 0, flags & 2 ? vel3.y : 0, flags & 4 ? vel3.z : 0);
       pos.set(flags & 1 ? pos.x + packet.x : packet.x, flags & 2 ? pos.y + packet.y : packet.y, flags & 4 ? pos.z + packet.z : packet.z);
-      newYaw = (flags & 8 ? currentYawDegrees() : 0) + packet.yaw;
-      newPitch = (flags & 16 ? conv.toNotchianPitch(bot.entity.pitch) : 0) + packet.pitch;
+      newYaw = (flags & 8 ? curYaw : 0) + packet.yaw;
+      newPitch = (flags & 16 ? curPitch : 0) + packet.pitch;
     }
 
-    bot.entity.yaw = conv.fromNotchianYaw(newYaw);
-    bot.entity.pitch = conv.fromNotchianPitch(newPitch);
     bot.entity.onGround = false;
-
     if (bot.supportFeature('teleportUsesOwnPacket')) bot._client.write('teleport_confirm', { teleportId: packet.teleportId });
 
     const confirm = (at, yawDeg, pitchDeg) => {
-      writeMove('position_look', at, Math.fround(yawDeg), Math.fround(pitchDeg), false, false);
+      setRotation(yawDeg, pitchDeg);
+      writeMove('position_look', at, Math.fround(current.yaw), Math.fround(current.pitch), false, false);
       shouldUsePhysics = true;
       bot.jumpTicks = 0;
-      lastSentYaw = PI - conv.toRadians(yawDeg); // тот же угол, что ушёл в пакете, — следующий не прыгнет на 360°
-      lastSentPitch = bot.entity.pitch;
       bot.emit('forcedMove');
     };
 
@@ -476,6 +591,8 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock }) {
     if (respawnTimer > 0 && Date.now() - respawnTimer < 2000) {
       respawnTimer = 0;
       const at = pos.clone();
+      bot.entity.yaw = conv.fromNotchianYaw(newYaw);
+      bot.entity.pitch = conv.fromNotchianPitch(newPitch);
       clock.setTimeout(() => confirm(at, newYaw, newPitch), 1500);
       return;
     }
@@ -510,4 +627,4 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock }) {
   bot.on('end', stopTicking);
 }
 
-module.exports = { createPhysicsPlugin, TICK_MS, MAX_CATCHUP_TICKS };
+module.exports = { createPhysicsPlugin, wrapDegrees, TICK_MS, MAX_CATCHUP_TICKS, MOUSE_STEP, TURN_SPEED };
