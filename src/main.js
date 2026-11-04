@@ -350,6 +350,7 @@ function startApp() {
     manager = new BotManager({
       config,
       authCacheDir: path.join(app.getPath('userData'), 'auth-cache'),
+      journalDir: path.join(logsDir, 'packets'), // журнал пакетов при кике и возврате в лобби
     });
     manager.on('log', (entry) => {
       send('bot:log', entry);

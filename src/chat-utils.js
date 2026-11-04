@@ -224,6 +224,34 @@ function describeEnd(reason) {
   return chatToText(reason) || 'соединение закрыто';
 }
 
+// ---------- возврат в лобби ----------
+
+// Прокси (Velocity, BungeeCord) часто не кикает, а возвращает игрока в лобби и пишет об этом в чат,
+// например: «Ты перемещен в лобби ▸ Подозрение в использовании читов».
+const FORCED_MOVE_RE = new RegExp(
+  [
+    '(?:перемещ[её]н|перенес[её]н|отправлен|возвращ[её]н|кикнут)[аоы]?\\s+(?:обратно\\s+)?(?:в|на)\\s+(?:лобби|хаб|lobby|hub)',
+    '(?:moved|sent|returned|kicked)\\s+(?:back\\s+)?to\\s+(?:the\\s+)?(?:lobby|hub)',
+    'kicked\\s+from\\b',
+  ].join('|'),
+  'i',
+);
+
+/** Причина возврата в лобби из системного сообщения или null, если это не оно. */
+function forcedMoveReason(text) {
+  const s = String(text === undefined || text === null ? '' : text)
+    .replace(/§[0-9a-fk-orx#]/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const m = s.match(FORCED_MOVE_RE);
+  if (!m) return null;
+  const rest = s
+    .slice(m.index + m[0].length)
+    .replace(/^[\s▸»>:|\-—–.,!]+/, '')
+    .trim();
+  return rest || s;
+}
+
 // ---------- ссылки ----------
 
 const URL_RE = /https?:\/\/[^\s"'<>\\`{}|^]+/gi;
@@ -265,4 +293,4 @@ function extractLinks(value, { maxNodes = 5000, maxDepth = 24 } = {}) {
   return [...found];
 }
 
-module.exports = { chatToText, describeError, describeEnd, noRetryReason, maskSecrets, extractLinks };
+module.exports = { chatToText, describeError, describeEnd, noRetryReason, maskSecrets, extractLinks, forcedMoveReason };

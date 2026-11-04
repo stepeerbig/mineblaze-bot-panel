@@ -3,23 +3,37 @@
 // Проверка бота на тестовом стенде. Если сервер не запущен — поднимает его сам, заводит бота так же,
 // как панель (через BotManager), держит его в мире и показывает, что заметили античит Grim и сервер.
 //
-// Запуск: npm run stand:check            — бот стоит в мире 60 секунд
-//         npm run stand:check -- 300     — 300 секунд
+// Запуск: npm run stand:check                    — бот стоит в мире 60 секунд
+//         npm run stand:check -- 300             — 300 секунд
+//         npm run stand:check -- --legacy        — бот как чистый mineflayer, без исправлений (сравнить «до/после»)
+//         npm run stand:check -- --no-tick-end   — без одного исправления: --no-tick-end, --no-physics, --no-profile
 // Перед первым запуском один раз открой test-server\start-test-server.bat: он скачает сервер и спросит про EULA.
 // Код выхода 0 — бот простоял всё время, его не кикнули, и ни Grim, ни сервер ничего не заметили.
+// Журнал пакетов каждой проверки: test-server\server\journals.
 
 const { spawn } = require('child_process');
 const fs = require('fs');
 const net = require('net');
 const os = require('os');
 const path = require('path');
+const { performance } = require('perf_hooks');
 const { BotManager } = require('../src/bot-manager');
 const { DEFAULT_CONFIG } = require('../src/config');
 
 const SERVER_DIR = path.join(__dirname, 'server');
 const LOG_FILE = path.join(SERVER_DIR, 'logs', 'latest.log');
+const JOURNAL_DIR = path.join(SERVER_DIR, 'journals');
 const BOT_NAME = 'StandBot';
-const STAY_MS = Math.max(5, parseInt(process.argv[2], 10) || 60) * 1000;
+
+const ARGS = process.argv.slice(2);
+const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile']);
+const STAY_MS = Math.max(5, parseInt(ARGS.find((a) => /^\d+$/.test(a)), 10) || 60) * 1000;
+const LEGACY = ARGS.includes('--legacy');
+const COMPAT = {
+  physics: !LEGACY && !ARGS.includes('--no-physics'),
+  tickEnd: !LEGACY && !ARGS.includes('--no-tick-end'),
+  profile: !LEGACY && !ARGS.includes('--no-profile'),
+};
 const SERVER_START_TIMEOUT = 6 * 60 * 1000; // первый запуск скачивает файлы Mojang и создаёт мир
 const BOT_ONLINE_TIMEOUT = 60 * 1000;
 
@@ -36,7 +50,7 @@ const clean = (line) => String(line).replace(/\x1b\[[0-9;]*m/g, '').replace(/§.
 
 function readJson(file) {
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, ''));
+    return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\\uFEFF/, ''));
   } catch (_) {
     return {};
   }
@@ -173,9 +187,15 @@ function runBot(host, port, version) {
       loginPassword: '',
       joinCommands: '',
     };
-    const manager = new BotManager({ config, authCacheDir: path.join(os.tmpdir(), 'mineblaze-stand-auth') });
-    const result = { online: false, onlineMs: 0, kick: null, problem: null };
+    const manager = new BotManager({
+      config,
+      authCacheDir: path.join(os.tmpdir(), 'mineblaze-stand-auth'),
+      journalDir: JOURNAL_DIR,
+      compat: COMPAT,
+    });
+    const result = { online: false, onlineMs: 0, kick: null, problem: null, stats: null };
     let onlineAt = 0;
+    let onlineAtJournal = 0; // то же время, но в часах журнала пакетов
     let stayTimer = null;
     let finished = false;
 
@@ -186,10 +206,12 @@ function runBot(host, port, version) {
       clearTimeout(stayTimer);
       result.problem = problem;
       result.onlineMs = onlineAt ? Date.now() - onlineAt : 0;
+      if (manager.journal) result.stats = manager.journal.stats(onlineAtJournal ? { sinceMs: onlineAtJournal } : {});
       if (manager.state === 'offline') {
-        resolve(result);
+        resolve(result); // при кике журнал уже сохранила сама панель
         return;
       }
+      manager.saveJournal(problem ? `проверка на стенде: ${problem}` : 'проверка на стенде');
       const giveUp = setTimeout(() => resolve(result), 5000);
       manager.on('state', (state) => {
         if (state === 'offline') {
@@ -212,6 +234,7 @@ function runBot(host, port, version) {
       if (state === 'online' && !result.online) {
         result.online = true;
         onlineAt = Date.now();
+        onlineAtJournal = performance.timeOrigin + performance.now();
         clearTimeout(onlineTimer);
         console.log(`Бот в мире, стоит ${STAY_MS / 1000} с…`);
         stayTimer = setTimeout(() => finish(null), STAY_MS);
@@ -224,6 +247,11 @@ function runBot(host, port, version) {
 }
 
 async function main() {
+  const unknown = ARGS.filter((a) => a.startsWith('-') && !KNOWN_FLAGS.has(a));
+  if (unknown.length) {
+    console.error(`Неизвестные параметры: ${unknown.join(' ')}. Есть: ${[...KNOWN_FLAGS].join(' ')} и число секунд.`);
+    return 2;
+  }
   if (!fs.existsSync(path.join(SERVER_DIR, 'paper.jar'))) {
     console.error('Стенд не установлен: сначала запусти test-server\\start-test-server.bat (он скачает сервер и спросит про EULA).');
     return 2;
@@ -250,6 +278,8 @@ async function main() {
 
     const grimLine = readLogFrom(0).split(/\r?\n/).find((line) => /Enabling GrimAC/i.test(line));
     console.log(grimLine ? `Античит: ${clean(grimLine).replace(/^.*Enabling /, '')}` : 'ВНИМАНИЕ: в логе сервера не видно, что Grim включился.');
+    const fixes = Object.keys(COMPAT).filter((k) => COMPAT[k]);
+    console.log(`Бот: ${fixes.length ? `как обычный клиент (${fixes.join(', ')})` : 'чистый mineflayer, без исправлений'}`);
 
     const offset = logSize();
     const result = await runBot(host, port, version);
@@ -261,6 +291,18 @@ async function main() {
     console.log(`Бот в мире: ${result.online ? `${Math.round(result.onlineMs / 1000)} с из ${STAY_MS / 1000}` : 'не появился'}`);
     if (result.kick) console.log(`Кик: ${result.kick}`);
     if (result.problem) console.log(`Проблема: ${result.problem}`);
+    if (result.stats) {
+      const st = result.stats;
+      const sent = st.out.map((r) => `${r.name} ${r.perSecond.toFixed(1)}`).join(', ');
+      console.log(`Бот отправлял, пакетов в секунду: ${sent || 'ничего'}`);
+      const t = st.ticks;
+      if (t.gaps) {
+        console.log(
+          `Тики (по tick_end): в среднем ${t.avgMs.toFixed(1)} мс, от ${t.minMs.toFixed(1)} до ${t.maxMs.toFixed(1)} мс; ` +
+            `длиннее 70 мс: ${t.over70}, пачкой: ${t.under5}`,
+        );
+      }
+    }
     if (checks.size) {
       console.log('Срабатывания Grim:');
       for (const [name, c] of checks) {

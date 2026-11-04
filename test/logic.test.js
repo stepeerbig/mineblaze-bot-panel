@@ -43,7 +43,7 @@ class FakeBot extends EventEmitter {
   }
 }
 
-function setup(over = {}, timings = {}) {
+function setup(over = {}, timings = {}, extra = {}) {
   const bots = [];
   const config = {
     host: 'h', port: 25565, username: 'Bot', version: '1.21.11', auth: 'offline',
@@ -58,6 +58,7 @@ function setup(over = {}, timings = {}) {
       bots.push(b);
       return b;
     },
+    ...extra,
   });
   const logs = [];
   const states = [];
@@ -80,7 +81,8 @@ test('полный цикл: подключение, вход, чат, кик, �
   assert.equal(mgr.start(), true);
   assert.equal(mgr.state, 'connecting');
   const bot = bots[0];
-  assert.deepEqual(bot.opts, { host: 'h', port: 25565, username: 'Bot', auth: 'offline', version: '1.21.11' });
+  const o = bot.opts;
+  assert.deepEqual([o.host, o.port, o.username, o.auth, o.version], ['h', 25565, 'Bot', 'offline', '1.21.11']);
 
   goOnline(bot);
   bot.emit('message', { toString: () => '<Steve> hi', toMotd: () => '§a<Steve> §fhi' }, 'chat');
@@ -774,4 +776,135 @@ test('ссылки из пакетов старого бота после пер
   old.emit('end', 'socketClosed');
   old._client.emit('packet', { reason: 'https://late.example' }, { name: 'kick_disconnect', state: 'play' });
   assert.deepEqual(links, []);
+});
+
+// ---------- бот как обычный клиент, журнал пакетов, возврат в лобби ----------
+
+const fs = require('node:fs');
+const os = require('node:os');
+const { forcedMoveReason } = require(path.join(SRC, 'chat-utils.js'));
+
+function tmpDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'mbp-test-'));
+}
+
+/** Клиент протокола, который пишет отправленное в client.sent (у FakeBot своего нет). */
+function withWritingClient(mgr) {
+  const origCreate = mgr._createBot;
+  mgr._createBot = (opts) => {
+    const b = origCreate(opts);
+    const client = withPacketClient(b);
+    client.state = 'play';
+    client.sent = [];
+    client.write = (name, params) => client.sent.push([name, params]);
+    return b;
+  };
+}
+
+test('опции бота: своя физика, настройки и бренд как у обычного клиента; без исправлений — чистый mineflayer', () => {
+  const { mgr, bots } = setup();
+  mgr.start();
+  const o = bots[0].opts;
+  assert.equal(typeof o.plugins.physics, 'function', 'своя физика вместо встроенной');
+  assert.equal(typeof o.plugins.settings, 'function', 'настройки не отправляются после каждого входа в мир');
+  assert.equal(o.brand, 'vanilla');
+  assert.equal(o.clientSettings.locale, 'ru_ru');
+  mgr.shutdown();
+
+  const legacy = setup({}, {}, { compat: { physics: false, tickEnd: false, profile: false } });
+  legacy.mgr.start();
+  const lo = legacy.bots[0].opts;
+  assert.equal(lo.plugins, undefined);
+  assert.equal(lo.brand, undefined);
+  assert.equal(lo.clientSettings, undefined);
+  legacy.mgr.shutdown();
+});
+
+test('возврат в лобби: причина из сообщения прокси', () => {
+  assert.equal(forcedMoveReason('| Ты перемещен в лобби ▸ Подозрение в использовании читов'), 'Подозрение в использовании читов');
+  assert.equal(forcedMoveReason('§cВы были перемещёны в лобби: §fAFK'), 'AFK');
+  assert.equal(forcedMoveReason('You were kicked from g5: Cheating'), 'g5: Cheating');
+  assert.equal(forcedMoveReason('You have been moved to the lobby'), 'You have been moved to the lobby', 'без причины — весь текст');
+  assert.equal(forcedMoveReason('Добро пожаловать на сервер'), null);
+  assert.equal(forcedMoveReason(''), null);
+  assert.equal(forcedMoveReason(undefined), null);
+});
+
+test('возврат в лобби: строка в консоли и журнал в файл; повтор и чат игроков не считаются', () => {
+  const dir = tmpDir();
+  const { mgr, bots, logs } = setup({}, {}, { journalDir: dir });
+  mgr.start();
+  const bot = bots[0];
+  goOnline(bot);
+  const msg = (text) => ({ toString: () => text, toMotd: () => text, json: { text } });
+  bot.emit('message', msg('<Steve> меня перемещен в лобби, лол'), 'chat'); // игрок — не считается
+  bot.emit('message', msg('| Ты перемещен в лобби ▸ Подозрение в использовании читов'), 'system');
+  bot.emit('message', msg('| Ты перемещен в лобби ▸ Подозрение в использовании читов'), 'system'); // повтор
+  const t = lines(logs);
+  assert.deepEqual(t.filter((x) => x.includes('в лобби')), ['kick:Сервер вернул бота в лобби: Подозрение в использовании читов']);
+  const files = fs.readdirSync(dir);
+  assert.equal(files.length, 1);
+  assert.match(files[0], /^packets-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.txt$/);
+  const text = fs.readFileSync(path.join(dir, files[0]), 'utf8');
+  assert.match(text, /возврат в лобби: Подозрение в использовании читов/);
+  assert.match(text, /Сервер: h:25565/);
+  assert.ok(t.includes(`info:Журнал пакетов сохранён: ${path.join(dir, files[0])}`));
+  assert.equal(mgr.state, 'online', 'соединение не рвётся');
+  mgr.shutdown();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('переход на другой сервер и бренд сервера видны в консоли', () => {
+  const { mgr, bots, logs } = setup();
+  withWritingClient(mgr);
+  mgr.start();
+  const bot = bots[0];
+  const client = bot._client;
+  client.emit('minecraft:brand', '§6Velocity');
+  goOnline(bot);
+  client.emit('minecraft:brand', 'Velocity'); // тот же — без повтора
+  client.emit('start_configuration');
+  client.emit('minecraft:brand', 'Paper');
+  bot.emit('login');
+  const t = lines(logs);
+  assert.deepEqual(t.filter((x) => /Сервер|сервер/.test(x) && !x.includes('Подключение')), [
+    'info:Сервер: Velocity',
+    'ok:Подключен: вход на сервер выполнен',
+    'info:Сервер переводит бота на другой сервер…',
+    'info:Сервер: Paper',
+    'ok:Переход на другой сервер выполнен',
+  ]);
+  mgr.shutdown();
+});
+
+test('кик: журнал пакетов в файле, пароль из /login в него не попадает; «Стоп» журнал не сохраняет', () => {
+  const dir = tmpDir();
+  const { mgr, bots, logs } = setup({}, {}, { journalDir: dir });
+  withWritingClient(mgr);
+  mgr.start();
+  const bot = bots[0];
+  const client = bot._client;
+  goOnline(bot);
+  client.emit('packet', { x: 1, y: 64, z: 2 }, { name: 'position', state: 'play' }, Buffer.alloc(40));
+  client.write('chat_command', { command: 'login Secret123', timestamp: 1n, salt: 0n, argumentSignatures: [] });
+  client.write('tick_end', {});
+  bot.emit('kicked', '{"text":"Подозрение в читах"}', true);
+  bot.emit('end', 'socketClosed');
+  const files = fs.readdirSync(dir);
+  assert.equal(files.length, 1);
+  const text = fs.readFileSync(path.join(dir, files[0]), 'utf8');
+  assert.match(text, /кик: Подозрение в читах/);
+  assert.match(text, /← {2}play {10}position {2}40 Б/);
+  assert.match(text, /chat_command {2}\{"command":"login ••••"/);
+  assert.ok(!text.includes('Secret123'), 'пароль не попал в журнал');
+  assert.match(text, /# {2}Кик: Подозрение в читах/);
+  assert.ok(lines(logs).some((x) => x.startsWith('info:Журнал пакетов сохранён:')));
+
+  // Ручная остановка — это не проблема, журнал не нужен.
+  mgr.start();
+  goOnline(bots[1]);
+  mgr.stop();
+  bots[1].emit('end', 'disconnect.quitting');
+  assert.equal(fs.readdirSync(dir).length, 1);
+  fs.rmSync(dir, { recursive: true, force: true });
 });

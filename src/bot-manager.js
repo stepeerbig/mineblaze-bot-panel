@@ -1,8 +1,17 @@
 'use strict';
 
 const EventEmitter = require('events');
-const { chatToText, describeError, describeEnd, noRetryReason, maskSecrets, extractLinks } = require('./chat-utils');
+const { chatToText, describeError, describeEnd, noRetryReason, maskSecrets, extractLinks, forcedMoveReason } = require('./chat-utils');
 const { parseJoinCommands, MAX_CHAT_LENGTH } = require('./config');
+const { PacketJournal, saveJournal } = require('./bot/packet-journal');
+const { createPhysicsPlugin } = require('./bot/physics');
+const { profileOptions, settingsPlugin, applyClientProfile } = require('./bot/client-profile');
+
+// Что бот делает как обычный клиент, а не как mineflayer (см. src/bot/). Выключать нужно только для сравнения
+// на тестовом стенде: physics — своя физика (ровные тики, движение по правилам клиента), tickEnd — пакет
+// tick_end в конце каждого тика, profile — бренд и настройки клиента один раз при входе.
+const DEFAULT_COMPAT = Object.freeze({ physics: true, tickEnd: true, profile: true });
+const FORCED_MOVE_REPEAT_MS = 10 * 1000; // одно и то же сообщение о возврате в лобби может прийти несколько раз
 
 const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
 
@@ -87,22 +96,32 @@ class BotManager extends EventEmitter {
    * @param {object}   opts
    * @param {object}   opts.config        живой объект настроек (см. config.js)
    * @param {string}   opts.authCacheDir  папка для токенов Microsoft-входа
+   * @param {string}   [opts.journalDir]  куда сохранять журнал пакетов при кике и возврате в лобби (нет — не сохранять)
+   * @param {object}   [opts.compat]      что делать как обычный клиент (см. DEFAULT_COMPAT)
    * @param {Function} [opts.createBot]   подмена mineflayer.createBot (нужна для тестов)
    * @param {object}   [opts.timings]     подмена задержек (нужна для тестов)
    */
-  constructor({ config, authCacheDir, createBot, timings } = {}) {
+  constructor({ config, authCacheDir, journalDir = null, compat, createBot, timings } = {}) {
     super();
     this.config = config;
     this.authCacheDir = authCacheDir;
+    this.journalDir = journalDir;
+    this.compat = { ...DEFAULT_COMPAT, ...compat };
     this._createBot = createBot;
     this.timings = { ...DEFAULT_TIMINGS, ...timings };
 
     this.state = 'offline';
     this.cur = null; // текущая сессия (см. _connect)
+    this.lastSession = null; // последняя сессия, даже закончившаяся: её журнал можно сохранить
     this.wantRun = false; // true между «Старт» и «Стоп» (или окончательным отказом)
     this.reconnectTimer = null;
     this.attempt = 0;
     this.announced = null; // какой бот последним объявлен событием 'bot'
+  }
+
+  /** Журнал пакетов последней сессии (или null, если бот ещё не запускался). */
+  get journal() {
+    return this.lastSession ? this.lastSession.journal : null;
   }
 
   // ---------- публичные методы ----------
@@ -188,6 +207,11 @@ class BotManager extends EventEmitter {
     return this._send(s, msg);
   }
 
+  /** Сохраняет журнал пакетов последней сессии в файл; возвращает путь или null. */
+  saveJournal(reason) {
+    return this.lastSession ? this._saveJournal(this.lastSession, reason) : null;
+  }
+
   /** Пауза перед попыткой номер attempt (в секундах). */
   reconnectDelayFor(attempt) {
     const base = clamp(parseInt(this.config.reconnectDelay, 10) || 5, 1, 600);
@@ -261,6 +285,19 @@ class BotManager extends EventEmitter {
       stopping: false,
       packNoted: false,
       links: new Set(), // ссылки, уже показанные в консоли за эту сессию
+      kickText: '',
+      switching: false, // прокси переводит бота на другой сервер
+      serverBrand: '',
+      forcedAt: 0, // когда последний раз сообщили о возврате в лобби
+      journal: null,
+      // Шапка файла журнала (без паролей).
+      meta: {
+        Сервер: `${cfg.host}:${cfg.port}`,
+        Версия: cfg.version || 'авто',
+        Ник: cfg.username,
+        Вход: cfg.auth,
+        'Как обычный клиент': Object.keys(this.compat).map((k) => `${k}=${this.compat[k] ? 'да' : 'нет'}`).join(', '),
+      },
       forceTimer: null,
       errorTimer: null,
       loginTimer: null,
@@ -277,6 +314,7 @@ class BotManager extends EventEmitter {
         username: cfg.username,
         auth: cfg.auth,
         version: cfg.version || false,
+        ...this._compatOptions(),
       };
       if (cfg.auth === 'microsoft') {
         options.profilesFolder = this.authCacheDir;
@@ -301,6 +339,11 @@ class BotManager extends EventEmitter {
 
     s.bot = bot;
     this.cur = s;
+    this.lastSession = s;
+    // Журнал — ближе всех к сети, профиль — поверх него: в журнал попадает то, что ушло на сервер на самом деле.
+    s.journal = new PacketJournal({ getSelfId: () => (bot.entity ? bot.entity.id : null) });
+    s.journal.attach(bot._client);
+    if (this.compat.profile) applyClientProfile(bot._client);
     s.loginTimer = later(
       () => this._loginTimeout(s, `вход не завершился за ${Math.round(this.timings.loginTimeout / 1000)} с`),
       this.timings.loginTimeout,
@@ -320,6 +363,13 @@ class BotManager extends EventEmitter {
       clearTimeout(s.loginTimer);
       this._setState('connected');
       this.log('ok', 'Подключен: вход на сервер выполнен');
+    });
+
+    // Повторный 'login' — бот уже на другом сервере за тем же прокси.
+    bot.on('login', () => {
+      if (!alive() || !s.switching) return;
+      s.switching = false;
+      this.log('ok', 'Переход на другой сервер выполнен');
     });
 
     // 'spawn' приходит при первом появлении, после возрождения и при смене мира.
@@ -371,6 +421,25 @@ class BotManager extends EventEmitter {
           /* ignore */
         }
       });
+
+      // Прокси (Velocity) переводит бота на другой сервер: снова фаза настройки, потом новый 'login'.
+      bot._client.on('start_configuration', () => {
+        if (!alive() || !s.spawned || s.stopping) return;
+        s.switching = true;
+        this.log('info', 'Сервер переводит бота на другой сервер…');
+      });
+
+      // Название серверной программы (например, «Paper» или «Velocity»): помогает понять, кто кикает.
+      bot._client.on('minecraft:brand', (brand) => {
+        if (!alive()) return;
+        const text = String(brand === undefined || brand === null ? '' : brand)
+          .replace(/§[0-9a-fk-orx#]/gi, '')
+          .trim()
+          .slice(0, 100);
+        if (!text || text === s.serverBrand) return;
+        s.serverBrand = text;
+        this.log('info', `Сервер: ${text}`);
+      });
     }
 
     bot.on('message', (jsonMsg, position) => {
@@ -400,6 +469,11 @@ class BotManager extends EventEmitter {
       const shown = String(text);
       const important = s.spawned ? links.filter((url) => !shown.includes(url)) : links;
       this._reportLinks(s, important, 'сообщение в чате');
+      // Сообщение прокси о возврате в лобби (сообщения игроков не считаем).
+      if (position !== 'chat') {
+        const forced = forcedMoveReason(shown);
+        if (forced) this._onForcedMove(s, forced);
+      }
     });
 
     bot.on('kicked', (reason, loggedIn) => {
@@ -408,6 +482,8 @@ class BotManager extends EventEmitter {
       s.kicked = true;
       s.noRetry = noRetryReason(reason);
       const text = chatToText(reason) || 'причина не указана';
+      s.kickText = text;
+      if (s.journal) s.journal.mark(`Кик: ${text}`);
       this.log('kick', `Кик${loggedIn === false ? ' при входе' : ''}: ${text}`);
     });
 
@@ -428,6 +504,42 @@ class BotManager extends EventEmitter {
       if (!alive()) return;
       this._onEnd(s, reason);
     });
+  }
+
+  /** Опции createBot, чтобы бот вёл себя как обычный клиент (см. DEFAULT_COMPAT и src/bot/). */
+  _compatOptions() {
+    const c = this.compat;
+    const out = {};
+    const plugins = {};
+    if (c.physics) plugins.physics = createPhysicsPlugin({ tickEnd: c.tickEnd });
+    if (c.profile) {
+      plugins.settings = settingsPlugin;
+      Object.assign(out, profileOptions());
+    }
+    if (Object.keys(plugins).length) out.plugins = plugins;
+    return out;
+  }
+
+  /** Сервер вернул бота в лобби (прокси пишет об этом в чат): это тот же кик, только без разрыва соединения. */
+  _onForcedMove(s, reason) {
+    const now = Date.now();
+    if (now - s.forcedAt < FORCED_MOVE_REPEAT_MS) return;
+    s.forcedAt = now;
+    this.log('kick', `Сервер вернул бота в лобби: ${reason}`);
+    if (s.journal) s.journal.mark(`Возврат в лобби: ${reason}`);
+    this._saveJournal(s, `возврат в лобби: ${reason}`);
+  }
+
+  _saveJournal(s, reason) {
+    if (!this.journalDir || !s || !s.journal) return null;
+    try {
+      const file = saveJournal(s.journal, this.journalDir, { reason, meta: s.meta });
+      this.log('info', `Журнал пакетов сохранён: ${file}`);
+      return file;
+    } catch (err) {
+      this.log('warn', `Не удалось сохранить журнал пакетов: ${describeError(err)}`);
+      return null;
+    }
   }
 
   /** Новые ссылки сессии — в консоль (кликабельно) и событием 'link'; повторы не показываем. */
@@ -516,6 +628,11 @@ class BotManager extends EventEmitter {
       this.log('warn', `Не в сети: ${describeEnd(reason)}`);
     } else {
       this.log('warn', 'Не в сети');
+    }
+
+    // Неожиданный разрыв после входа (кик, обрыв) — журнал в файл, чтобы можно было понять причину.
+    if (!manual && (s.loggedIn || s.kicked)) {
+      this._saveJournal(s, s.kickText ? `кик: ${s.kickText}` : `соединение прервано: ${describeEnd(reason)}`);
     }
 
     if (!manual && this.config.autoReconnect && s.noRetry) {
