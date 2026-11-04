@@ -11,6 +11,10 @@
 //                                                  (часть пути бегом), копает и ставит блоки (площадку готовит сам)
 //         npm run stand:check -- --electron      — бот заходит через настоящий Electron (как в панели: главный
 //                                                  процесс + процесс бота); --electron=<путь к exe> — через сборку
+//         npm run stand:check -- --clicks        — клики в меню: бот берёт из сундука предметы с названиями,
+//                                                  описаниями, зачарованиями… и кладёт обратно; сервер не должен
+//                                                  ничего поправлять (значит, «отпечатки» предметов как у игры);
+//                                                  --clicks --no-clicks — то же без исправления (для сравнения)
 // Перед первым запуском один раз открой test-server\start-test-server.bat: он скачает сервер и спросит про EULA.
 // Код выхода 0 — бот простоял всё время, его не кикнули, и ни Grim, ни сервер ничего не заметили.
 // Журнал пакетов каждой проверки: test-server\server\journals.
@@ -32,18 +36,20 @@ const BOT_NAME = 'StandBot';
 const HELPER_NAME = 'Helper'; // второй игрок в сценарии — для команд по нику
 
 const ARGS = process.argv.slice(2);
-const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--scenario', '--electron']);
+const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--no-clicks', '--scenario', '--clicks', '--electron']);
 const SCENARIO = ARGS.includes('--scenario');
+const CLICKS = ARGS.includes('--clicks');
 const ELECTRON_ARG = ARGS.find((a) => a === '--electron' || a.startsWith('--electron='));
 const ELECTRON = Boolean(ELECTRON_ARG);
 const ELECTRON_EXE = ELECTRON_ARG && ELECTRON_ARG.includes('=') ? ELECTRON_ARG.slice(ELECTRON_ARG.indexOf('=') + 1).replace(/^"|"$/g, '') : '';
 const ROOT = path.join(__dirname, '..');
-const STAY_MS = Math.max(5, parseInt(ARGS.find((a) => /^\d+$/.test(a)), 10) || (SCENARIO ? 10 : 60)) * 1000;
+const STAY_MS = Math.max(5, parseInt(ARGS.find((a) => /^\d+$/.test(a)), 10) || (SCENARIO || CLICKS ? 10 : 60)) * 1000;
 const LEGACY = ARGS.includes('--legacy');
 const COMPAT = {
   physics: !LEGACY && !ARGS.includes('--no-physics'),
   tickEnd: !LEGACY && !ARGS.includes('--no-tick-end'),
   profile: !LEGACY && !ARGS.includes('--no-profile'),
+  clicks: !LEGACY && !ARGS.includes('--no-clicks'),
 };
 const SERVER_START_TIMEOUT = 6 * 60 * 1000; // первый запуск скачивает файлы Mojang и создаёт мир
 const BOT_ONLINE_TIMEOUT = 60 * 1000;
@@ -282,6 +288,115 @@ async function runScenario(manager, cmd) {
   }
 }
 
+// Предметы для проверки кликов: как в меню NPC на MineBlaze (название с цветом, описание из нескольких строк)
+// и другие частые компоненты. [что проверяем, предмет для команды /item].
+const CLICK_ITEMS = [
+  ['простое название', 'minecraft:gold_ingot[custom_name="Аванс на семена."]'],
+  [
+    'название и описание с цветами',
+    'minecraft:wheat[custom_name={text:"Грядки без истерики.",color:"yellow",italic:false},' +
+      'lore=[{text:"После последней непогоды огород",color:"gray",italic:false},' +
+      '{text:"",italic:false,extra:[{text:"Передайте пшеницу: ",color:"white"},"0/224"]},' +
+      '{text:"Нажмите, чтобы взять задание",color:"green",bold:true,italic:false}]]',
+  ],
+  ['цвет #RRGGBB, жирный, тень', 'minecraft:experience_bottle[custom_name={text:"Улучшения",color:"#FFAA00",bold:true,italic:false,shadow_color:-16777216}]'],
+  ['зачарования и износ', 'minecraft:diamond_sword[enchantments={sharpness:5,unbreaking:3},damage=10,repair_cost=4]'],
+  ['данные плагина', 'minecraft:paper[custom_data={quest:"farmer_1",level:2b,nums:[I;1,2,3],list:[1,2,3],PublicBukkitValues:{"plugin:key":"v"}}]'],
+  ['блеск, редкость, размер стака', 'minecraft:stick[enchantment_glint_override=true,rarity="epic",max_stack_size=16]'],
+  [
+    'скрытые подсказки, своя модель',
+    'minecraft:clock[tooltip_display={hidden_components:["minecraft:enchantments"]},' +
+      'custom_model_data={floats:[1.5f],flags:[true],strings:["a"],colors:[16711680]}]',
+  ],
+  ['стекло без подсказки', 'minecraft:gray_stained_glass_pane[tooltip_display={hide_tooltip:true}]'],
+  ['краска и неразрушимость', 'minecraft:leather_chestplate[dyed_color=16711680,unbreakable={}]'],
+  ['другая модель предмета', 'minecraft:apple[item_model="minecraft:golden_apple"]'],
+  ['стак без компонентов', 'minecraft:dirt 5'],
+];
+
+/**
+ * Проверка кликов в меню (--clicks). Бот открывает сундук с предметами из CLICK_ITEMS и каждый берёт в курсор,
+ * а потом кладёт обратно (стак земли — ещё и правой кнопкой, половину). В пакете клика бот сообщает серверу
+ * «отпечатки» предметов; если они посчитаны как в игре, серверу нечего поправлять, и он молчит. Поправка
+ * (set_slot, set_cursor_item, window_items) — отпечаток не совпал. Возвращает число неудачных проверок.
+ */
+async function runClickCheck(manager, cmd) {
+  if (!cmd) throw new Error('для проверки кликов сервер должна запускать сама проверка: закрой окно тестового сервера и запусти снова');
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  await wait(3000);
+  const bot = manager.getBot();
+  if (!bot || !bot.actions) throw new Error('у бота нет безопасных действий (они работают только со своей физикой)');
+  const o = bot.entity.position.floored();
+  const chest = o.offset(2, 0, -2);
+  const at = `${chest.x} ${chest.y} ${chest.z}`;
+  for (const c of [
+    'difficulty peaceful',
+    'time set day',
+    `fill ${o.x - 3} ${o.y - 1} ${o.z - 3} ${o.x + 3} ${o.y - 1} ${o.z + 3} minecraft:stone`,
+    `fill ${o.x - 3} ${o.y} ${o.z - 3} ${o.x + 3} ${o.y + 3} ${o.z + 3} minecraft:air`,
+    `setblock ${at} minecraft:chest`,
+    ...CLICK_ITEMS.map(([, item], i) => `item replace block ${at} container.${i} with ${item}`),
+    `clear ${BOT_NAME}`,
+    `give ${BOT_NAME} minecraft:iron_pickaxe[damage=5,enchantments={efficiency:2},custom_name="Кирка"]`,
+  ]) cmd(c);
+  await wait(2500);
+
+  const opened = new Promise((resolve) => bot.once('windowOpen', resolve));
+  await bot.actions.activate(chest);
+  const window = await Promise.race([opened, wait(5000).then(() => null)]);
+  if (!window) throw new Error('сундук не открылся');
+  await wait(1000); // содержимое сундука пришло, дальше сервер молчит
+
+  const answers = [];
+  const onPacket = (data, meta) => {
+    if (['set_slot', 'set_cursor_item', 'window_items'].includes(meta.name)) {
+      answers.push(`${meta.name}${data && data.slot !== undefined ? ` [${data.slot}]` : ''}`);
+    }
+  };
+  bot._client.on('packet', onPacket);
+  const unknown = [];
+  const onUnknown = (type) => unknown.push(type);
+  bot.on('clickHashUnknown', onUnknown);
+
+  let failed = 0;
+  const check = async (slot, label, button = 0) => {
+    const item = window.slots[slot];
+    if (!item) {
+      console.log(`  [клики] [${slot}] ${label}: предмета нет — НЕ ПРОВЕРЕНО`);
+      failed += 1;
+      return;
+    }
+    answers.length = 0;
+    await bot.actions.clickSlot(slot, { button }); // взять в курсор (правой — половину)
+    const took = answers.splice(0);
+    await bot.actions.clickSlot(slot); // положить обратно
+    await wait(300);
+    const put = answers.splice(0);
+    const ok = !took.length && !put.length && window.slots[slot] && window.slots[slot].count === item.count && !window.selectedItem;
+    if (!ok) failed += 1;
+    const what = ok
+      ? 'сервер согласен'
+      : `ПОПРАВИЛ: взять — ${took.join(', ') || 'нет'}; положить — ${put.join(', ') || 'нет'}; ` +
+        `компоненты: ${JSON.stringify(item.components || []).slice(0, 400)}`;
+    console.log(`  [клики] [${slot}] ${label} (${item.name}${button ? ', правой' : ''}): ${what}`);
+  };
+
+  try {
+    for (let i = 0; i < CLICK_ITEMS.length; i += 1) await check(i, CLICK_ITEMS[i][0]);
+    const dirt = CLICK_ITEMS.findIndex(([, item]) => item.startsWith('minecraft:dirt'));
+    await check(dirt, 'половина стака', 1);
+    const pick = window.slots.findIndex((it, i) => i >= window.inventoryStart && it && it.name === 'iron_pickaxe');
+    if (pick >= 0) await check(pick, 'своя кирка в инвентаре (название, износ, зачарование)');
+    else console.log('  [клики] кирки в инвентаре нет — её не проверил');
+  } finally {
+    bot._client.removeListener('packet', onPacket);
+    bot.removeListener('clickHashUnknown', onUnknown);
+    await bot.actions.closeMenu().catch(() => {});
+  }
+  if (unknown.length) console.log(`  [клики] не умею считать отпечатки: ${[...new Set(unknown)].join(', ')}`);
+  return failed;
+}
+
 /** Бот заходит через настоящий Electron: самопроверка панели с сервером (см. MBP_SELFTEST_* в src/main.js). */
 function runElectron(host, port, version) {
   return new Promise((resolve) => {
@@ -382,14 +497,16 @@ function runBot(host, port, version, cmd) {
         onlineAt = Date.now();
         onlineAtJournal = performance.timeOrigin + performance.now();
         clearTimeout(onlineTimer);
-        if (SCENARIO) {
-          console.log('Бот в мире: готовлю площадку и действую…');
-          runScenario(manager, cmd).then(
+        if (SCENARIO || CLICKS) {
+          console.log(SCENARIO ? 'Бот в мире: готовлю площадку и действую…' : 'Бот в мире: проверяю клики в меню…');
+          const what = SCENARIO ? 'сценарий' : 'клики';
+          (SCENARIO ? runScenario : runClickCheck)(manager, cmd).then(
             (failed) => {
-              console.log(`Сценарий закончен, бот стоит ещё ${STAY_MS / 1000} с…`);
-              stayTimer = setTimeout(() => finish(failed ? `сценарий: не выполнено команд — ${failed}` : null), STAY_MS);
+              console.log(`${SCENARIO ? 'Сценарий закончен' : 'Клики проверены'}, бот стоит ещё ${STAY_MS / 1000} с…`);
+              const why = SCENARIO ? `не выполнено команд — ${failed}` : `неудачных проверок — ${failed}`;
+              stayTimer = setTimeout(() => finish(failed ? `${what}: ${why}` : null), STAY_MS);
             },
-            (err) => finish(`сценарий: ${err.message}`),
+            (err) => finish(`${what}: ${err.message}`),
           );
         } else {
           console.log(`Бот в мире, стоит ${STAY_MS / 1000} с…`);
@@ -405,8 +522,12 @@ function runBot(host, port, version, cmd) {
 
 async function main() {
   const unknown = ARGS.filter((a) => a.startsWith('-') && !KNOWN_FLAGS.has(a) && !a.startsWith('--electron='));
-  if (ELECTRON && (SCENARIO || ARGS.some((a) => /^--(legacy|no-)/.test(a)))) {
-    console.error('--electron проверяет бота таким, какой он в панели: без --scenario, --legacy и --no-…');
+  if (ELECTRON && (SCENARIO || CLICKS || ARGS.some((a) => /^--(legacy|no-)/.test(a)))) {
+    console.error('--electron проверяет бота таким, какой он в панели: без --scenario, --clicks, --legacy и --no-…');
+    return 2;
+  }
+  if (SCENARIO && CLICKS) {
+    console.error('--scenario и --clicks — разные проверки: запусти их по очереди');
     return 2;
   }
   if (unknown.length) {
@@ -450,7 +571,7 @@ async function main() {
 
     console.log('');
     console.log('===== Итог =====');
-    const stayed = `${Math.round(result.onlineMs / 1000)} с${SCENARIO ? ' (сценарий и пауза после него)' : ` из ${STAY_MS / 1000}`}`;
+    const stayed = `${Math.round(result.onlineMs / 1000)} с${SCENARIO || CLICKS ? ' (проверка и пауза после неё)' : ` из ${STAY_MS / 1000}`}`;
     console.log(`Бот в мире: ${result.online ? stayed : 'не появился'}`);
     if (result.kick) console.log(`Кик: ${result.kick}`);
     if (result.problem) console.log(`Проблема: ${result.problem}`);

@@ -820,17 +820,64 @@ test('опции бота: своя физика, настройки и брен
   assert.equal(typeof o.plugins.physics, 'function', 'своя физика вместо встроенной');
   assert.equal(typeof o.plugins.actions, 'function', 'безопасные действия');
   assert.equal(typeof o.plugins.settings, 'function', 'настройки не отправляются после каждого входа в мир');
+  assert.equal(typeof o.plugins.windowClicks, 'function', 'клики в меню с настоящими отпечатками предметов');
   assert.equal(o.brand, 'vanilla');
   assert.equal(o.clientSettings.locale, 'ru_ru');
   mgr.shutdown();
 
-  const legacy = setup({}, {}, { compat: { physics: false, tickEnd: false, profile: false } });
+  const legacy = setup({}, {}, { compat: { physics: false, tickEnd: false, profile: false, clicks: false } });
   legacy.mgr.start();
   const lo = legacy.bots[0].opts;
   assert.equal(lo.plugins, undefined);
   assert.equal(lo.brand, undefined);
   assert.equal(lo.clientSettings, undefined);
   legacy.mgr.shutdown();
+});
+
+test('сторож тишины: отличает «сервер молчит» от «бот не разбирает пришедшее»', (t) => {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: 1000000 });
+  const bots = [];
+  const mgr = new BotManager({
+    config: { host: 'h', port: 1, username: 'Bot', version: '1.21.11', auth: 'offline', autoReconnect: false },
+    authCacheDir: '/tmp/auth',
+    createBot: (opts) => {
+      const b = new FakeBot(opts);
+      const client = new EventEmitter();
+      client.socket = { bytesRead: 0, destroy: () => {} };
+      b._client = client;
+      bots.push(b);
+      return b;
+    },
+  });
+  const logs = [];
+  mgr.on('log', (e) => logs.push(e));
+  mgr.start();
+  const bot = bots[0];
+  const client = bot._client;
+  goOnline(bot);
+  const packet = () => client.emit('packet', {}, { name: 'keep_alive', state: 'play' });
+  const seconds = (n) => {
+    for (let i = 0; i < n; i += 1) t.mock.timers.tick(1000); // по секунде: так часы и сторож идут вместе
+  };
+
+  packet();
+  seconds(3);
+  assert.ok(!lines(logs).some((l) => l.includes('ничего не приходит')), '3 с — ещё не тишина');
+  seconds(1);
+  assert.ok(lines(logs).includes('warn:От сервера 4 с ничего не приходит'));
+
+  client.socket.bytesRead += 5000; // байты есть, а пакетов нет
+  seconds(1);
+  assert.ok(lines(logs).some((l) => l.startsWith('error:Данные от сервера приходят, но бот перестал их разбирать')));
+
+  packet();
+  assert.ok(lines(logs).includes('info:Сервер снова на связи (молчал 5.0 с)'));
+
+  // Снова тишина, но на этот раз сервер правда ничего не шлёт — и соединение закрывается.
+  seconds(6);
+  bot.emit('end', 'socketClosed');
+  assert.ok(lines(logs).includes('warn:Перед обрывом сервер ничего не присылал (молчал сам)'));
+  assert.equal(mgr.state, 'offline');
 });
 
 test('возврат в лобби: причина из сообщения прокси', () => {

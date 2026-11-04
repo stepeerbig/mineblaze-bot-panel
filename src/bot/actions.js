@@ -23,6 +23,13 @@ const LOOK_TIMEOUT_TICKS = 60;
 const STUCK_TICKS = 60; // столько тиков без продвижения — бот застрял
 const ATTACK_COOLDOWN_TICKS = 12; // пауза между ударами (меч восстанавливается за 12,5 тика)
 const CHAT_INTERVAL_MS = 1500;
+// Клики в меню: первый — через 0,5–0,9 с после открытия, следующие — через 0,25–0,55 с; ответ сервера ждём до 0,5 с.
+const FIRST_CLICK_TICKS = 10;
+const FIRST_CLICK_JITTER = 8;
+const NEXT_CLICK_TICKS = 5;
+const NEXT_CLICK_JITTER = 6;
+const CLICK_REPLY_TICKS = 10;
+const WINDOW_PACKETS = ['set_slot', 'set_cursor_item', 'window_items', 'open_window', 'close_window', 'set_player_inventory'];
 const FULL_BLOCK = [[0, 0, 0, 1, 1, 1]];
 
 // Грани в номерах протокола: 0 низ, 1 верх, 2 север (-z), 3 юг (+z), 4 запад (-x), 5 восток (+x).
@@ -679,15 +686,25 @@ function inject(bot, { random, now }) {
     });
   }
 
-  // Когда открылось меню: первый клик — не раньше, чем человек успел бы его рассмотреть.
+  // Когда открылось меню: первый клик — не раньше, чем человек успел бы его рассмотреть и довести мышь.
   let windowOpenedTick = -Infinity;
   let lastClickTick = -Infinity;
+  let lastWindowPacketTick = -Infinity; // последний ответ сервера про меню, ячейки или курсор
   bot.on('windowOpen', () => {
     windowOpenedTick = ticks();
   });
+  if (bot._client && typeof bot._client.on === 'function') {
+    for (const name of WINDOW_PACKETS) {
+      bot._client.on(name, () => {
+        lastWindowPacketTick = ticks();
+      });
+    }
+  }
 
   /**
-   * Клик по ячейке открытого меню (сундук, меню NPC): с паузой после открытия и между кликами, стоя на месте.
+   * Клик по ячейке открытого меню (сундук, меню NPC): стоя на месте, с паузой после открытия и между кликами,
+   * как у человека. После клика ждёт ответа сервера (он поправляет ячейки и курсор), чтобы следующий клик
+   * исходил из того, что на самом деле лежит в меню.
    * @param {number} slot    номер ячейки (как в #окно)
    * @param {object} [opts]  button: 0 — левая, 1 — правая
    */
@@ -697,15 +714,20 @@ function inject(bot, { random, now }) {
       if (!window) throw new ActionError('меню не открыто');
       if (!Number.isInteger(slot) || slot < 0 || slot >= window.slots.length) throw new ActionError(`в меню нет ячейки ${slot}`);
       await standStill(signal);
-      const minGap = Math.max(windowOpenedTick + 6, lastClickTick + 4) + Math.floor(random() * 5);
-      while (ticks() < minGap) await inTick(() => {}, signal);
+      const afterOpen = windowOpenedTick + FIRST_CLICK_TICKS + Math.floor(random() * (FIRST_CLICK_JITTER + 1));
+      const afterClick = lastClickTick + NEXT_CLICK_TICKS + Math.floor(random() * (NEXT_CLICK_JITTER + 1));
+      const notBefore = Math.max(afterOpen, afterClick);
+      while (ticks() < notBefore) await inTick(() => {}, signal);
       if (bot.currentWindow !== window) throw new ActionError('меню закрылось');
+      const sentTick = ticks();
       try {
         await bot.clickWindow(slot, button, 0);
       } catch (err) {
         throw new ActionError(`клик не удался: ${err && err.message ? err.message : err}`);
       }
       lastClickTick = ticks();
+      // Ответ сервера (если прогноз клика совпал с сервером, он молчит — тогда просто пауза).
+      while (ticks() - sentTick < CLICK_REPLY_TICKS && lastWindowPacketTick < sentTick) await inTick(() => {}, signal);
       await waitTicks(2, signal);
       return { slot };
     }, { keepWindow: true });

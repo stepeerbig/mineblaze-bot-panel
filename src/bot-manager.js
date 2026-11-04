@@ -7,15 +7,38 @@ const { PacketJournal, saveJournal } = require('./bot/packet-journal');
 const { createPhysicsPlugin } = require('./bot/physics');
 const { profileOptions, settingsPlugin, applyClientProfile } = require('./bot/client-profile');
 const { createActionsPlugin } = require('./bot/actions');
+const { windowClicksPlugin } = require('./bot/window-clicks');
 const { runCommand } = require('./bot/commands');
 
 // Что бот делает как обычный клиент, а не как mineflayer (см. src/bot/). Выключать нужно только для сравнения
 // на тестовом стенде: physics — своя физика (ровные тики, движение по правилам клиента), tickEnd — пакет
-// tick_end в конце каждого тика, profile — бренд и настройки клиента один раз при входе.
-const DEFAULT_COMPAT = Object.freeze({ physics: true, tickEnd: true, profile: true });
+// tick_end в конце каждого тика, profile — бренд и настройки клиента один раз при входе, clicks — клики
+// в меню с настоящими «отпечатками» предметов и курсор, который поправляет сервер.
+const DEFAULT_COMPAT = Object.freeze({ physics: true, tickEnd: true, profile: true, clicks: true });
 const FORCED_MOVE_REPEAT_MS = 10 * 1000; // одно и то же сообщение о возврате в лобби может прийти несколько раз
+// Сервер шлёт что-нибудь (ping, keep_alive…) по многу раз в секунду: столько тишины — уже странно.
+const SILENCE_MS = 4000;
+const SILENCE_STUCK_BYTES = 256; // столько пришло за тишину, а пакетов нет — бот перестал разбирать данные
 
 const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
+
+/** Сколько байтов пришло по сокету клиента (null — не узнать). */
+function socketBytes(client) {
+  const sock = client && client.socket;
+  return sock && Number.isFinite(sock.bytesRead) ? sock.bytesRead : null;
+}
+
+/** Где застряли данные от сервера (для журнала пакетов): байты сокета и очереди разбора minecraft-protocol. */
+function pipelineInfo(client) {
+  const len = (stream) => {
+    if (!stream) return '—';
+    const queued = Number.isFinite(stream.writableLength) ? stream.writableLength : '?';
+    return `${queued}${stream.destroyed ? ' (сломан)' : ''}`;
+  };
+  const split = client && client.splitter && client.splitter.buffer ? client.splitter.buffer.length : '?';
+  return `получено байт ${socketBytes(client) === null ? '?' : socketBytes(client)}, ждут нарезки ${split} Б, ` +
+    `очередь распаковки ${len(client && client.decompressor)}, очередь разбора ${len(client && client.deserializer)}`;
+}
 
 // Таймеры менеджера не должны держать процесс живым (важно для тестов; в Electron ничего не меняет).
 function later(fn, ms) {
@@ -270,6 +293,47 @@ class BotManager extends EventEmitter {
     clearTimeout(s.errorTimer);
     clearTimeout(s.loginTimer);
     clearTimeout(s.joinTimer);
+    clearInterval(s.silenceTimer);
+  }
+
+  /**
+   * Сторож тишины. Если от сервера несколько секунд не приходит ни одного пакета, это или сервер перестал
+   * отвечать, или бот перестал разбирать то, что приходит. Различаем по счётчику байтов сокета и пишем
+   * в консоль и в журнал пакетов — чтобы по следующему обрыву было видно, чья это проблема.
+   */
+  _watchSilence(s) {
+    const client = s.bot && s.bot._client;
+    if (!client || typeof client.on !== 'function') return;
+    s.lastInAt = Date.now();
+    client.on('packet', () => {
+      const now = Date.now();
+      if (s.silence && this.cur === s) {
+        const sec = ((now - s.silence.since) / 1000).toFixed(1);
+        this.log('info', `Сервер снова на связи (молчал ${sec} с)`);
+        if (s.journal) s.journal.mark(`Сервер снова на связи после ${sec} с тишины`);
+      }
+      s.silence = null;
+      s.lastInAt = now;
+    });
+    s.silenceTimer = setInterval(() => {
+      if (this.cur !== s || !s.loggedIn || s.stopping) return;
+      const quiet = Date.now() - s.lastInAt;
+      if (quiet < SILENCE_MS) return;
+      const bytes = socketBytes(client);
+      if (!s.silence) {
+        s.silence = { since: s.lastInAt, bytes, stuck: false };
+        this.log('warn', `От сервера ${Math.round(quiet / 1000)} с ничего не приходит`);
+        if (s.journal) s.journal.mark(`Тишина от сервера ${quiet} мс; ${pipelineInfo(client)}`);
+        return;
+      }
+      if (!s.silence.stuck && bytes !== null && s.silence.bytes !== null && bytes - s.silence.bytes > SILENCE_STUCK_BYTES) {
+        s.silence.stuck = true;
+        this.log('error', 'Данные от сервера приходят, но бот перестал их разбирать — это ошибка бота (журнал пакетов сохранён)');
+        if (s.journal) s.journal.mark(`Данные приходят, но не разбираются: ${pipelineInfo(client)}`);
+        this._saveJournal(s, 'бот перестал разбирать данные от сервера');
+      }
+    }, 1000);
+    if (s.silenceTimer && typeof s.silenceTimer.unref === 'function') s.silenceTimer.unref();
   }
 
   _connect() {
@@ -347,6 +411,7 @@ class BotManager extends EventEmitter {
     s.journal = new PacketJournal({ getSelfId: () => (bot.entity ? bot.entity.id : null) });
     s.journal.attach(bot._client);
     if (this.compat.profile) applyClientProfile(bot._client);
+    this._watchSilence(s);
     s.loginTimer = later(
       () => this._loginTimeout(s, `вход не завершился за ${Math.round(this.timings.loginTimeout / 1000)} с`),
       this.timings.loginTimeout,
@@ -490,6 +555,11 @@ class BotManager extends EventEmitter {
       this.log('kick', `Кик${loggedIn === false ? ' при входе' : ''}: ${text}`);
     });
 
+    bot.on('clickHashUnknown', (type) => {
+      if (!alive()) return;
+      this.log('warn', `Клик в меню: не умею считать «отпечаток» компонента ${type} у предмета — сервер увидит неточный клик`);
+    });
+
     bot.on('error', (err) => {
       if (!alive()) return;
       s.reported = true;
@@ -532,6 +602,7 @@ class BotManager extends EventEmitter {
       plugins.settings = settingsPlugin;
       Object.assign(out, profileOptions());
     }
+    if (c.clicks) plugins.windowClicks = windowClicksPlugin;
     if (Object.keys(plugins).length) out.plugins = plugins;
     return out;
   }
@@ -644,6 +715,21 @@ class BotManager extends EventEmitter {
       this.log('warn', `Не в сети: ${describeEnd(reason)}`);
     } else {
       this.log('warn', 'Не в сети');
+    }
+
+    // Обрыв после тишины: сколько байтов пришло, пока пакетов не было (0 — молчал сервер, больше — бот не разобрал).
+    if (s.silence && s.journal) {
+      const bytes = socketBytes(s.bot && s.bot._client);
+      const during = bytes !== null && s.silence.bytes !== null ? bytes - s.silence.bytes : '?';
+      s.journal.mark(
+        `Соединение закрыто после ${((Date.now() - s.silence.since) / 1000).toFixed(1)} с тишины; ` +
+          `за тишину пришло байт: ${during}; ${pipelineInfo(s.bot && s.bot._client)}`,
+      );
+      if (!manual && s.loggedIn && !s.kicked) {
+        this.log('warn', during === 0
+          ? 'Перед обрывом сервер ничего не присылал (молчал сам)'
+          : `Перед обрывом данные от сервера приходили (${during} байт), но бот их не разобрал`);
+      }
     }
 
     // Неожиданный разрыв после входа (кик, обрыв) — журнал в файл, чтобы можно было понять причину.
