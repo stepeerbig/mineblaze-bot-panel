@@ -447,6 +447,7 @@ function runBot(host, port, version, cmd) {
       autoReconnect: false,
       loginPassword: '',
       joinCommands: '',
+      godMode: false, // на стенде нет /god (это плагин сервера MineBlaze)
     };
     const manager = new BotManager({
       config,

@@ -86,12 +86,28 @@
       <details id="autologin" class="group fold">
         <summary class="group-title">Автовход и команды <span id="autologinTag" class="tag" hidden>настроено</span></summary>
         <label class="field">Пароль для /login
-          <input id="loginPassword" type="password" autocomplete="off" spellcheck="false" placeholder="не отправлять">
+          <span class="secret">
+            <input id="loginPassword" type="password" autocomplete="off" spellcheck="false" placeholder="не отправлять">
+            <button id="showPassword" class="eye" type="button" aria-pressed="false" aria-label="Показать пароль" title="Показать пароль">
+              <svg viewBox="0 0 12 12" aria-hidden="true"><path fill-rule="evenodd" d="M6 2.5C3.2 2.5 1.1 4.4.3 6c.8 1.6 2.9 3.5 5.7 3.5s4.9-1.9 5.7-3.5C10.9 4.4 8.8 2.5 6 2.5zm0 1.2a2.3 2.3 0 1 1 0 4.6 2.3 2.3 0 0 1 0-4.6zm0 1.1a1.2 1.2 0 1 0 0 2.4 1.2 1.2 0 0 0 0-2.4z"/></svg>
+            </button>
+          </span>
         </label>
         <label class="field">Команды после входа
           <textarea id="joinCommands" rows="3" spellcheck="false" placeholder="/server survival"></textarea>
         </label>
         <p class="hint">Отправляются один раз после появления в мире, по одной строке с паузой. Пароль хранится зашифрованным и в чате показывается точками.</p>
+      </details>
+
+      <details id="guardGroup" class="group fold">
+        <summary class="group-title">Охрана и режим бога <span id="guardTag" class="tag" hidden></span></summary>
+        <label class="check"><input id="guardOn" type="checkbox"><span>Охрана вне спавна</span></label>
+        <p class="hint">После <b>/home</b> или <b>/rtp</b> бот раз в 5 секунд пишет <b>/near</b> и смотрит сам. Чужой ник рядом — сразу <b>/spawn</b>. На спавне и после <b>/warp ah</b> охрана молчит.</p>
+        <label class="check"><input id="godOn" type="checkbox"><span>Режим бога: <b>/god</b> после перехода на сервер</span></label>
+        <label class="field">Белый список — ники, по одному в строке
+          <textarea id="whitelist" rows="4" spellcheck="false" placeholder="BARABYLKAyt"></textarea>
+        </label>
+        <p class="hint">Действует сразу, перезапускать бота не нужно. Можно писать и ник, и имя, которое показывает /near.</p>
       </details>
     </aside>
 

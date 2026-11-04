@@ -61,6 +61,36 @@ test('команды: один список — имена по-русски и 
   for (const en of ['help', 'pos', 'look', 'goto', 'dig', 'place', 'use', 'open', 'equip', 'inv', 'near', 'stop']) assert.ok(seen.has(en), `есть английское ${en}`);
 });
 
+test('команды: #охрана — что с охраной, вкл сразу, выкл; выключена в настройках — честно скажет', async () => {
+  const { Guard } = require(path.join(__dirname, '..', 'src', 'bot', 'guard.js'));
+  const { bot, run } = setup();
+  const sent = [];
+  const config = { guard: true, whitelist: 'Friend\nДруг' };
+  bot.guard = new Guard({ getBot: () => bot, send: (cmd) => sent.push(cmd), log: () => {}, config });
+
+  let r = await run('#охрана');
+  assert.equal(r.ok, true);
+  assert.equal(r.message, 'Охрана ждёт: включится после /home или /rtp; белый список: 2 ника');
+  assert.deepEqual(r.data, { armed: false, active: false, pvp: false });
+
+  r = await run('#охрана вкл');
+  assert.equal(r.ok, true);
+  assert.match(r.message, /^Охрана следит: \/near раз в 5 с/);
+  assert.equal(bot.guard.active, true);
+
+  r = await run('#guard выкл');
+  assert.equal(r.message, 'Охрана выключена до следующего /home или /rtp');
+  assert.equal(bot.guard.active, false);
+
+  config.guard = false;
+  r = await run('#охрана вкл');
+  assert.equal(r.ok, false);
+  assert.match(r.message, /выключена в настройках/);
+  r = await run('#охрана туда');
+  assert.equal(r.code, 'bad_args');
+  bot.guard.stop();
+});
+
 test('команды: координаты как в игре — числа и «~» от бота', () => {
   assert.equal(parseCoord('10', 0), 10);
   assert.equal(parseCoord('-3,5', 0), -3.5);
@@ -246,6 +276,25 @@ test('команды: NPC — #сущности, #нажми по имени (и
   assert.equal((await run('#иди к Оружейник')).message, 'Подошёл к Оружейник');
   assert.equal((await run('#нажми Оружейник')).message, 'Нажал на Оружейник (меню не открылось)');
   assert.match((await run('#нажми Кузнец')).message, /рядом нет «Кузнец» — посмотри, кто есть: #сущности/);
+});
+
+test('команды: #сущности — NPC-«игрок» со служебным ником называется по надписи над головой', async () => {
+  const stand = (id, y, name) => ({
+    id, type: 'object', name: 'armor_stand', position: new Vec3(4.5, y, 2.5),
+    getCustomName: () => ({ json: { text: name }, toString: () => name }),
+  });
+  const { run } = setup({
+    entities: [
+      { id: 301, type: 'player', username: '#1479d9c455b1f85', position: new Vec3(4.5, 64, 2.5), height: 1.8 },
+      stand(302, 66.3, 'Квест NPC'),
+      stand(303, 66.6, 'Фермер'),
+      stand(304, 66.0, 'Нажмите, чтобы открыть'),
+    ],
+  });
+  const list = await run('#сущности');
+  const npc = list.data.entities.find((e) => e.id === 301);
+  assert.deepEqual([npc.type, npc.name], ['npc', 'Фермер']);
+  assert.ok([].concat(list.message).includes('@301 NPC «Фермер» — 4.5 бл.'), [].concat(list.message).join('\n'));
 });
 
 test('команды: неизвестная — подсказка; #помощь работает и без мира; #стоп', async () => {

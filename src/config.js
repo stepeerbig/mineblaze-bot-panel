@@ -11,7 +11,12 @@ const DEFAULT_CONFIG = Object.freeze({
   loginPassword: '', // если задан — после входа бот сам отправит /login <пароль>
   joinCommands: '', // команды после входа, по одной на строку (например, /server survival)
   viewerMode: 'first', // «Экран бота»: 'first' — глазами бота, 'third' — со стороны
+  guard: true, // охрана: после /home или /rtp — /near раз в 5 с, чужой рядом → /spawn
+  godMode: true, // режим бога: /god после перехода на сервер режима
+  whitelist: '', // белый список охраны: ники, по одному в строке
 });
+
+const MAX_WHITELIST_LENGTH = 5000;
 
 const VIEWER_MODES = ['first', 'third'];
 
@@ -52,6 +57,9 @@ function sanitize(src) {
     out.joinCommands = src.joinCommands.replace(/\r\n?/g, '\n').slice(0, 2000);
   }
   if (VIEWER_MODES.includes(src.viewerMode)) out.viewerMode = src.viewerMode;
+  if (typeof src.guard === 'boolean') out.guard = src.guard;
+  if (typeof src.godMode === 'boolean') out.godMode = src.godMode;
+  if (typeof src.whitelist === 'string') out.whitelist = src.whitelist.replace(/\r\n?/g, '\n').slice(0, MAX_WHITELIST_LENGTH);
   return out;
 }
 

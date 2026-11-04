@@ -164,12 +164,30 @@ function entityLabel(e) {
   return name;
 }
 
+// NPC на серверах — это «игроки» со служебным ником (#1479d9c455b1f85); их имя — в надписи над головой.
+const REAL_NICK = /^[A-Za-z0-9_]{3,16}$/;
+const GENERIC_SIGN = /^(?:квест\s*npc|npc|нпс|нажмите.*|кликни.*|пкм.*|click.*)$/i;
+
 function entitiesNear(bot, radius) {
   const me = bot.entity.position;
-  return Object.values(bot.entities || {})
+  const list = Object.values(bot.entities || {})
     .filter((e) => e && e !== bot.entity && e.position && e.position.distanceTo(me) <= radius)
     .map((e) => ({ entity: e, dist: e.position.distanceTo(me), label: entityLabel(e) }))
     .sort((a, b) => a.dist - b.dist);
+  for (const x of list) {
+    const e = x.entity;
+    if (e.type !== 'player' || REAL_NICK.test(e.username || '')) continue;
+    const p = e.position;
+    const sign = list.find((s) =>
+      s.label && DISPLAY_TYPES.has(s.entity.name) && !GENERIC_SIGN.test(s.label.trim()) &&
+      Math.hypot(s.entity.position.x - p.x, s.entity.position.z - p.z) < 1.2 &&
+      s.entity.position.y > p.y + 0.5 && s.entity.position.y < p.y + 4.5);
+    if (sign) {
+      x.label = sign.label;
+      x.npc = true;
+    }
+  }
+  return list;
 }
 
 /**
@@ -549,8 +567,16 @@ async function cmdEntities({ bot }) {
   if (!list.length) return { ok: true, message: 'Рядом (до 10 блоков) никого и ничего нет', data: { entities: [] } };
   return {
     ok: true,
-    message: ['Рядом (номер, вид, имя, расстояние):', ...list.map((x) => `@${x.entity.id} ${x.entity.name || x.entity.type}${x.label ? ` «${x.label}»` : ''} — ${round(x.dist)} бл.`)],
-    data: { entities: list.map((x) => ({ id: x.entity.id, type: x.entity.name || x.entity.type, name: x.label || null, distance: Math.round(x.dist * 10) / 10, position: plain(x.entity.position) })) },
+    message: ['Рядом (номер, вид, имя, расстояние):', ...list.map((x) => `@${x.entity.id} ${x.npc ? 'NPC' : x.entity.name || x.entity.type}${x.label ? ` «${x.label}»` : ''} — ${round(x.dist)} бл.`)],
+    data: {
+      entities: list.map((x) => ({
+        id: x.entity.id,
+        type: x.npc ? 'npc' : x.entity.name || x.entity.type,
+        name: x.label || null,
+        distance: Math.round(x.dist * 10) / 10,
+        position: plain(x.entity.position),
+      })),
+    },
   };
 }
 
@@ -653,6 +679,24 @@ async function cmdStop({ bot }) {
   return { ok: true, message: had ? 'Остановлено' : 'Бот ничего не делал', data: { stopped: had } };
 }
 
+/** #охрана — что с охраной; #охрана вкл — следить прямо сейчас (бот уже на месте); #охрана выкл. */
+async function cmdGuard({ bot, words }) {
+  if (!bot) return { ok: false, code: 'not_ready', message: 'Команда не выполнена: бот не в мире' };
+  const guard = bot.guard;
+  if (!guard) return { ok: false, code: 'unsupported', message: 'Охраны у этого бота нет' };
+  const w = words[0] || '';
+  if (['вкл', 'включи', 'on', 'да', 'следи'].includes(w)) {
+    if (!guard.activateNow('включена командой')) return { ok: false, code: 'disabled', message: 'Охрана выключена в настройках панели («Охрана и режим бога»)' };
+    return { ok: true, message: guard.status(), data: { armed: true } };
+  }
+  if (['выкл', 'выключи', 'off', 'нет'].includes(w)) {
+    guard.disarm('выключена командой');
+    return { ok: true, message: 'Охрана выключена до следующего /home или /rtp', data: { armed: false } };
+  }
+  if (w) return { ok: false, code: 'bad_args', message: 'Так: #охрана, #охрана вкл или #охрана выкл' };
+  return { ok: true, message: guard.status(), data: { armed: guard.armed, active: guard.active, pvp: guard.pvp } };
+}
+
 /**
  * Все команды. name — главное имя (по-русски), aliases — другие написания, usage — как писать (первая строка —
  * главная форма), about — что делает. observe — только смотрит, ничего не меняет.
@@ -708,6 +752,14 @@ const COMMANDS = [
   { name: 'инвентарь', aliases: ['inv', 'инв'], usage: ['#инвентарь'], about: 'что у бота в руке и в инвентаре', observe: true, run: cmdInventory },
   { name: 'рядом', aliases: ['near', 'кто'], usage: ['#рядом'], about: 'игроки и сундуки поблизости', observe: true, run: cmdNearby },
   { name: 'стоп', aliases: ['stop', 'хватит', 'стой'], usage: ['#стоп'], about: 'остановить действие', run: cmdStop },
+  {
+    name: 'охрана',
+    aliases: ['guard'],
+    usage: ['#охрана', '#охрана вкл', '#охрана выкл'],
+    about: 'охрана вне спавна: следит ли она, кто был рядом; вкл — следить сразу (бот уже на месте), выкл — перестать',
+    needsWorld: false,
+    run: cmdGuard,
+  },
 ];
 
 function findCommand(word) {

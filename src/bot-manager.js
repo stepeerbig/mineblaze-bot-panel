@@ -8,6 +8,7 @@ const { createPhysicsPlugin } = require('./bot/physics');
 const { profileOptions, settingsPlugin, applyClientProfile } = require('./bot/client-profile');
 const { createActionsPlugin } = require('./bot/actions');
 const { windowClicksPlugin } = require('./bot/window-clicks');
+const { Guard, GodKeeper, parseNear } = require('./bot/guard');
 const { runCommand } = require('./bot/commands');
 
 // Что бот делает как обычный клиент, а не как mineflayer (см. src/bot/). Выключать нужно только для сравнения
@@ -19,6 +20,9 @@ const FORCED_MOVE_REPEAT_MS = 10 * 1000; // одно и то же сообщен
 // Сервер шлёт что-нибудь (ping, keep_alive…) по многу раз в секунду: столько тишины — уже странно.
 const SILENCE_MS = 4000;
 const SILENCE_STUCK_BYTES = 256; // столько пришло за тишину, а пакетов нет — бот перестал разбирать данные
+// Режим бога: проверить через столько после команд входа и после перехода на другой сервер.
+const GOD_AFTER_JOIN_MS = 4000;
+const GOD_AFTER_SWITCH_MS = 3000;
 
 const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
 
@@ -69,6 +73,8 @@ const LINK_SKIP = new Set([
   'declare_commands', 'declare_recipes', 'advancements', 'statistics', 'player_info', 'player_remove',
   'add_resource_pack', 'remove_resource_pack', 'resource_pack_send', // адрес ресурспака — не для человека
   'server_links', // ссылки «сайт / дискорд» из меню паузы — не то, что ищем
+  // Таблица справа и команды (Tab): там адрес сайта сервера-рекламы («www.MineBlaze.net»), а не проверка.
+  'scoreboard_score', 'scoreboard_objective', 'scoreboard_display_objective', 'reset_score', 'teams',
   'keep_alive', 'ping', 'ping_response', 'position', 'player_rotation', 'sync_entity_position',
   'rel_entity_move', 'entity_move_look', 'entity_look', 'entity_head_rotation', 'entity_teleport', 'entity_velocity',
   'entity_status', 'entity_destroy', 'entity_effect', 'remove_entity_effect', 'entity_update_attributes',
@@ -294,6 +300,8 @@ class BotManager extends EventEmitter {
     clearTimeout(s.loginTimer);
     clearTimeout(s.joinTimer);
     clearInterval(s.silenceTimer);
+    if (s.guard) s.guard.stop();
+    if (s.god) s.god.stop();
   }
 
   /**
@@ -412,6 +420,24 @@ class BotManager extends EventEmitter {
     s.journal.attach(bot._client);
     if (this.compat.profile) applyClientProfile(bot._client);
     this._watchSilence(s);
+
+    // Охрана вне спавна и режим бога (src/bot/guard.js). Настройки берут живые: белый список меняется на ходу.
+    const guardCtx = {
+      send: (cmd, opts) => (alive() && s.loggedIn && !s.stopping ? this._send(s, cmd, opts) : false),
+      log: (level, text) => {
+        if (alive()) this.log(level, text);
+      },
+      config: this.config,
+    };
+    s.guard = new Guard({ ...guardCtx, getBot: () => (alive() && s.spawned && !s.stopping ? bot : null) });
+    s.god = new GodKeeper(guardCtx);
+    bot.guard = s.guard;
+    bot.on('forcedMove', () => {
+      if (alive()) s.guard.onTeleport();
+    });
+    bot.on('respawn', () => {
+      if (alive()) s.guard.onTeleport();
+    });
     s.loginTimer = later(
       () => this._loginTimeout(s, `вход не завершился за ${Math.round(this.timings.loginTimeout / 1000)} с`),
       this.timings.loginTimeout,
@@ -438,6 +464,7 @@ class BotManager extends EventEmitter {
       if (!alive() || !s.switching) return;
       s.switching = false;
       this.log('ok', 'Переход на другой сервер выполнен');
+      s.god.schedule(GOD_AFTER_SWITCH_MS); // на новом сервере режим бога — свой
     });
 
     // 'spawn' приходит при первом появлении, после возрождения и при смене мира.
@@ -448,7 +475,9 @@ class BotManager extends EventEmitter {
         this.attempt = 0;
         this._setState('online');
         this.log('ok', 'В сети: бот появился в мире');
-        this._scheduleJoinCommands(s);
+        const joinCount = this._scheduleJoinCommands(s);
+        // Режим бога — после команд входа (если они переведут на другой сервер, проверка перенесётся туда).
+        s.god.schedule(this.timings.joinFirst + joinCount * this.timings.joinStep + GOD_AFTER_JOIN_MS);
         this._announceBot();
       } else if (s.dead) {
         s.dead = false;
@@ -495,6 +524,7 @@ class BotManager extends EventEmitter {
         if (!alive() || !s.spawned || s.stopping) return;
         s.switching = true;
         this.log('info', 'Сервер переводит бота на другой сервер…');
+        s.guard.disarm('бот уходит на другой сервер');
       });
 
       // Название серверной программы (например, «Paper» или «Velocity»): помогает понять, кто кикает.
@@ -532,15 +562,22 @@ class BotManager extends EventEmitter {
         /* ignore */
       }
       if (!String(text).trim() && !String(motd).trim() && !links.length) return;
-      this.emit('chat', { time: Date.now(), text, motd: motd || text, position, links });
-      // В консоль — спрятанные ссылки и всё, что пришло до появления в мире (проверка при входе).
       const shown = String(text);
+      // Ответ на /near охраны приходит каждые 5 секунд: в чат панели — только когда он изменился.
+      const nearReply = position !== 'chat' && s.guard.active && parseNear(shown) !== null;
+      if (!nearReply || shown !== s.lastNearShown) {
+        if (nearReply) s.lastNearShown = shown;
+        this.emit('chat', { time: Date.now(), text, motd: motd || text, position, links });
+      }
+      // В консоль — спрятанные ссылки и всё, что пришло до появления в мире (проверка при входе).
       const important = s.spawned ? links.filter((url) => !shown.includes(url)) : links;
       this._reportLinks(s, important, 'сообщение в чате');
-      // Сообщение прокси о возврате в лобби (сообщения игроков не считаем).
+      // Сообщения сервера (не игроков): возврат в лобби, ответы для охраны и режима бога.
       if (position !== 'chat') {
         const forced = forcedMoveReason(shown);
         if (forced) this._onForcedMove(s, forced);
+        s.guard.onChat(shown);
+        s.god.onChat(shown);
       }
     });
 
@@ -646,26 +683,33 @@ class BotManager extends EventEmitter {
     this._forceClose(s, 'timeout');
   }
 
-  _send(s, msg) {
+  /** Отправить в чат сервера. quiet — не показывать команду в чате панели (частые команды охраны). */
+  _send(s, msg, { quiet = false } = {}) {
     try {
       s.bot.chat(msg);
     } catch (err) {
       this.log('error', `Не удалось отправить сообщение: ${describeError(err)}`);
       return false;
     }
-    // Ответ на команду сервер пришлёт сам, а саму команду покажем в чате (пароли скрыты).
     if (msg.startsWith('/')) {
-      const shown = `› ${maskSecrets(msg)}`;
-      this.emit('chat', { time: Date.now(), text: shown, motd: shown, position: 'self' });
+      // Ответ на команду сервер пришлёт сам, а саму команду покажем в чате (пароли скрыты).
+      if (!quiet) {
+        const shown = `› ${maskSecrets(msg)}`;
+        this.emit('chat', { time: Date.now(), text: shown, motd: shown, position: 'self' });
+      }
+      // /home, /rtp, /spawn, /warp ah включают и выключают охрану — откуда бы ни пришли.
+      if (s.guard) s.guard.onCommand(msg);
+      if (s.god) s.god.onCommand(msg);
     }
     return true;
   }
 
+  /** Автовход и команды после входа — по очереди с паузами. Возвращает, сколько их будет. */
   _scheduleJoinCommands(s) {
     const queue = [];
     if (this.config.loginPassword) queue.push({ cmd: `/login ${this.config.loginPassword}`, label: 'Автовход' });
     for (const cmd of parseJoinCommands(this.config.joinCommands)) queue.push({ cmd, label: 'Команда после входа' });
-    if (!queue.length) return;
+    if (!queue.length) return 0;
 
     let i = 0;
     const next = () => {
@@ -677,6 +721,7 @@ class BotManager extends EventEmitter {
       if (i < queue.length) s.joinTimer = later(next, this.timings.joinStep);
     };
     s.joinTimer = later(next, this.timings.joinFirst);
+    return queue.length;
   }
 
   _forceClose(s, reason) {

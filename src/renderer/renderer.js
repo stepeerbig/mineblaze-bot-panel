@@ -26,7 +26,12 @@ const el = {
   auth: $('auth'),
   autologinTag: $('autologinTag'),
   loginPassword: $('loginPassword'),
+  showPassword: $('showPassword'),
   joinCommands: $('joinCommands'),
+  guardTag: $('guardTag'),
+  guardOn: $('guardOn'),
+  godOn: $('godOn'),
+  whitelist: $('whitelist'),
   console: $('console'),
   chat: $('chat'),
   chatForm: $('chatForm'),
@@ -207,6 +212,18 @@ function updateAutologinTag() {
   el.autologinTag.hidden = !(el.loginPassword.value || el.joinCommands.value.trim());
 }
 
+/** Ники белого списка (как их читает бот: через перенос строки, запятую или пробел). */
+function whitelistCount() {
+  return new Set(el.whitelist.value.split(/[\s,;]+/).map((s) => s.trim().toLowerCase()).filter(Boolean)).size;
+}
+
+function updateGuardTag() {
+  const on = el.guardOn.checked;
+  el.guardTag.textContent = on ? 'вкл' : el.godOn.checked ? '/god' : '';
+  el.guardTag.title = on ? `Охрана включена, в белом списке: ${whitelistCount()}` : '';
+  el.guardTag.hidden = !on && !el.godOn.checked;
+}
+
 function fillForm(cfg) {
   el.host.value = cfg.host;
   el.port.value = cfg.port;
@@ -216,9 +233,14 @@ function fillForm(cfg) {
   el.delay.value = cfg.reconnectDelay;
   el.loginPassword.value = cfg.loginPassword || '';
   el.joinCommands.value = cfg.joinCommands || '';
+  el.guardOn.checked = cfg.guard !== false;
+  el.godOn.checked = cfg.godMode !== false;
+  // Белый список не трогаем, пока человек его правит (иначе прыгнет курсор).
+  if (document.activeElement !== el.whitelist) el.whitelist.value = cfg.whitelist || '';
   setAutoReconnectUi(cfg.autoReconnect);
   updateLabels();
   updateAutologinTag();
+  updateGuardTag();
 }
 
 function readForm() {
@@ -283,6 +305,39 @@ for (const field of [el.loginPassword, el.joinCommands]) {
     bridge.saveConfig({ loginPassword: el.loginPassword.value, joinCommands: el.joinCommands.value });
   });
 }
+
+// «Глазок»: показать пароль, чтобы видеть, что пишешь.
+el.showPassword.addEventListener('click', () => {
+  const show = el.loginPassword.type === 'password';
+  el.loginPassword.type = show ? 'text' : 'password';
+  el.showPassword.setAttribute('aria-pressed', String(show));
+  const label = show ? 'Скрыть пароль' : 'Показать пароль';
+  el.showPassword.title = label;
+  el.showPassword.setAttribute('aria-label', label);
+});
+
+el.guardOn.addEventListener('change', () => {
+  updateGuardTag();
+  bridge.saveConfig({ guard: el.guardOn.checked });
+});
+el.godOn.addEventListener('change', () => {
+  updateGuardTag();
+  bridge.saveConfig({ godMode: el.godOn.checked });
+});
+
+// Белый список уходит боту прямо во время набора (с небольшой паузой), перезапуск не нужен.
+let whitelistTimer = null;
+const saveWhitelist = () => {
+  clearTimeout(whitelistTimer);
+  whitelistTimer = null;
+  bridge.saveConfig({ whitelist: el.whitelist.value });
+};
+el.whitelist.addEventListener('input', () => {
+  updateGuardTag();
+  clearTimeout(whitelistTimer);
+  whitelistTimer = setTimeout(saveWhitelist, 400);
+});
+el.whitelist.addEventListener('change', saveWhitelist);
 
 el.chatForm.addEventListener('submit', async (event) => {
   event.preventDefault();

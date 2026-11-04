@@ -263,6 +263,7 @@ summary:focus-visible {
 
 .tag {
   padding: 1px 7px;
+  white-space: nowrap;
   border-radius: 10px;
   background: rgba(59, 212, 127, .14);
   color: var(--emerald);
@@ -277,6 +278,46 @@ summary:focus-visible {
   font-size: 12px;
   line-height: 1.4;
 }
+
+.hint b { color: var(--chalk); font-weight: 600; }
+
+/* Поле пароля с «глазком»: показать, что написано */
+.secret { position: relative; display: block; }
+.secret input { padding-right: 36px; }
+
+.eye {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  transform: translateY(-50%);
+  cursor: pointer;
+}
+
+.eye svg { width: 16px; height: 16px; fill: var(--dust); }
+.eye:hover svg { fill: var(--chalk); }
+.eye[aria-pressed="true"] svg { fill: var(--lapis); }
+
+/* Флажки (охрана, режим бога) */
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  line-height: 1.35;
+  color: var(--chalk);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.check input { flex: none; width: 15px; height: 15px; margin: 1px 0 0; accent-color: var(--emerald); cursor: pointer; }
+.check b { font-weight: 600; }
 
 /* ---------- консоль и чат ---------- */
 

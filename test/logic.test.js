@@ -880,6 +880,46 @@ test('сторож тишины: отличает «сервер молчит» 
   assert.equal(mgr.state, 'offline');
 });
 
+test('охрана и режим бога в менеджере: /god после входа; /home → тихий /near → чужой → /spawn', (t) => {
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout', 'Date'], now: 1000000 });
+  const { mgr, bots, logs, chats } = setup({ whitelist: 'Friend' });
+  mgr.start();
+  const bot = bots[0];
+  goOnline(bot);
+  const seconds = (n) => {
+    for (let i = 0; i < n; i += 1) t.mock.timers.tick(1000);
+  };
+  const msg = (text) => bot.emit('message', { toString: () => text, toMotd: () => text }, 'system');
+
+  // Команд входа нет: режим бога — через 1,5 + 4 с после появления в мире.
+  seconds(6);
+  assert.deepEqual(bot.sent, ['/god']);
+  msg('| Режим бога включен!');
+  assert.ok(lines(logs).includes('ok:Режим бога включён'));
+
+  assert.equal(mgr.say('/home home'), true);
+  bot.emit('forcedMove'); // сервер перенёс бота на дом
+  seconds(2);
+  assert.deepEqual(bot.sent.slice(-2), ['/home home', '/near']);
+  assert.equal(chats.filter((c) => c.text === '› /near').length, 0, '/near охраны в чат панели не пишется');
+  assert.equal(chats.filter((c) => c.text === '› /home home').length, 1, 'а свою команду человек видит');
+
+  msg('| Окружающие игроки: никого');
+  msg('| Окружающие игроки: никого');
+  assert.equal(chats.filter((c) => c.text === '| Окружающие игроки: никого').length, 1, 'одинаковые ответы /near — в чат один раз');
+  msg('| Окружающие игроки: [Ender] friend(8m)');
+  assert.equal(bot.sent.at(-1), '/near');
+
+  msg('| Окружающие игроки: [Игрок] Stranger(30m)');
+  assert.equal(bot.sent.at(-1), '/spawn');
+  assert.ok(lines(logs).includes('warn:Охрана: рядом чужой — Stranger (30 м). Ухожу на спавн (/spawn)'));
+  assert.ok(lines(logs).includes('info:Охрана выключена: бот ушёл на спавн'));
+  const sentAfter = bot.sent.length;
+  seconds(15);
+  assert.equal(bot.sent.length, sentAfter, 'на спавне охрана молчит');
+  mgr.shutdown();
+});
+
 test('возврат в лобби: причина из сообщения прокси', () => {
   assert.equal(forcedMoveReason('| Ты перемещен в лобби ▸ Подозрение в использовании читов'), 'Подозрение в использовании читов');
   assert.equal(forcedMoveReason('§cВы были перемещёны в лобби: §fAFK'), 'AFK');
