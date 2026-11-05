@@ -458,7 +458,7 @@ test('команды: #квесты у Фермера — показать, вз
 test('команды: #квесты принести — склад (/home), сдать NPC (/warp ah), награды (/home); ответы сервера — из чата', async () => {
   const json = (text) => JSON.stringify({ text });
   let bot = null;
-  const state = { taken: { 19: false }, have: { 11: 0, 19: 0 }, done: { 11: false, 19: false } };
+  const state = { taken: { 19: false }, have: { 11: 0, 19: 0 }, done: { 11: false, 19: false }, level: 1 };
   const QUESTS = {
     11: { title: 'Грядки без истерики.', icon: 'wheat', need: 224, items: ['wheat', 'carrot', 'potato', 'beetroot'], what: ['Передайте пшеницу, морковь,', 'картофель или свёклу'], gave: 'Урожай', reward: ['bread', 24, '24 хлеба'] },
     19: { title: 'Лесная кислинка.', icon: 'sweet_berries', need: 96, items: ['sweet_berries', 'apple'], what: ['Передайте сладкие ягоды или', 'яблоки'], gave: 'Ягодный запас', reward: ['cookie', 16, '16 печенек'] },
@@ -478,7 +478,19 @@ test('команды: #квесты принести — склад (/home), с�
     return w;
   };
   const mainMenu = () => menu(5, 'Фермер › Уровень 1', { 22: { name: 'experience_bottle', count: 1, customName: json('Улучшения'), customLore: [json('Повышайте уровень доверия')] } });
-  const questsMenu = () => menu(6, 'Фермер › Уровень 1 → 2', { 11: questItem(11), 19: questItem(19), 36: { name: 'arrow', count: 1, customName: json('Назад') } });
+  // Кнопка уровня (как на скриншотах 5 ноября); в открытом меню сервер её не обновляет — видно, только если открыть заново.
+  const allDone = () => state.done[11] && state.done[19];
+  const sunflower = () => (state.level === 1 && allDone()
+    ? { name: 'sunflower', count: 1, customName: json('Доступно улучшение'), customLore: [json(''), json('Нажмите, чтобы перейти на новый уровень!')] }
+    : { name: 'sunflower', count: 1, customLore: [json('Ещё не все задания уровня'), json('выполнены до конца.')] });
+  const back = { name: 'arrow', count: 1, customName: json('Назад') };
+  const questsMenu = () => (state.level === 1
+    ? menu(6, 'Фермер › Уровень 1 → 2', { 11: questItem(11), 19: questItem(19), 36: back, 40: sunflower() })
+    : menu(6, 'Фермер › Уровень 2 → 3', {
+      12: { name: 'clock', count: 1, customName: json('Посиди у костра.'), customLore: [json('▪ Награда: 2 500 монет'), json('Проведите на сервере: 0 м./3 ч.')] },
+      36: back,
+      40: sunflower(),
+    }));
   const say = (text) => bot.emit('message', { json: { text }, toString: () => text }, 'system');
   const deliver = (w, slot) => {
     const q = QUESTS[slot];
@@ -510,6 +522,12 @@ test('команды: #квесты принести — склад (/home), с�
   };
   const onClick = (w, slot) => {
     if (w.id === 5 && slot === 22) return questsMenu();
+    if (w.id === 6 && slot === 40 && state.level === 1 && allDone()) {
+      state.level = 2;
+      say('| Уровень доверия повышен! Текущий уровень: 2 ↑');
+      bot.currentWindow = null; // и меню закрыто (на скриншоте после нажатия меню уже нет)
+      return null;
+    }
     if (w.id === 6 && slot === 19 && !state.taken[19]) {
       state.taken[19] = true;
       say('| Вы взяли задание Лесная кислинка.');
@@ -554,8 +572,12 @@ test('команды: #квесты принести — склад (/home), с�
     'Склад (/home урожай): взял wheat×192, sweet_berries×128',
     'Сдал в «Грядки без истерики.»: 0 → 224 из 224 — выполнено, награда: 24 хлеба',
     'Сдал в «Лесная кислинка.»: 0 → 96 из 96 — выполнено, награда: 16 печенек',
+    'Фермер: уровень повышен — теперь 2',
     'Награды (/home награды): положил bread×24, cookie×16',
   ]);
+  assert.equal(state.level, 2);
+  assert.deepEqual(r.data.levelUps, [{ up: true, level: 2 }]);
+  assert.equal(bot.clicks.filter((c) => c.slot === 40).length, 1, 'кнопку уровня — один раз');
   assert.deepEqual(bot.sentCommands, ['/home урожай', '/warp ah', '/home награды']);
   assert.deepEqual(invNames(bot).sort(), ['iron_pickaxe', 'sweet_berries', 'wheat'], 'остатки для заданий и кирка — с собой');
   assert.equal(invCount(bot, 'wheat'), 8);
@@ -567,6 +589,7 @@ test('команды: #квесты принести — склад (/home), с�
   assert.deepEqual(bot.sentCommands.slice(3), ['/warp ah'], 'к NPC вернулся сам');
 
   // Дома нет — сервер так и сказал; что успел — в ответе.
+  state.level = 1;
   state.done[11] = false;
   state.have[11] = 200;
   const lost = await s.run('#квесты принести нет', 60000);
@@ -576,6 +599,80 @@ test('команды: #квесты принести — склад (/home), с�
   bot.username = 'NewBot';
   assert.match((await s.run('#квесты принести')).message, /откуда брать\? Например: #квесты принести урожай награды/);
   assert.match((await s.run('#квесты принести урожай;op')).message, /не похоже на название дома/);
+});
+
+test('команды: #квесты уровень — «Доступно улучшение», подтверждение из чата; «у Алхимика»; взять — сначала новый уровень', async () => {
+  const json = (text) => JSON.stringify({ text });
+  let bot = null;
+  const state = { level: 1, done: false, answer: true, taken: false };
+  const menu = (id, title, filled) => {
+    const w = { id, title: json(title), inventoryStart: 54, slots: new Array(90).fill(null) };
+    for (const [i, it] of Object.entries(filled)) w.slots[i] = it;
+    for (let j = 0; j < 36; j += 1) w.slots[54 + j] = bot.inventory.slots[9 + j] || null;
+    return w;
+  };
+  const say = (text) => bot.emit('message', { json: { text }, toString: () => text }, 'system');
+  const quest = (title, icon, lore) => ({ name: icon, count: 1, customName: json(title), customLore: lore.map(json) });
+  const ready = { name: 'sunflower', count: 1, customName: json('Доступно улучшение'), customLore: [json(''), json('Нажмите, чтобы перейти на новый уровень!')] };
+  const notReady = { name: 'sunflower', count: 1, customLore: [json('Ещё не все задания уровня'), json('выполнены до конца.')] };
+  const mainMenu = () => menu(5, `Алхимик › Уровень ${state.level}`, {
+    22: { name: 'experience_bottle', count: 1, customName: json('Улучшения'), customLore: [json('Повышайте уровень доверия алхимика')] },
+  });
+  const questsMenu = () => (state.level === 1
+    ? menu(6, 'Алхимик › Уровень 1 → 2', {
+      11: quest('Глаз да глаз.', 'spider_eye', ['▪ Награда: 8 зелий', `Передайте паучьи глаза: ${state.done ? 16 : 3}/16`]),
+      40: state.done ? ready : notReady,
+    })
+    : menu(6, 'Алхимик › Уровень 2 → 3', {
+      12: quest('Сладкая жизнь.', 'sugar_cane', ['▪ Награда: 4 бутылочки', 'Передайте сахарный тростник: 0/64', ...(state.taken ? [] : ['Нажмите, чтобы взять задание'])]),
+      40: notReady,
+    }));
+  const onClick = (w, slot) => {
+    if (w.id === 5 && slot === 22) return questsMenu();
+    if (w.id === 6 && slot === 40 && state.level === 1 && state.done && state.answer) {
+      state.level = 2;
+      say('| Уровень доверия повышен! Текущий уровень: 2 ↑');
+      bot.currentWindow = null; // сервер закрыл меню
+    }
+    if (w.id === 6 && slot === 12 && state.level === 2 && !state.taken) {
+      state.taken = true;
+      say('| Вы взяли задание Сладкая жизнь.');
+      w.slots[12] = questsMenu().slots[12];
+    }
+    return null;
+  };
+  const npc = { id: 401, type: 'player', username: '#2a8b1c0f9d3e7a1', position: new Vec3(0.5, 64, 2.5), height: 1.8, width: 0.6 };
+  const sign = { id: 402, type: 'object', name: 'armor_stand', position: new Vec3(0.5, 66.4, 2.5), getCustomName: () => ({ json: { text: 'Алхимик' }, toString: () => 'Алхимик' }) };
+  const s = setup({ entities: [npc, sign], npcs: { 401: mainMenu }, onClick });
+  bot = s.bot;
+
+  // Не всё выполнено — кнопку не трогает, пишет, что осталось.
+  const early = await s.run('#квесты уровень у Алхимика');
+  assert.equal(early.ok, false);
+  assert.deepEqual(early.message, [
+    'Уровень пока не повысить (Алхимик › Уровень 1 → 2): Ещё не все задания уровня выполнены до конца.',
+    'Не выполнено: 1',
+    '[11] Глаз да глаз. — Передайте паучьи глаза (spider_eye): 3/16; награда: 8 зелий',
+  ]);
+  assert.ok(!bot.clicks.some((c) => c.slot === 40));
+  assert.equal(bot.currentWindow, null);
+
+  // Всё выполнено, но сервер промолчал — так и пишет.
+  state.done = true;
+  state.answer = false;
+  assert.equal([].concat((await s.run('#квесты алхимик')).message).at(-1), 'Уровень: все задания выполнены — можно повышать (#квесты уровень)');
+  const silent = await s.run('#квесты повысить уровень алхимику');
+  assert.equal(silent.ok, false);
+  assert.equal(silent.message, 'Алхимик: нажал «Доступно улучшение», но сервер не написал «Уровень доверия повышен»');
+  assert.equal(state.level, 1);
+
+  // «#квесты взять»: сначала новый уровень (меню сервер закрывает), потом — задания нового уровня.
+  state.answer = true;
+  const took = await s.run('#квесты взять у Алхимика');
+  assert.equal(took.ok, true, [].concat(took.message).join('\n'));
+  assert.deepEqual(took.message, ['Алхимик: уровень повышен — теперь 2', 'Взял задания: «Сладкая жизнь.»']);
+  assert.deepEqual([state.level, state.taken], [2, true]);
+  assert.equal(bot.currentWindow, null);
 });
 
 test('команды: сундук на чужой территории — сервер не даёт открыть, бот так и пишет', async () => {

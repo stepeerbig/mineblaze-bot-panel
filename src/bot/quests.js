@@ -32,7 +32,13 @@ const TIME_RE = new RegExp(`(Проведите\\s+[^:]*?):\\s*(${DURATION})\\/\
 const TAKE_RE = /нажмите,?\s*чтобы\s*взять\s*задание/i;
 const DONE_RE = /задание\s+(?:выполнено|завершено)/i;
 const REWARD_RE = /награда:\s*(.+)/i;
-const LEVEL_RE = /задания уровня|повысить уровень|следующий уровень|уровень доверия повышен/i;
+// Кнопка уровня — подсолнух внизу «Улучшений» (журнал 4 ноября, скриншоты 5 ноября): пока задания не все —
+// лор «Ещё не все задания уровня / выполнены до конца.»; все выполнены — «Доступно улучшение» / «Нажмите, чтобы
+// перейти на новый уровень!». «Уровень доверия» без «повышен» — нельзя: «Повышайте уровень доверия фермера»
+// написано на кнопке «Улучшения» в главном меню NPC.
+const LEVEL_RE = /задания уровня|повысить уровень|следующий уровень|на новый уровень|доступно улучшение|уровень доверия повышен/i;
+const LEVEL_READY_RE = /доступно улучшение|нажмите/i;
+const LEVEL_NOT_READY_RE = /не все|не выполнен|недоступн/i;
 const BUY_RE = /нажмите,?\s*чтобы\s*купить/i;
 
 /** «2 500» → 2500, «8400.0» → 8400, «1,5» → 1.5. */
@@ -154,8 +160,8 @@ function parseQuest(slot, title, lore, icon = '') {
 }
 
 /**
- * Меню заданий: { quests, level } — level — кнопка уровня («Ещё не все задания уровня выполнены до конца.»):
- * { slot, text, ready } (ready — можно нажать, чтобы перейти на следующий уровень).
+ * Меню заданий: { quests, level } — level — кнопка уровня: { slot, title, text, ready } (ready — «Доступно
+ * улучшение»: все задания выполнены, нажатие переводит на новый уровень). Надпись бывает и в названии, и в лоре.
  * slots — [{ slot, title, lore, icon }].
  */
 function parseQuestMenu(slots) {
@@ -168,9 +174,10 @@ function parseQuestMenu(slots) {
       continue;
     }
     const text = clean((s.lore || []).join(' '));
-    if (LEVEL_RE.test(text) || LEVEL_RE.test(s.title || '')) {
-      level = { slot: s.slot, title: clean(s.title), text, ready: !/не все|не выполнен/i.test(text) && /нажмите/i.test(text) };
-    }
+    const all = `${s.title || ''} ${text}`;
+    if (!LEVEL_RE.test(all)) continue;
+    const ready = !LEVEL_NOT_READY_RE.test(all) && LEVEL_READY_RE.test(all);
+    if (!level || (ready && !level.ready)) level = { slot: s.slot, title: clean(s.title), text, ready };
   }
   return { quests, level };
 }
@@ -196,6 +203,7 @@ function parseOffer(s) {
 // Ответы сервера в чате (MineBlaze, скриншоты пользователя; системные строки начинаются с «|»):
 //   «| Вы взяли задание Ночная прополка.»
 //   «| Вы передали Ягодный запас» → «| Задание Лесная кислинка выполнено» → «| Вы получаете награду: 16 печенек»
+//   кнопка уровня → «| Уровень доверия повышен! Текущий уровень: 4 ↑» (и титр на экране «Вы повысили уровень!»)
 const CHAT_START = String.raw`^\s*(?:[|│▎▍▌▐┃]\s*)?`;
 const QUEST_CHAT = [
   ['took', new RegExp(`${CHAT_START}Вы взяли задание\\s+(.+?)\\s*$`, 'i')],
@@ -203,10 +211,16 @@ const QUEST_CHAT = [
   ['done', new RegExp(`${CHAT_START}Задание\\s+(.+?)\\s+(?:выполнено|завершено)[.!]?\\s*$`, 'i')],
   ['reward', new RegExp(`${CHAT_START}Вы получаете награду:\\s*(.+?)\\s*$`, 'i')],
 ];
+const LEVEL_CHAT_RE = new RegExp(`${CHAT_START}Уровень доверия повышен[!.]?(?:\\s*Текущий уровень:?\\s*(\\d+))?`, 'i');
 
-/** Сообщение сервера о задании → { type: took | gave | done | reward, text } или null (не о задании). */
+/**
+ * Сообщение сервера о задании → { type: took | gave | done | reward, text } или null (не о задании).
+ * Новый уровень NPC → { type: 'level', text: '4', level: 4 }.
+ */
 function parseQuestChat(line) {
   const s = clean(line);
+  const up = LEVEL_CHAT_RE.exec(s);
+  if (up) return { type: 'level', text: up[1] || '', level: up[1] ? Number(up[1]) : null };
   for (const [type, re] of QUEST_CHAT) {
     const m = re.exec(s);
     if (m) return { type, text: m[1].replace(/[.!]+$/, '').trim() };

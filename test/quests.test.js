@@ -17,6 +17,30 @@ test('ответы сервера о заданиях (скриншоты MineBl
   assert.ok(!sameTitle('Ночная прополка.', 'Лесная кислинка'));
 });
 
+test('кнопка уровня (скриншоты 5 ноября): готова — «Доступно улучшение»; ответ сервера — «Уровень доверия повышен»', () => {
+  assert.deepEqual(parseQuestChat('| Уровень доверия повышен! Текущий уровень: 4 ↑'), { type: 'level', text: '4', level: 4 });
+  assert.deepEqual(parseQuestChat('Уровень доверия повышен!'), { type: 'level', text: '', level: null });
+  assert.equal(parseQuestChat('[Ender] zJeezy → Уровень доверия повышен! Текущий уровень: 4'), null, 'игрок не может «ответить» за сервер');
+
+  const sunflower = (title, lore) => [{ slot: 40, title, icon: 'sunflower', lore }];
+  // Надпись — в названии предмета или в лоре: годится и так, и так.
+  for (const menu of [
+    sunflower('Доступно улучшение', ['', 'Нажмите, чтобы перейти на новый уровень!']),
+    sunflower('Sunflower', ['Доступно улучшение', '', 'Нажмите, чтобы перейти на новый уровень!']),
+  ]) {
+    const { level } = parseQuestMenu(menu);
+    assert.equal(level && level.slot, 40);
+    assert.equal(level.ready, true, JSON.stringify(menu));
+  }
+  assert.equal(parseQuestMenu(sunflower('Sunflower', ['Ещё не все задания уровня', 'выполнены до конца.'])).level.ready, false);
+  // Главное меню NPC — не меню заданий: «Повышайте уровень доверия фермера» — не кнопка уровня.
+  const main = [
+    { slot: 20, title: 'Покупка', icon: 'hay_block', lore: ['Вам доступны товары 3 уровня'] },
+    { slot: 22, title: 'Улучшения', icon: 'experience_bottle', lore: ['Повышайте уровень доверия фермера', 'Вам доступны товары 3 уровня'] },
+  ];
+  assert.equal(parseQuestMenu(main).level, null);
+});
+
 // Меню «Фермер › Уровень 1 → 2» с MineBlaze (из лога панели, #окно; строки описания были через « / »).
 const FARMER_LOG = [
   [10, 'Аванс на семена.', 'gold_ingot', 'Фермер потёр ладони и сказал, / что у любой приличной деревни / сначала появляется бюджет, а / потом уже драма. Помоги ему / распродать первую витрину - и / он начнёт относиться к тебе как / к человеку, а не как к ходячей / тыкве. / Купите у Фермера товаров на: 0/12000'],

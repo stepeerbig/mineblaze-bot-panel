@@ -653,6 +653,7 @@ async function cmdClose({ bot }) {
 // ---------- задания и покупки у NPC (Фермер, Алхимик, Оружейник — /warp ah) ----------
 
 const QUEST_NPC = 'Фермер';
+const QUEST_NPCS = ['Фермер', 'Алхимик', 'Оружейник']; // NPC с заданиями у /warp ah (ТЗ)
 const NPC_REACH = 2.5; // ближе — можно нажимать (дотянуться можно на 2,9 от глаз)
 const MENU_WAIT_MS = 2000; // меню NPC сервер присылает не сразу
 const AFTER_CLICK_MS = 400; // после клика сервер пересобирает меню несколькими пакетами
@@ -716,8 +717,15 @@ async function openNpcSection(bot, npc, isSection, buttonRe, what) {
   if (btn === null) throw new CommandError(`в меню «${windowTitle(w)}» нет кнопки «${what}»`);
   await bot.actions.clickSlot(btn);
   const next = await waitNewWindow(bot, w, MENU_WAIT_MS);
-  if (!next || !isSection(next)) throw new CommandError(`раздел «${what}» не открылся`);
+  if (!next || !isSection(next)) throw new CommandError(`раздел «${what}» не открылся${next ? ` (открылось «${windowTitle(next)}»)` : ''}`);
   return next;
+}
+
+/** Имя NPC из слов команды: «у Алхимика», «оружейнику» → «Алхимик», «Оружейник»; другое — как написали. */
+function npcName(text) {
+  const t = String(text || '').trim().replace(/^у(?:\s+|$)/i, '');
+  if (!t) return QUEST_NPC;
+  return QUEST_NPCS.find((n) => matchesQuery(n, t)) || t;
 }
 
 // Меню заданий: в нём задания, кнопка уровня или заголовок «Фермер › Уровень 1 → 2» (когда всё выполнено,
@@ -740,26 +748,27 @@ async function clickAndSettle(bot, slot) {
 
 const quote = (q) => `«${q.title}»`;
 
-/** «#квесты [взять|сдать] [NPC]», «#квесты принести <дом склада> [<дом наград>] [у NPC]» — разобрать слова. */
+/** «#квесты [взять|сдать|уровень] [у NPC]», «#квесты принести <дом склада> [<дом наград>] [у NPC]» — разобрать слова. */
 function questArgs(args, words) {
   const ACTIONS = {
     взять: 'take', возьми: 'take', прими: 'take', принять: 'take', take: 'take',
     сдать: 'give', сдай: 'give', отдать: 'give', отдай: 'give', give: 'give', deliver: 'give',
     принести: 'bring', принеси: 'bring', bring: 'bring',
+    уровень: 'level', повысить: 'level', повысь: 'level', улучшить: 'level', улучши: 'level', level: 'level', up: 'level',
   };
   let action = 'show';
   const rest = [];
   args.forEach((a, i) => {
-    if (action === 'show' && ACTIONS[words[i]]) action = ACTIONS[words[i]];
+    const act = ACTIONS[words[i]];
+    if (act && (action === 'show' || act === action)) action = act; // «повысить уровень» — одно действие
     else rest.push(a);
   });
   if (action === 'bring') {
     const at = rest.findIndex((a) => norm(a) === 'у');
     const homes = at >= 0 ? rest.slice(0, at) : rest;
-    const npc = at >= 0 ? rest.slice(at + 1).join(' ') : '';
-    return { action, npc: npc || QUEST_NPC, storage: homes[0] || null, rewards: homes[1] || null };
+    return { action, npc: npcName(at >= 0 ? rest.slice(at + 1).join(' ') : ''), storage: homes[0] || null, rewards: homes[1] || null };
   }
-  return { action, npc: rest.join(' ') || QUEST_NPC };
+  return { action, npc: npcName(rest.join(' ')) };
 }
 
 /** Закрыть меню после дела (как человек: посмотрел — закрыл); ошибка закрытия не важнее ответа. */
@@ -787,11 +796,33 @@ async function cmdQuests({ bot, args, words }) {
     lastHomes.set(norm(bot.username), homes);
     return bringQuests(bot, npc, homes.storage, homes.rewards || null);
   }
+  const lines = []; // что уже сделано (например, новый уровень) — в ответе, даже если дальше ошибка
   try {
     await openQuests(bot, npc);
-    if (action === 'take') return await takeQuests(bot, npc);
-    if (action === 'give') return await giveQuests(bot, npc);
+    if (action === 'level') return await levelQuests(bot, npc);
+    if (action === 'take') {
+      // Все задания уровня выполнены — сначала новый уровень: новые задания появятся только после него.
+      const up = await levelUpBeforeTaking(bot, npc, lines);
+      const took = await takeQuests(bot, npc);
+      const unconfirmed = Boolean(up && !up.up);
+      return {
+        ok: took.ok && !unconfirmed,
+        code: unconfirmed ? 'unconfirmed' : took.code,
+        message: [...lines, ...[].concat(took.message)],
+        data: { ...took.data, levelUp: up },
+      };
+    }
+    if (action === 'give') {
+      const gave = await giveQuests(bot, npc);
+      lines.push(...[].concat(gave.message));
+      const up = await levelUpAfterGiving(bot, npc, gave.data.gave, lines);
+      return { ok: !up || up.up, code: up && !up.up ? 'unconfirmed' : undefined, message: lines, data: { ...gave.data, levelUp: up } };
+    }
     return showQuests(bot, npc);
+  } catch (err) {
+    if (!lines.length) throw err;
+    lines.push(`Остановился: ${err && err.message ? err.message : err}`);
+    return { ok: false, code: (err && err.code) || 'failed', message: lines };
   } finally {
     await closeAfter(bot);
   }
@@ -803,8 +834,82 @@ function showQuests(bot, npc) {
   const taken = quests.filter((q) => q.taken).length;
   const done = quests.filter((q) => q.done).length;
   const lines = [`Задания (${title}): ${quests.length}, взято ${taken}, выполнено ${done}`, ...quests.map(describeQuest)];
-  if (level) lines.push(`Уровень: ${level.text || level.title}${level.ready ? ' — можно повышать' : ''}`);
+  if (level) lines.push(level.ready ? 'Уровень: все задания выполнены — можно повышать (#квесты уровень)' : `Уровень: ${level.text || level.title}`);
   return { ok: true, message: lines, data: { npc, title, quests, level } };
+}
+
+// ---------- уровень NPC: кнопка-подсолнух внизу «Улучшений» ----------
+
+const LEVEL_WAIT_MS = 5000; // ответ сервера на кнопку уровня
+
+/** Последние системные строки сервера («| …», «! …») — объяснить, что пошло не так. */
+function serverSaid(lines, n = 2) {
+  return lines.filter((l) => /^\s*[|!│]/.test(l)).slice(-n).map((l) => l.replace(/^[\s!|│]+/, '')).join(' / ');
+}
+
+/**
+ * Нажать готовую кнопку уровня («Доступно улучшение») и дождаться ответа в чате:
+ * «| Уровень доверия повышен! Текущий уровень: 4 ↑» (скриншоты 5 ноября). Меню после этого сервер может закрыть.
+ */
+async function pressLevel(bot, npc, level) {
+  const chat = watchChat(bot);
+  const answer = () => chat.lines.map(parseQuestChat).find((x) => x && x.type === 'level');
+  try {
+    await bot.actions.clickSlot(level.slot);
+    for (let t = 0; t < LEVEL_WAIT_MS && !answer(); t += 100) await bot.actions.wait(100);
+  } finally {
+    chat.stop();
+  }
+  const hit = answer();
+  if (hit) return { up: true, level: hit.level, line: `${npc}: уровень повышен${hit.level ? ` — теперь ${hit.level}` : ''}` };
+  const said = serverSaid(chat.lines);
+  return { up: false, level: null, line: `${npc}: нажал «Доступно улучшение», но сервер не написал «Уровень доверия повышен»${said ? ` (сервер: «${said}»)` : ''}` };
+}
+
+/** Перед взятием заданий: все задания уровня выполнены — повысить уровень и открыть «Улучшения» заново. */
+async function levelUpBeforeTaking(bot, npc, lines) {
+  const { level } = readQuests(bot);
+  if (!level || !level.ready) return null;
+  const r = await pressLevel(bot, npc, level);
+  lines.push(r.line);
+  await closeAfter(bot);
+  await openQuests(bot, npc); // уже с заданиями нового уровня
+  return r;
+}
+
+/**
+ * После сдачи: задания уровня теперь все выполнены — повысить уровень. Кнопку в открытом меню сервер может
+ * не обновить: если сдали последнее невыполненное, а она не готова — открыть меню заново и посмотреть ещё раз.
+ */
+async function levelUpAfterGiving(bot, npc, gave, lines) {
+  const now = readQuests(bot);
+  let { level } = now;
+  const finished = gave.filter((g) => g.done);
+  const left = now.quests.filter((q) => !q.done && !finished.some((g) => g.slot === q.slot && sameTitle(g.title, q.title)));
+  if (!(level && level.ready) && finished.length && !left.length) {
+    await closeAfter(bot);
+    await openQuests(bot, npc);
+    ({ level } = readQuests(bot));
+  }
+  if (!level || !level.ready) return null;
+  const r = await pressLevel(bot, npc, level);
+  lines.push(r.line);
+  return r;
+}
+
+/** «#квесты уровень»: все задания выполнены — повысить уровень; нет — показать, что осталось. */
+async function levelQuests(bot, npc) {
+  const title = windowTitle(bot.currentWindow);
+  const { quests, level } = readQuests(bot);
+  if (!level) return { ok: false, code: 'not_found', message: `В меню «${title}» нет кнопки уровня`, data: { npc, title } };
+  if (!level.ready) {
+    const left = quests.filter((q) => !q.done);
+    const lines = [`Уровень пока не повысить (${title}): ${level.text || level.title}`];
+    if (left.length) lines.push(`Не выполнено: ${left.length}`, ...left.map(describeQuest));
+    return { ok: false, code: 'not_ready', message: lines, data: { npc, title, ready: false, left: left.map((q) => q.slot) } };
+  }
+  const r = await pressLevel(bot, npc, level);
+  return { ok: r.up, code: r.up ? undefined : 'unconfirmed', message: r.line, data: { npc, title, up: r.up, level: r.level } };
 }
 
 async function takeQuests(bot, npc) {
@@ -906,7 +1011,7 @@ async function teleportBy(bot, cmd) {
     chat.stop();
   }
   if (!moved) {
-    const said = chat.lines.filter((l) => /^\s*[|!│]/.test(l)).slice(-2).map((l) => l.replace(/^[\s!|│]+/, '')).join(' / ');
+    const said = serverSaid(chat.lines);
     throw new CommandError(`после ${cmd} телепорта не было${said ? ` (сервер: «${said}»)` : ''}`);
   }
   for (let i = 0; i < 30 && !bot.blockAt(bot.entity.position.offset(0, -1, 0)); i += 1) await bot.actions.wait(100);
@@ -983,16 +1088,24 @@ async function takeFromStorage(bot, needs) {
  * «#квесты принести урожай награды»: задания «Передайте…» целиком. У NPC (/warp ah) — взять новые задания и
  * посчитать, чего не хватает (с учётом инвентаря); /home урожай — взять это из сундуков у дома; /warp ah —
  * сдать; /home награды — положить награды. Инструменты и остатки для заданий бот оставляет себе.
+ * Все задания уровня выполнены (до или после сдачи) — бот повышает уровень NPC кнопкой «Доступно улучшение».
  */
 async function bringQuests(bot, npc, storageHome, rewardsHome) {
   const lines = [];
-  const data = { npc, storage: storageHome, rewards: rewardsHome, needs: [], taken: [], gave: [], stored: [] };
+  const data = { npc, storage: storageHome, rewards: rewardsHome, needs: [], taken: [], gave: [], stored: [], levelUps: [] };
+  // Готово; кнопку уровня нажали, а сервер не подтвердил — это стоит проверить, поэтому не «всё хорошо».
+  const finish = () => {
+    const unconfirmed = data.levelUps.some((u) => !u.up);
+    return { ok: !unconfirmed, code: unconfirmed ? 'unconfirmed' : undefined, message: lines, data };
+  };
   try {
-    // 1. Задания.
+    // 1. Задания (все задания уровня уже выполнены — сначала новый уровень).
     await ensureNpc(bot, npc);
     let quests;
     try {
       await openQuests(bot, npc);
+      const up = await levelUpBeforeTaking(bot, npc, lines);
+      if (up) data.levelUps.push({ up: up.up, level: up.level });
       const took = await takeQuests(bot, npc);
       if (took.data.took.length) lines.push([].concat(took.message)[0]);
       quests = readQuests(bot).quests;
@@ -1002,7 +1115,7 @@ async function bringQuests(bot, npc, storageHome, rewardsHome) {
     const todo = quests.filter((q) => q.kind === 'deliver' && q.taken && !q.done && q.items.length && q.need > q.have);
     if (!todo.length) {
       lines.push('Приносить нечего: заданий «Передайте…» нет или все выполнены');
-      return { ok: true, message: lines, data };
+      return finish();
     }
     // 2. Чего не хватает: нужное минус то, что уже есть в инвентаре.
     const inv = new Map();
@@ -1032,17 +1145,18 @@ async function bringQuests(bot, npc, storageHome, rewardsHome) {
       if (r.full) line += '; инвентарь полон';
       lines.push(line);
     }
-    // 4. Сдать.
+    // 4. Сдать; выполнили всё — новый уровень.
     await ensureNpc(bot, npc);
-    let gave;
     try {
       await openQuests(bot, npc);
-      gave = await giveQuests(bot, npc);
+      const gave = await giveQuests(bot, npc);
+      data.gave = gave.data.gave;
+      lines.push(...[].concat(gave.message));
+      const up = await levelUpAfterGiving(bot, npc, gave.data.gave, lines);
+      if (up) data.levelUps.push({ up: up.up, level: up.level });
     } finally {
       await closeAfter(bot);
     }
-    data.gave = gave.data.gave;
-    lines.push(...[].concat(gave.message));
     // 5. Награды — в сундук у дома наград; инструменты и всё, что ещё пригодится для заданий, — с собой.
     if (rewardsHome) {
       const keep = (it) => KEEP_RE.test(it.name) || taken.has(it.name) || needs.some((n) => n.test(it));
@@ -1053,7 +1167,7 @@ async function bringQuests(bot, npc, storageHome, rewardsHome) {
         lines.push(`Награды (/home ${rewardsHome}): ${r.total ? `положил ${countsText(r.moved)}` : 'ничего не положил'}${r.full ? ' — сундук полон' : ''}`);
       }
     }
-    return { ok: true, message: lines, data };
+    return finish();
   } catch (err) {
     // Что успели — в ответе; дальше — почему остановились.
     lines.push(`Остановился: ${err && err.message ? err.message : err}`);
@@ -1460,9 +1574,10 @@ const COMMANDS = [
   {
     name: 'квесты',
     aliases: ['quests', 'задания'],
-    usage: ['#квесты', '#квесты взять', '#квесты сдать', '#квесты принести урожай награды', '#квесты Алхимик', '#квесты взять Оружейник'],
-    about: 'задания NPC (по умолчанию Фермер, у /warp ah): показать; взять все новые; сдать из инвентаря; ' +
-      'принести — всё для «Передайте…» со склада (/home урожай), сдать и сложить награды (/home награды)',
+    usage: ['#квесты', '#квесты взять', '#квесты сдать', '#квесты уровень', '#квесты принести урожай награды', '#квесты у Алхимика', '#квесты взять у Оружейника'],
+    about: 'задания NPC (по умолчанию Фермер, у /warp ah): показать; взять все новые; сдать из инвентаря; уровень — повысить ' +
+      '(взять, сдать и принести повышают сами, когда все задания выполнены); принести — всё для «Передайте…» со склада ' +
+      '(/home урожай), сдать и сложить награды (/home награды)',
     run: cmdQuests,
   },
   {
