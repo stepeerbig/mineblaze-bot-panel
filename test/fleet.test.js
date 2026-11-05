@@ -177,6 +177,49 @@ test('флот: упал процесс — его боты не в сети; п
   await fleet.shutdown();
 });
 
+test('флот: команда ботам для ИИ — «#…» по одному с ответом каждого, «/…» — ответ сервера из чата; стоп', async () => {
+  const { fleet, config, managers, managerOf } = makeFleet({ perProcess: 2, gapMs: 1 });
+  config.aiKey = 'sk-or-v1-секрет';
+  fleet.setAccounts(accounts(4));
+  await fleet.start(['Farm01', 'Farm02', 'Farm03']);
+  assert.ok(await waitFor(() => fleet.summary().online === 3));
+  assert.equal(managerOf('Farm01').opts.config.aiKey, undefined, 'ключ ИИ процессам ботов не уходит');
+  managerOf('Farm02').failCommands = true;
+
+  // Всем в сети: по одному, по порядку списка, у каждого — свой ответ.
+  const all = await fleet.commandEach(null, '#где');
+  assert.deepEqual(all.map((r) => [r.nick, r.ok, r.message]), [
+    ['Farm01', true, ['#где: готово']], ['Farm02', false, ['#где: готово']], ['Farm03', true, ['#где: готово']],
+  ]);
+  const runs = managers().flatMap((m) => m.runs || []).sort((a, b) => a.started - b.started);
+  for (let i = 1; i < runs.length; i += 1) assert.ok(runs[i].started >= runs[i - 1].ended - 1, 'следующий — когда закончил предыдущий');
+  // По никам (любой регистр); не в сети — так и сказано.
+  const some = await fleet.commandEach(['farm03', 'Farm04'], '#где');
+  assert.deepEqual(some.map((r) => [r.nick, r.ok, r.code]), [['Farm03', true, null], ['Farm04', false, 'offline']]);
+  await assert.rejects(fleet.commandEach(null, 'привет'), /только команды/);
+
+  // «/…»: ответ — сообщения сервера в чате бота; чат игроков не берём.
+  for (const m of managers()) m.serverReply = (text) => [{ position: 'system', text: `| ответ на ${text}` }, { position: 'chat', text: '<Игрок> привет' }];
+  fleet.timings.replyMs = 80;
+  const warp = await fleet.commandEach(['Farm01', 'Farm03'], '/warp ah');
+  assert.deepEqual(warp.map((r) => [r.nick, r.ok, r.message]), [['Farm01', true, ['| ответ на /warp ah']], ['Farm03', true, ['| ответ на /warp ah']]]);
+  managerOf('Farm03').serverReply = () => [];
+  const silent = await fleet.commandEach(['Farm03'], '/near');
+  assert.deepEqual(silent[0].message, ['отправлено; сервер ничего не ответил']);
+
+  // Стоп: тот, кто выполняет, получает «#стоп», остальные не начинают.
+  for (const m of managers()) m.commandMs = 100;
+  const abort = new AbortController();
+  const pending = fleet.commandEach(null, '#квесты принести', { signal: abort.signal });
+  await flush(30);
+  abort.abort();
+  const stopped = await pending;
+  assert.deepEqual(stopped.map((r) => [r.nick, r.code]), [['Farm01', null], ['Farm02', 'stopped'], ['Farm03', 'stopped']]);
+  assert.ok(await waitFor(() => managerOf('Farm01').calls.includes('say:#стоп')), '#стоп — тому, кто начал');
+  assert.ok(!managerOf('Farm02').calls.includes('command:#квесты принести'), 'следующие не начали');
+  await fleet.shutdown();
+});
+
 test('флот: события ботов — с ником; убранный из списка бот выходит с сервера', async () => {
   const { fleet, events, managerOf } = makeFleet({ perProcess: 3, gapMs: 1 });
   fleet.setAccounts(accounts(2));

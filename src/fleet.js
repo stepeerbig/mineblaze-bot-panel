@@ -17,10 +17,13 @@ const { BotClient } = require('./bot-client');
 const DEFAULT_TIMINGS = Object.freeze({
   broadcastGap: 150, // «всем ботам»: между ботами — пауза, а не 70 команд в одну секунду
   turnTimeout: 15 * 60 * 1000, // «по очереди»: столько ждём одного бота (#квесты принести — минуты)
+  replyMs: 3000, // команда серверу «/…» от ИИ: столько собираем ответ сервера в чате бота
 });
 const STOP_RE = /^#\s*(?:стоп|stop|хватит|стой)(?:\s|$)/i;
+const REPLY_LINES = 6; // строк ответа сервера на «/…» — каждому боту
 const errText = (err) => (err && err.message ? err.message : String(err));
 const RUNNING = (state) => state && state !== 'offline';
+const IN_GAME = (b) => b.state === 'online' || b.state === 'connected';
 
 class Fleet extends EventEmitter {
   /**
@@ -230,6 +233,76 @@ class Fleet extends EventEmitter {
     return { targets: targets.length };
   }
 
+  /**
+   * Команда ботам с ответом каждого — для ИИ (src/ai.js). «#…» — по одному: следующий начинает, когда закончил
+   * предыдущий (как «по очереди»); «/…» серверу — всем почти сразу (пауза broadcastGap), ответ — сообщения
+   * сервера в чате бота за replyMs после отправки (чат игроков не берём). ids — каким ботам (null — всем в сети).
+   * signal (AbortSignal) сработал — новые боты не начинают, а тем, кто выполняет «#…», уходит «#стоп».
+   * → [{ bot, nick, ok, code, message: [строки] }] в порядке списка ботов.
+   */
+  async commandEach(ids, text, { signal = null } = {}) {
+    const line = String(text || '').trim();
+    if (!/^[/#]/.test(line)) throw new Error('только команды: «/…» серверу или «#…» боту');
+    const picked = ids ? this._pick(ids) : this.order.map((id) => this.bots.get(id)).filter(IN_GAME);
+    const result = (b, ok, code, message) => ({ bot: b.bot, nick: b.nick, ok, code: code || null, message: [].concat(message || []).map(String) });
+    const stopped = () => Boolean(signal && signal.aborted);
+    if (line.startsWith('/')) return this._commandServer(picked, line, result, stopped, signal);
+    const out = [];
+    for (const b of picked) {
+      const w = this.workers[b.worker];
+      if (stopped()) out.push(result(b, false, 'stopped', 'не начато: остановлено'));
+      else if (!this.bots.has(b.bot) || !IN_GAME(b) || !w || !w.client || !w.client.child) out.push(result(b, false, 'offline', 'бот не в сети'));
+      else {
+        const onAbort = () => this.say(b.bot, '#стоп').catch(() => {});
+        if (signal) signal.addEventListener('abort', onAbort, { once: true });
+        try {
+          const r = await w.client.request('command', { bot: b.bot, line }, { timeoutMs: this.timings.turnTimeout });
+          out.push(result(b, Boolean(r && r.ok), r && r.code, r && r.message));
+        } catch (err) {
+          out.push(result(b, false, 'failed', errText(err)));
+        } finally {
+          if (signal) signal.removeEventListener('abort', onAbort);
+        }
+      }
+    }
+    return out;
+  }
+
+  async _commandServer(picked, line, result, stopped, signal) {
+    const windows = new Map(); // номер бота → строки ответа сервера
+    const onChat = (m) => {
+      const lines = m && windows.get(m.bot);
+      if (lines && m.position !== 'chat' && m.position !== 'self' && lines.length < REPLY_LINES) lines.push(String(m.text || ''));
+    };
+    this.on('chat', onChat);
+    try {
+      const sends = [];
+      for (const [i, b] of picked.entries()) {
+        if (stopped()) break;
+        if (i) await new Promise((r) => later(r, this.timings.broadcastGap));
+        if (!IN_GAME(b)) continue;
+        windows.set(b.bot, []);
+        sends.push(this.say(b.bot, line).then((ok) => ({ b, ok }), (err) => ({ b, ok: false, err })));
+      }
+      const sent = new Map((await Promise.all(sends)).map((s) => [s.b.bot, s]));
+      if (sent.size) {
+        await new Promise((resolve) => {
+          const t = later(resolve, this.timings.replyMs);
+          if (signal) signal.addEventListener('abort', () => { clearTimeout(t); resolve(); }, { once: true });
+        });
+      }
+      return picked.map((b) => {
+        const s = sent.get(b.bot);
+        if (!s) return result(b, false, stopped() ? 'stopped' : 'offline', stopped() ? 'не отправлено: остановлено' : 'бот не в сети');
+        if (!s.ok) return result(b, false, 'failed', `не отправилось${s.err ? `: ${errText(s.err)}` : ''}`);
+        const lines = windows.get(b.bot);
+        return result(b, true, null, lines.length ? lines : 'отправлено; сервер ничего не ответил');
+      });
+    } finally {
+      this.off('chat', onChat);
+    }
+  }
+
   /** Остановить очередь «по очереди»: бот, который уже начал, доделает своё, новые не начнут. */
   cancelTurn() {
     if (!this._turn || this._turn.cancelled) return false;
@@ -339,7 +412,8 @@ class Fleet extends EventEmitter {
   }
 
   _sharedConfig() {
-    const { accounts, ...rest } = this.config; // пароли всех ботов процессам не нужны: у каждого — свой
+    // Пароли всех ботов процессам не нужны (у каждого — свой), ключ и настройки ИИ — тоже.
+    const { accounts, aiKey, aiBaseUrl, aiModel, ...rest } = this.config;
     // Ники всех ботов панели: охрана каждого считает остальных своими (у одного склада их много).
     rest.fleetNicks = this.order.map((id) => this.bots.get(id).username).join('\n');
     return rest;

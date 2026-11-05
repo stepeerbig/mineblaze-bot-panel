@@ -455,6 +455,49 @@ test('команды: #квесты у Фермера — показать, вз
   assert.match((await s.run('#купи торт')).message, /у Фермер нет «торт». Есть: Тюк сена/);
 });
 
+test('команды: #квесты далеко от NPC — бот сам телепортируется на /warp ah (не умеет писать серверу — подскажет)', async () => {
+  const json = (text) => JSON.stringify({ text });
+  let bot = null;
+  const menu = (id, title, filled) => {
+    const w = { id, title: json(title), inventoryStart: 54, slots: new Array(90).fill(null) };
+    for (const [i, it] of Object.entries(filled)) w.slots[i] = it;
+    for (let j = 0; j < 36; j += 1) w.slots[54 + j] = bot.inventory.slots[9 + j] || null;
+    return w;
+  };
+  const mainMenu = () => menu(5, 'Фермер › Уровень 1', { 22: { name: 'experience_bottle', count: 1, customName: json('Улучшения'), customLore: [json('Повышайте уровень доверия')] } });
+  const questsMenu = () => menu(6, 'Фермер › Уровень 1 → 2', {
+    12: { name: 'clock', count: 1, customName: json('Посиди у костра.'), customLore: [json('▪ Награда: 2 500 монет'), json('Проведите на сервере: 0 м./3 ч.')] },
+    40: { name: 'sunflower', count: 1, customLore: [json('Ещё не все задания уровня'), json('выполнены до конца.')] },
+  });
+  const onClick = (w, slot) => (w.id === 5 && slot === 22 ? questsMenu() : null);
+  // NPC — у /warp ah, далеко от бота: пока бот не там, сервер их не показывает.
+  const npc = { id: 401, type: 'player', username: '#1479d9c455b1f85', position: new Vec3(100.5, 64, 2.5), height: 1.8, width: 0.6 };
+  const sign = { id: 402, type: 'object', name: 'armor_stand', position: new Vec3(100.5, 66.4, 2.5), getCustomName: () => ({ json: { text: 'Фермер' }, toString: () => 'Фермер' }) };
+  const s = setup({ npcs: { 401: mainMenu }, onClick });
+  bot = s.bot;
+
+  const hint = await s.run('#квесты');
+  assert.equal(hint.ok, false);
+  assert.match(hint.message, /рядом нет «Фермер» — сначала \/warp ah/);
+
+  const sent = [];
+  bot.sendCommand = (cmd) => {
+    sent.push(cmd);
+    if (cmd === '/warp ah') {
+      bot.entities[npc.id] = npc;
+      bot.entities[sign.id] = sign;
+      teleport(bot, { x: 100.5, y: 64, z: 0.5 });
+    }
+    return true;
+  };
+  const r = await s.run('#квесты', 60000);
+  assert.equal(r.ok, true, [].concat(r.message).join('\n'));
+  assert.equal(r.message[0], 'Задания (Фермер › Уровень 1 → 2): 1, взято 1, выполнено 0');
+  assert.deepEqual(sent, ['/warp ah']);
+  await s.run('#квесты');
+  assert.deepEqual(sent, ['/warp ah'], 'уже у NPC — второй раз не телепортируется');
+});
+
 test('команды: #квесты принести — склад (/home), сдать NPC (/warp ah), награды (/home); ответы сервера — из чата', async () => {
   const json = (text) => JSON.stringify({ text });
   let bot = null;

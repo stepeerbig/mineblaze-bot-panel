@@ -33,6 +33,38 @@
         </button>
       </div>
 
+      <details id="aiGroup" class="group fold" open>
+        <summary class="group-title">ИИ-помощник <span id="aiTag" class="tag" hidden></span></summary>
+        <label class="field">Задание словами
+          <textarea id="aiTask" rows="3" spellcheck="false" placeholder="Например: покажи задания Фермера у всех ботов"></textarea>
+        </label>
+        <div class="row">
+          <button id="aiRun" class="btn ai-run" type="button" title="Ctrl+Enter — тоже выполнить">Выполнить</button>
+          <button id="aiStop" class="btn ai-stop" type="button" disabled title="Остановить ИИ: новые команды ботам не уйдут, начатое бот бросит">Стоп</button>
+        </div>
+        <div id="aiResult" class="ai-result" role="status" hidden></div>
+        <p class="hint">ИИ сам отдаёт ботам команды <b>#…</b> и <b>/…</b>, читает ответы и пишет итог. Каждый шаг — в консоли с меткой <b>ИИ</b>.</p>
+        <details id="aiSettings" class="fold sub">
+          <summary>Ключ, модель и сервис <span id="aiKeyTag" class="tag warn" hidden>нужен ключ</span></summary>
+          <label class="field">Ключ API (openrouter.ai → Keys)
+            <span class="secret">
+              <input id="aiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-or-v1-…">
+              <button id="showAiKey" class="eye" type="button" aria-pressed="false" aria-label="Показать ключ" title="Показать ключ">
+                <svg viewBox="0 0 12 12" aria-hidden="true"><path fill-rule="evenodd" d="M6 2.5C3.2 2.5 1.1 4.4.3 6c.8 1.6 2.9 3.5 5.7 3.5s4.9-1.9 5.7-3.5C10.9 4.4 8.8 2.5 6 2.5zm0 1.2a2.3 2.3 0 1 1 0 4.6 2.3 2.3 0 0 1 0-4.6zm0 1.1a1.2 1.2 0 1 0 0 2.4 1.2 1.2 0 0 0 0-2.4z"/></svg>
+              </button>
+            </span>
+          </label>
+          <label class="field">Модель
+            <input id="aiModel" type="text" list="aiModels" autocomplete="off" spellcheck="false">
+          </label>
+          <datalist id="aiModels"></datalist>
+          <label class="field">Адрес сервиса
+            <input id="aiBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="https://openrouter.ai/api/v1">
+          </label>
+          <p class="hint">Бесплатно: OpenRouter, модели с <b>:free</b> — до 50 запросов к ИИ в день (одно задание — обычно 3–6). Ключ хранится зашифрованным, ботам и в логи не попадает.</p>
+        </details>
+      </details>
+
       <div class="group">
         <div class="group-title">Автоматический реконнект</div>
         <div class="reconnect">

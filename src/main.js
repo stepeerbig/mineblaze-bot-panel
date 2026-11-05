@@ -1,10 +1,11 @@
 'use strict';
 
-const { app, BrowserWindow, Menu, clipboard, ipcMain, safeStorage, session, shell, utilityProcess } = require('electron');
+const { app, BrowserWindow, Menu, clipboard, ipcMain, net, safeStorage, session, shell, utilityProcess } = require('electron');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { Fleet } = require('./fleet');
+const { AiAgent } = require('./ai');
 const { DEFAULT_CONFIG, sanitize, validate, accountsOf } = require('./config');
 const { maskSecrets } = require('./chat-utils');
 
@@ -19,7 +20,7 @@ const SELFTEST_OUT = process.env.MBP_SELFTEST_OUT || '';
 if (SELFTEST_OUT) app.setPath('userData', fs.mkdtempSync(path.join(os.tmpdir(), 'mbp-selftest-')));
 
 const config = { ...DEFAULT_CONFIG }; // настройки панели; копию держат процессы ботов
-const SECRET_FIELDS = ['loginPassword', 'joinCommands', 'accounts']; // хранятся зашифрованными (Windows DPAPI)
+const SECRET_FIELDS = ['loginPassword', 'joinCommands', 'accounts', 'aiKey']; // хранятся зашифрованными (Windows DPAPI)
 const ICON = path.join(__dirname, 'assets', 'icon.png');
 const VIEWER_PARTITION = 'mineblaze-viewer'; // без «persist:» — сессия окна экрана живёт только в памяти
 const CHAT_HISTORY = 300; // строк чата каждого бота: выбрал бота в списке — видишь его чат
@@ -27,6 +28,7 @@ let configFile = '';
 let logsDir = '';
 let win = null;
 let fleet = null; // все боты (src/fleet.js)
+let ai = null; // ИИ-помощник (src/ai.js)
 let selectedBot = null; // чей чат в панели и кого показывает экран бота
 let appliedAccounts = null; // список ботов, который уже отдан флоту
 let viewerWin = null; // окно «Экран бота»
@@ -180,6 +182,21 @@ function uiLog(level, text) {
   appendLog('events', entry.time, `${level.toUpperCase().padEnd(5)} ${text}`);
 }
 
+/** Пароли ботов и ключ ИИ — точками: ни в лог, ни в консоль, ни сервису ИИ они попасть не должны. */
+function hideSecrets(text) {
+  let s = String(text === undefined || text === null ? '' : text);
+  const secrets = [config.loginPassword, config.aiKey, ...accountsOf(config).accounts.map((a) => a.password)];
+  for (const v of new Set(secrets.filter((x) => typeof x === 'string' && x.length >= 4))) s = s.split(v).join('••••');
+  return maskSecrets(s);
+}
+
+/** Строка ИИ-помощника: в консоль (с меткой «ИИ») и в лог. */
+function aiLog(level, text) {
+  const entry = { bot: null, nick: null, source: 'ai', time: Date.now(), level, text: hideSecrets(text) };
+  send('bot:log', entry);
+  appendLog('events', entry.time, `[ИИ] ${level.toUpperCase().padEnd(5)} ${entry.text}`);
+}
+
 function selectBot(id) {
   const b = fleet && fleet.get(id);
   if (b) selectedBot = b.bot;
@@ -190,7 +207,14 @@ function selectBot(id) {
 function registerIpc() {
   ipcMain.handle('app:init', () => {
     selectBot(selectedBot);
-    return { config: { ...config }, bots: fleet.list(), summary: fleet.summary(), selected: selectedBot, chat: chatHistory.get(selectedBot) || [] };
+    return {
+      config: { ...config },
+      bots: fleet.list(),
+      summary: fleet.summary(),
+      selected: selectedBot,
+      chat: chatHistory.get(selectedBot) || [],
+      ai: { running: Boolean(ai && ai.busy) },
+    };
   });
 
   ipcMain.handle('config:save', (_e, patch) => {
@@ -218,6 +242,7 @@ function registerIpc() {
   });
 
   ipcMain.handle('bots:stop', async (_e, { ids = null } = {}) => {
+    if (!ids && ai && ai.stop()) aiLog('warn', 'Останавливаю ИИ: «Стоп всех»');
     const stopped = await fleet.stop(Array.isArray(ids) ? ids : null);
     if (!ids && stopped > 1) uiLog('info', `Останавливаю ботов: ${stopped}`);
     return { ok: true, stopped };
@@ -267,6 +292,41 @@ function registerIpc() {
   });
 
   ipcMain.handle('viewer:open', () => openViewer());
+
+  // ИИ-помощник (src/ai.js): задание словами — ИИ сам отдаёт ботам команды. settings — поля ИИ из формы.
+  ipcMain.handle('ai:run', (_e, { task, settings = null } = {}) => {
+    if (settings) {
+      Object.assign(config, sanitize(settings));
+      saveConfig();
+    }
+    const text = hideSecrets(String(task || '').trim()).slice(0, 2000);
+    try {
+      ai.run(text).catch((err) => aiLog('error', errText(err)));
+    } catch (err) {
+      return { ok: false, error: errText(err) };
+    }
+    aiLog('info', `Задание: ${text} (модель ${config.aiModel})`);
+    return { ok: true };
+  });
+
+  ipcMain.handle('ai:stop', () => {
+    const stopped = ai.stop();
+    if (stopped) aiLog('warn', 'Останавливаю: новые команды ботам не уйдут, начатое бот бросит');
+    return stopped;
+  });
+
+  // Бесплатные модели сервиса, которые умеют вызывать инструменты (для подсказки в поле «Модель»).
+  ipcMain.handle('ai:models', async (_e, settings) => {
+    if (settings) {
+      Object.assign(config, sanitize(settings));
+      saveConfig();
+    }
+    try {
+      return { ok: true, models: await ai.listModels() };
+    } catch (err) {
+      return { ok: false, error: hideSecrets(errText(err)) };
+    }
+  });
 }
 
 function createWindow({ show = true } = {}) {
@@ -511,6 +571,40 @@ function createFleet() {
   return f;
 }
 
+// ---------- ИИ-помощник ----------
+
+function createAi() {
+  const agent = new AiAgent({
+    getConfig: () => config,
+    // Сеть Chromium, а не fetch из Node: прокси и сертификаты Windows (антивирус с проверкой HTTPS иначе мешает).
+    fetch: (url, opts) => net.fetch(url, opts),
+    env: {
+      listBots: () => fleet.list(),
+      // Ответы ботов уходят сервису ИИ — пароли из них (если вдруг попали) прячем.
+      runCommand: async (ids, line, signal) => (await fleet.commandEach(ids, line, { signal }))
+        .map((r) => ({ ...r, message: r.message.map(hideSecrets) })),
+      startBots: async (ids) => {
+        const problem = validate(config);
+        if (problem) throw new Error(problem);
+        return fleet.start(ids);
+      },
+      catalog: () => require('./bot/commands').catalog(), // список команд ботов — тот же, что #помощь
+    },
+  });
+  agent.on('action', ({ text }) => aiLog('info', text));
+  agent.on('thought', ({ text }) => aiLog('info', `«${text}»`));
+  agent.on('done', ({ text, partial, requests }) => {
+    aiLog(partial ? 'warn' : 'ok', `Итог (запросов к ИИ: ${requests}): ${text}`);
+    send('ai:done', { text: hideSecrets(text), partial, requests });
+  });
+  agent.on('error', ({ text }) => {
+    aiLog('error', `Не получилось: ${text}`);
+    send('ai:done', { text: hideSecrets(text), error: true });
+  });
+  agent.on('state', (s) => send('ai:state', s));
+  return agent;
+}
+
 function reportFatal(err) {
   uiLog('error', `Необработанная ошибка: ${errText(err)}`);
 }
@@ -534,6 +628,7 @@ function startApp() {
     loadConfig();
 
     fleet = createFleet();
+    ai = createAi();
     syncFleet(); // процессы ботов запускаются, когда нужны (по «Старт» или для экрана бота)
     selectBot(null);
 
@@ -553,6 +648,7 @@ function startApp() {
     event.preventDefault();
     if (quitting) return;
     quitting = true;
+    if (ai) ai.stop();
     Promise.resolve(fleet && fleet.shutdown())
       .catch(() => {})
       .finally(() => {
@@ -586,18 +682,22 @@ function runSelftest() {
     const nicks = count === 1 ? [nick] : Array.from({ length: count }, (_, i) => `${nick}${i + 1}`);
     Object.assign(config, { accounts: nicks.join('\n'), username: nicks[0], startInterval: interval });
     fleet = createFleet();
+    ai = createAi();
     syncFleet();
     selectBot(null);
     try {
       const client = await fleet.ensureClientOf(nicks[0]);
       const pong = await client.request('ping');
       const details = await client.request('selftest', {}, { timeoutMs: 60 * 1000 });
+      // ИИ-помощник: список команд ботов грузится в главном процессе (в exe — из app.asar), подсказка модели собирается.
+      const aiPrompt = require('./ai').systemPrompt(require('./bot/commands').catalog());
+      const aiCheck = { promptChars: aiPrompt.length, ok: aiPrompt.length > 1000 && aiPrompt.includes('#квесты') };
       registerIpc();
       createWindow({ show: false });
       const ui = await checkUi(nicks.length);
       const server = process.env.MBP_SELFTEST_SERVER ? await selftestOnServer(process.env.MBP_SELFTEST_SERVER, nicks, stay * 1000) : null;
       await fleet.shutdown();
-      finish({ ok: pong === 'pong' && ui.ok && (!server || server.online), ...details, ui, server }, 0);
+      finish({ ok: pong === 'pong' && ui.ok && aiCheck.ok && (!server || server.online), ...details, ui, ai: aiCheck, server }, 0);
     } catch (err) {
       finish({ ok: false, error: errText(err) }, 1);
     }
@@ -636,10 +736,11 @@ async function checkUi(expected) {
     mode.value = 'turn';
     mode.dispatchEvent(new Event('change'));
     out.placeholder = document.getElementById('chatInput').placeholder;
+    out.ai = Boolean(document.getElementById('aiRun') && document.getElementById('aiKey') && document.getElementById('aiModel').value);
     return out;
   })()`, true);
   const wantSelected = fleet.order.length > 1 ? fleet.get(fleet.order[1]).nick : fleet.order.length ? fleet.get(fleet.order[0]).nick : null;
-  return { ok: errors.length === 0 && result.bots === expected && result.selected === wantSelected, ...result, errors };
+  return { ok: errors.length === 0 && result.bots === expected && result.selected === wantSelected && result.ai, ...result, errors };
 }
 
 /** Память и процессор процессов ботов (Electron считает их сам): сколько уходит на бота. */

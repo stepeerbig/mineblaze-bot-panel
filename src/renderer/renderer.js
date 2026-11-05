@@ -36,6 +36,18 @@ const el = {
   guardOn: $('guardOn'),
   godOn: $('godOn'),
   whitelist: $('whitelist'),
+  aiTag: $('aiTag'),
+  aiTask: $('aiTask'),
+  aiRun: $('aiRun'),
+  aiStop: $('aiStop'),
+  aiResult: $('aiResult'),
+  aiSettings: $('aiSettings'),
+  aiKeyTag: $('aiKeyTag'),
+  aiKey: $('aiKey'),
+  showAiKey: $('showAiKey'),
+  aiModel: $('aiModel'),
+  aiModels: $('aiModels'),
+  aiBaseUrl: $('aiBaseUrl'),
   botList: $('botList'),
   botsCount: $('botsCount'),
   console: $('console'),
@@ -138,12 +150,12 @@ function appendLinkified(target, text) {
 
 const hiddenByFilter = (row) => el.onlySelected.checked && Boolean(row.dataset.bot) && row.dataset.bot !== selected;
 
-function addConsole({ bot = null, nick = null, time, level, text }) {
+function addConsole({ bot = null, nick = null, source = null, time, level, text }) {
   const lv = LEVELS.includes(level) ? level : 'info';
 
   // Одинаковые подряд идущие строки одного бота сворачиваем в «×N» (время — последнего повтора).
   const last = lastConsoleLine;
-  if (last && last.level === lv && last.text === text && last.bot === (bot || null) && el.console.lastElementChild === last.row) {
+  if (last && last.level === lv && last.text === text && last.bot === (bot || null) && last.source === (source || null) && el.console.lastElementChild === last.row) {
     last.count += 1;
     last.cnt.textContent = `×${last.count}`;
     last.ts.textContent = clock(time);
@@ -152,7 +164,13 @@ function addConsole({ bot = null, nick = null, time, level, text }) {
 
   const { row, ts, tx } = makeRow(time, `lv-${lv}`);
   row.dataset.bot = bot || '';
-  if (nick) {
+  if (source === 'ai') {
+    const tag = document.createElement('span');
+    tag.className = 'ai-tag';
+    tag.title = 'ИИ-помощник';
+    tag.textContent = 'ИИ';
+    tx.append(tag, ' ');
+  } else if (nick) {
     const tag = document.createElement('span');
     tag.className = 'who-tag';
     tag.dataset.bot = bot;
@@ -166,7 +184,7 @@ function addConsole({ bot = null, nick = null, time, level, text }) {
   row.appendChild(cnt);
   row.hidden = hiddenByFilter(row);
   pushRow(el.console, row);
-  lastConsoleLine = { level: lv, text, bot: bot || null, row, ts, cnt, count: 1 };
+  lastConsoleLine = { level: lv, text, bot: bot || null, source: source || null, row, ts, cnt, count: 1 };
 }
 
 function applyConsoleFilter() {
@@ -402,11 +420,80 @@ function fillForm(cfg) {
   el.guardOn.checked = cfg.guard !== false;
   el.godOn.checked = cfg.godMode !== false;
   if (document.activeElement !== el.whitelist) el.whitelist.value = cfg.whitelist || '';
+  for (const key of ['aiKey', 'aiModel', 'aiBaseUrl']) {
+    if (document.activeElement !== el[key]) el[key].value = cfg[key] || '';
+  }
   setAutoReconnectUi(cfg.autoReconnect);
   updateLabels();
   updateBotsTag();
   updateAutologinTag();
   updateGuardTag();
+  updateAiKeyTag();
+}
+
+// ---------- ИИ-помощник ----------
+
+const AI_LOCAL_RE = /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])/i; // ИИ на своём ПК — без ключа
+let aiRunning = false;
+let aiModelsLoaded = false;
+
+const readAiForm = () => ({ aiKey: el.aiKey.value, aiModel: el.aiModel.value, aiBaseUrl: el.aiBaseUrl.value });
+
+function updateAiKeyTag() {
+  const missing = !el.aiKey.value.trim() && !AI_LOCAL_RE.test(el.aiBaseUrl.value.trim());
+  el.aiKeyTag.hidden = !missing;
+  if (missing) el.aiSettings.open = true; // где вписать ключ — сразу видно
+}
+
+function showAiResult(text, kind) {
+  el.aiResult.textContent = text;
+  el.aiResult.className = `ai-result ${kind}`;
+  el.aiResult.hidden = !text;
+}
+
+function setAiRunning(on) {
+  aiRunning = Boolean(on);
+  el.aiRun.disabled = aiRunning;
+  el.aiStop.disabled = !aiRunning;
+  el.aiTag.textContent = aiRunning ? 'работает…' : '';
+  el.aiTag.className = 'tag busy';
+  el.aiTag.hidden = !aiRunning;
+}
+
+async function runAi() {
+  const task = el.aiTask.value.trim();
+  if (aiRunning) return;
+  if (!task) {
+    showAiResult('Напиши задание словами, например: «Сколько ботов в сети?»', 'warn');
+    el.aiTask.focus();
+    return;
+  }
+  el.aiRun.disabled = true; // защита от двойного клика
+  const r = await bridge.aiRun(task, readAiForm());
+  if (r && r.ok) {
+    setAiRunning(true);
+    showAiResult('Работаю… шаги — в консоли с меткой «ИИ»', 'busy');
+  } else {
+    el.aiRun.disabled = aiRunning;
+    showAiResult(`Не начато: ${(r && r.error) || 'неизвестная ошибка'}`, 'error');
+    updateAiKeyTag();
+  }
+}
+
+/** Подсказка в поле «Модель»: бесплатные модели сервиса, которые умеют вызывать инструменты. */
+async function loadAiModels() {
+  if (aiModelsLoaded) return;
+  aiModelsLoaded = true;
+  const r = await bridge.aiModels(readAiForm());
+  if (!r || !r.ok) {
+    aiModelsLoaded = false; // попробуем в следующий раз
+    return;
+  }
+  el.aiModels.replaceChildren(...r.models.map((id) => {
+    const o = document.createElement('option');
+    o.value = id;
+    return o;
+  }));
 }
 
 function readForm() {
@@ -541,6 +628,46 @@ el.whitelist.addEventListener('input', () => {
 });
 el.whitelist.addEventListener('change', saveWhitelist);
 
+el.aiRun.addEventListener('click', runAi);
+el.aiTask.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
+    runAi();
+  }
+});
+el.aiStop.addEventListener('click', async () => {
+  el.aiStop.disabled = true;
+  if (!(await bridge.aiStop())) setAiRunning(false);
+});
+
+// Ключ, модель и адрес сервиса сохраняются сразу (ключ — зашифрованным).
+for (const field of [el.aiKey, el.aiModel, el.aiBaseUrl]) {
+  field.addEventListener('change', async () => {
+    const before = `${el.aiBaseUrl.value}\n${el.aiKey.value}`;
+    const cfg = await bridge.saveConfig(readAiForm());
+    fillForm(cfg);
+    if (`${el.aiBaseUrl.value}\n${el.aiKey.value}` !== before) aiModelsLoaded = false; // другой сервис — другие модели
+  });
+}
+el.aiKey.addEventListener('input', updateAiKeyTag);
+el.aiBaseUrl.addEventListener('input', updateAiKeyTag);
+el.aiModel.addEventListener('focus', loadAiModels);
+
+el.showAiKey.addEventListener('click', () => {
+  const show = el.aiKey.type === 'password';
+  el.aiKey.type = show ? 'text' : 'password';
+  el.showAiKey.setAttribute('aria-pressed', String(show));
+  const label = show ? 'Скрыть ключ' : 'Показать ключ';
+  el.showAiKey.title = label;
+  el.showAiKey.setAttribute('aria-label', label);
+});
+
+bridge.onAiState(({ running }) => setAiRunning(running));
+bridge.onAiDone(({ text, partial, error, requests }) => {
+  const tail = Number.isFinite(requests) ? `\n\nЗапросов к ИИ: ${requests}` : '';
+  showAiResult(error ? `Не получилось: ${text}` : `${text}${tail}`, error ? 'error' : partial ? 'warn' : 'ok');
+});
+
 el.sendMode.addEventListener('change', updateSelectedUi);
 el.onlySelected.addEventListener('change', applyConsoleFilter);
 
@@ -585,9 +712,10 @@ bridge.onList(({ bots: list, selected: sel }) => {
   if (changed && sel) choose(sel);
 });
 
-bridge.init().then(({ config, bots: list, summary: s, selected: sel, chat }) => {
+bridge.init().then(({ config, bots: list, summary: s, selected: sel, chat, ai }) => {
   fillForm(config);
   renderList(list, sel);
   applySummary(s);
   renderChatHistory(chat);
+  setAiRunning(ai && ai.running);
 });

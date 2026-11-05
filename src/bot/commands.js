@@ -692,7 +692,12 @@ async function openNpcMenu(bot, npc) {
   try {
     e = findEntity(bot, npc);
   } catch (err) {
-    throw new CommandError(`рядом нет «${npc}» — сначала /warp ah (NPC стоят там), потом #сущности покажет, кто есть`);
+    // NPC не видно — они стоят у /warp ah: туда бот телепортируется сам (как в «#квесты принести»).
+    if (typeof bot.sendCommand !== 'function') {
+      throw new CommandError(`рядом нет «${npc}» — сначала /warp ah (NPC стоят там), потом #сущности покажет, кто есть`);
+    }
+    await ensureNpc(bot, npc);
+    e = findEntity(bot, npc);
   }
   if (bot.entity.position.distanceTo(e.position) > NPC_REACH) {
     try {

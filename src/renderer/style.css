@@ -271,6 +271,47 @@ summary:focus-visible {
 }
 
 .tag[hidden] { display: none; }
+.tag.warn { background: rgba(240, 180, 60, .16); color: var(--gold); }
+.tag.busy { background: rgba(107, 155, 255, .16); color: var(--lapis); }
+
+/* ИИ-помощник */
+.btn.ai-run { height: 36px; background: var(--lapis); color: #0b1530; font-size: 13px; }
+.btn.ai-run:hover:not(:disabled) { background: #8db2ff; }
+.btn.ai-stop { height: 36px; background: var(--cobble); color: var(--chalk); font-size: 13px; }
+.btn.ai-stop:hover:not(:disabled) { background: #4a3634; color: #f3b0ac; }
+
+.ai-result {
+  max-height: 240px;
+  padding: 8px 10px;
+  overflow-y: auto;
+  border-left: 2px solid var(--cobble);
+  border-radius: 4px;
+  background: var(--deepslate);
+  color: var(--chalk);
+  font-size: 12.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ai-result[hidden] { display: none; }
+.ai-result.busy { color: var(--dust); border-left-color: var(--lapis); }
+.ai-result.ok { border-left-color: var(--emerald); }
+.ai-result.warn { border-left-color: var(--gold); }
+.ai-result.error { border-left-color: var(--redstone); color: #f3b0ac; }
+
+/* Вложенная сворачиваемая группа (настройки ИИ) */
+.fold.sub > summary { color: var(--dust); font: 12.5px var(--ui); }
+.fold.sub > summary:hover { color: var(--chalk); }
+
+/* Метка «ИИ» у строк консоли */
+.ai-tag {
+  padding: 0 5px;
+  border-radius: 3px;
+  background: rgba(107, 155, 255, .16);
+  color: var(--lapis);
+  font: 600 11px/1.6 var(--ui);
+}
 
 .hint {
   margin: 0;

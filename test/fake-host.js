@@ -71,6 +71,13 @@ class FakeManager extends EventEmitter {
   say(text) {
     this.calls.push(`say:${text}`);
     this.emit('chat', { time: 1, text: `› ${text}`, motd: `› ${text}`, position: 'self', links: [] });
+    // serverReply(text) → [{ position, text }]: что «сервер» ответит в чат на команду «/…» (чуть позже, как настоящий).
+    if (this.serverReply && String(text).startsWith('/')) {
+      const replies = this.serverReply(text);
+      setTimeout(() => {
+        for (const r of replies) this.emit('chat', { time: 1, motd: r.text, links: [], ...r });
+      }, 5);
+    }
     return true;
   }
 

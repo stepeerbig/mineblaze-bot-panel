@@ -19,6 +19,10 @@ const DEFAULT_CONFIG = Object.freeze({
   startInterval: 5, // секунд между входами ботов
   viewDistance: 4, // дальность прорисовки, которую бот сообщает серверу: меньше чанков — меньше памяти на бота
   botsPerProcess: 10, // ботов в одном процессе: больше — тики начнут опаздывать, меньше — больше памяти на процессы
+  // ИИ-помощник (src/ai.js): любой сервис с OpenAI-совместимым API. Ключ хранится зашифрованным.
+  aiBaseUrl: 'https://openrouter.ai/api/v1',
+  aiKey: '',
+  aiModel: 'nvidia/nemotron-3-ultra-550b-a55b:free',
 });
 
 const MAX_WHITELIST_LENGTH = 5000;
@@ -30,6 +34,7 @@ const VIEWER_MODES = ['first', 'third'];
 const MAX_JOIN_COMMANDS = 10;
 const MAX_CHAT_LENGTH = 256;
 const NICK_RE = /^[A-Za-z0-9_]{3,16}$/;
+const AI_LOCAL_RE = /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?(?:\/\S*)?$/i; // сервис ИИ на своём ПК
 
 /** Приводит присланные значения к безопасному виду; неверные поля просто отбрасывает. */
 function sanitize(src) {
@@ -76,6 +81,14 @@ function sanitize(src) {
     const n = src[key] === undefined ? undefined : int(src[key], min, max);
     if (n !== undefined) out[key] = n;
   }
+  if (typeof src.aiBaseUrl === 'string') {
+    const url = src.aiBaseUrl.trim().replace(/\/+$/, '');
+    if (!url) out.aiBaseUrl = DEFAULT_CONFIG.aiBaseUrl;
+    // Ключ по сети — только через https; http — лишь на своём ПК (Ollama и т.п.).
+    else if (url.length <= 300 && (/^https:\/\/[^\s/]+(?:\/\S*)?$/i.test(url) || AI_LOCAL_RE.test(url))) out.aiBaseUrl = url;
+  }
+  if (typeof src.aiKey === 'string') out.aiKey = src.aiKey.replace(/\s+/g, '').slice(0, 300);
+  if (typeof src.aiModel === 'string') out.aiModel = src.aiModel.trim().replace(/\s+/g, '').slice(0, 200) || DEFAULT_CONFIG.aiModel;
   return out;
 }
 

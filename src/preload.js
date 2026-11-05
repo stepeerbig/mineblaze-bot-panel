@@ -18,6 +18,12 @@ contextBridge.exposeInMainWorld('api', {
   say: (text, mode) => ipcRenderer.invoke('bot:say', { text: String(text), mode: ['all', 'turn'].includes(mode) ? mode : 'one' }),
   openLogs: () => ipcRenderer.invoke('app:open-logs'),
   openViewer: () => ipcRenderer.invoke('viewer:open'), // окно «Экран бота» выбранного бота; true, если открылось
+  // ИИ-помощник: задание словами; settings — поля ИИ из формы (сохранить перед запуском). → { ok, error }
+  aiRun: (task, settings) => ipcRenderer.invoke('ai:run', { task: String(task || ''), settings: settings || null }),
+  aiStop: () => ipcRenderer.invoke('ai:stop'),
+  aiModels: (settings) => ipcRenderer.invoke('ai:models', settings || null), // → { ok, models: [название] }
+  onAiState: listen('ai:state'), // { running }
+  onAiDone: listen('ai:done'), // { text, partial, requests, error }
   onLog: listen('bot:log'),
   onChat: listen('bot:chat'),
   onState: listen('bot:state'), // { bot, nick, state }
