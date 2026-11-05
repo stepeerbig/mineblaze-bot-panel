@@ -17,7 +17,7 @@ const DEFAULT_TIMINGS = Object.freeze({
   crashWindow: 60 * 1000,
 });
 const MAX_CRASHES = 3; // столько аварий за минуту — и больше не перезапускаем: что-то сломано всерьёз
-const EVENTS = new Set(['log', 'chat', 'state', 'link', 'msa', 'want-connect', 'viewer-mode']);
+const EVENTS = new Set(['log', 'chat', 'state', 'link', 'msa', 'ping', 'want-connect', 'viewer-mode']);
 
 class BotClient extends EventEmitter {
   /**

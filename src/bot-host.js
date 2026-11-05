@@ -7,7 +7,8 @@
 //
 // Сообщения главного процесса: { id, type, payload } → ответ { id, ok: true, value } или { id, ok: false, error }.
 // События отсюда: { event, payload }; у событий бота в payload есть bot — его номер (ник маленькими буквами):
-//   log, chat, state { bot, state }, link, msa, want-connect { bot } — просится в общую очередь входа;
+//   log, chat, state { bot, state }, link, msa, ping { bot, ping } — пинг, как его считает сервер,
+//   want-connect { bot } — просится в общую очередь входа;
 //   viewer-mode — режим экрана переключили в его окне.
 
 const path = require('path');
@@ -87,6 +88,7 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
     manager.on('state', (state) => emit('state', { bot: id, state }));
     manager.on('link', (l) => emit('link', { bot: id, ...l }));
     manager.on('msa', (d) => emit('msa', { bot: id, ...d }));
+    manager.on('ping', (ping) => emit('ping', { bot: id, ping }));
     // Экран показывает своего бота: тот появился в мире или пропал — экран узнаёт сразу.
     manager.on('bot', (bot) => {
       if (viewer && viewerBot === id) viewer.setBot(bot);

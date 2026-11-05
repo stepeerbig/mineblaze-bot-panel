@@ -208,6 +208,35 @@ test('очередь входа: ждёт разрешения (queued), admit �
   assert.equal(bots.length, 1);
 });
 
+test('пинг бота (как его считает сервер) — событием; сервер раз за разом возвращает бота на место — предупреждение', async () => {
+  const { mgr, bots, logs } = setup();
+  const pings = [];
+  mgr.on('ping', (p) => pings.push(p));
+  mgr.start();
+  const b = bots[0];
+  b.username = 'Bot';
+  goOnline(b);
+  b.emit('playerJoined', { username: 'Other', ping: 5 });
+  b.emit('playerJoined', { username: 'Bot', ping: 0 });
+  b.emit('playerUpdated', { username: 'Bot', ping: 133 });
+  b.emit('playerUpdated', { username: 'Bot', ping: 133 });
+  assert.deepEqual(pings, [0, 133], 'только свой и только когда поменялся');
+  assert.equal(mgr.ping, 133);
+
+  const warned = () => lines(logs).filter((x) => x.includes('раз за разом возвращает бота на место')).length;
+  for (let i = 0; i < 7; i += 1) b.emit('forcedMove');
+  assert.equal(warned(), 0, 'несколько телепортов — нормально');
+  b.emit('forcedMove');
+  assert.equal(warned(), 1);
+  assert.ok(lines(logs).some((x) => x.startsWith('warn:Сервер раз за разом возвращает бота на место: 8 раз за 3 с — похоже, он застрял')));
+  for (let i = 0; i < 10; i += 1) b.emit('forcedMove');
+  assert.equal(warned(), 1, 'не чаще раза в 30 с');
+
+  mgr.stop();
+  await tick();
+  assert.deepEqual(pings, [0, 133, null], 'не в сети — пинга нет');
+});
+
 test('повторное нажатие «Стоп» не дублирует остановку', () => {
   const { mgr, bots, logs } = setup();
   mgr.start();

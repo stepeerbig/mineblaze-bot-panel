@@ -369,6 +369,10 @@ summary:focus-visible {
 }
 
 .bot:hover { border-color: #4f5560; }
+.bot .ping { color: var(--dust); font-size: 11px; }
+.bot .ping:empty { display: none; }
+.bot .ping.slow { color: var(--gold); }
+.bot .ping.bad { color: var(--redstone); }
 .bot[data-state="offline"] .nick { color: var(--dust); }
 .bot.is-selected { border-color: var(--lapis); box-shadow: inset 0 0 0 1px var(--lapis); }
 

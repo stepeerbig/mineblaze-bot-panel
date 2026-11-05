@@ -9,7 +9,7 @@ const path = require('node:path');
 const { Vec3 } = require('vec3');
 const { fakeClock, makeWorld, physicsBot, autoServer, teleport, take, runFor, VERSION } = require('./fake-bot');
 
-const { runCommand, catalog, COMMANDS, parseCoord, parseBlockPos, itemTest, storageArgs } = require(path.join(__dirname, '..', 'src', 'bot', 'commands.js'));
+const { runCommand, catalog, COMMANDS, parseCoord, parseBlockPos, itemTest, storageArgs, pingReport } = require(path.join(__dirname, '..', 'src', 'bot', 'commands.js'));
 
 /** Бот стоит в 0.5 64 0.5 на камне, смотрит на юг (+z). players: [{ name, at: [x, y, z] }], inventory: [[имя, кол-во]]. */
 function setup({ players = [], farPlayers = [], chests = {}, storage = {}, inventory = [], entities = [], npcs = {}, onClick = null } = {}) {
@@ -752,6 +752,42 @@ test('команды: Фермер 4-го уровня — заданий бол
 
   // Условие Фермера у Оружейника теперь выполнено.
   assert.equal((await s.run('#квесты оружейник')).message[1], '[10] Рекомендация от Фермера. — выполнено, Прокачайте Фермера до 4 уровня: 4/4');
+});
+
+test('команды: #пинг — замер ботом (ping_request → ping_response, как график в F3) и пинг из Tab; действие бота не прерывает', async () => {
+  const { bot } = setup();
+  bot._client.state = 'play';
+  const write = bot._client.write;
+  const echo = (name, params) => {
+    write(name, params);
+    if (name === 'ping_request') setImmediate(() => bot._client.emit('ping_response', { id: params.id }));
+  };
+  bot._client.write = echo;
+  bot.player = { username: 'Bot', ping: 133 };
+  let interrupted = false;
+  bot.actions.wait(60000).catch(() => { interrupted = true; }); // бот чем-то занят
+  const logs = [];
+  const r = await runCommand(bot, '#пинг', (level, text) => logs.push(`${level}:${text}`));
+  assert.equal(r.ok, true, [].concat(r.message).join('\n'));
+  assert.equal(r.data.samples.length, 3);
+  assert.ok(r.data.best < 50, String(r.data.best));
+  assert.equal(r.data.shown, 133);
+  assert.match(r.message[0], /^Замер ботом: \d+, \d+, \d+ мс — столько пакет идёт до сервера и обратно/);
+  assert.equal(r.message[1], 'Пинг в Tab: 133 мс — так его считает сервер');
+  assert.equal(r.message[2], 'Связь у бота быстрая — лишнее в Tab добавляет сам сервер, когда считает пинг бота (не сеть и не панель)');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(interrupted, false, 'замер не прерывает дело бота');
+  assert.ok(logs.every((l) => l.startsWith('info:')), 'просто сведения — не ошибка');
+
+  // Сервер не отвечает — так и пишет, а лишний раз не ждёт.
+  bot._client.write = write;
+  const silent = await pingReport(bot, { timeoutMs: 30, gapMs: 1 });
+  assert.equal(silent.message[0], 'Замер ботом: сервер не ответил за 0.03 с');
+  assert.deepEqual(silent.data.samples, []);
+
+  bot._client.state = 'configuration';
+  assert.match((await runCommand(bot, '#пинг')).message, /бот сейчас не в игре/);
+  bot.actions.stop();
 });
 
 test('команды: сундук на чужой территории — сервер не даёт открыть, бот так и пишет', async () => {

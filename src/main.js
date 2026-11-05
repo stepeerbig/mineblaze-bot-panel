@@ -468,6 +468,7 @@ function createFleet() {
     logChat(msg);
   });
   f.on('state', (s) => send('bot:state', s));
+  f.on('ping', (p) => send('bot:ping', p)); // пинг бота, как его считает сервер (Tab)
   f.on('summary', (s) => send('fleet:summary', s));
   f.on('list', (bots) => {
     for (const id of [...chatHistory.keys()]) if (!f.get(id)) chatHistory.delete(id);

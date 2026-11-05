@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('api', {
   onLog: listen('bot:log'),
   onChat: listen('bot:chat'),
   onState: listen('bot:state'), // { bot, nick, state }
+  onPing: listen('bot:ping'), // { bot, nick, ping } — пинг, как его считает сервер (Tab)
   onSummary: listen('fleet:summary'), // { total, online, … }
   onList: listen('fleet:list'), // { bots: [{ bot, nick, state }], selected }
 });

@@ -1507,6 +1507,76 @@ async function cmdNearby({ bot }) {
   };
 }
 
+// ---------- пинг ----------
+
+const PING_SAMPLES = 3;
+const PING_TIMEOUT_MS = 3000;
+const { performance } = require('perf_hooks');
+const lowId = (v) => (Array.isArray(v) ? v[1] : typeof v === 'bigint' ? Number(BigInt.asIntN(32, v)) : Number(v));
+
+/**
+ * Один замер: ping_request → ping_response — тем же пакетом обычный клиент рисует график пинга в F3; сервер
+ * отвечает сразу. Миллисекунды туда и обратно или null (не ответил).
+ */
+function measureRtt(bot, timeoutMs = PING_TIMEOUT_MS) {
+  const client = bot._client;
+  if (!client || typeof client.write !== 'function' || typeof client.on !== 'function') return Promise.resolve(null);
+  const id = 1 + Math.floor(Math.random() * 0x7ffffffe);
+  return new Promise((resolve) => {
+    let timer = null;
+    const started = performance.now();
+    const onPong = (packet) => {
+      if (packet && lowId(packet.id) === id) done(Math.round(performance.now() - started));
+    };
+    function done(value) {
+      clearTimeout(timer);
+      client.removeListener('ping_response', onPong);
+      resolve(value);
+    }
+    timer = setTimeout(() => done(null), timeoutMs);
+    client.on('ping_response', onPong);
+    try {
+      client.write('ping_request', { id: [0, id] });
+    } catch (_) {
+      done(null);
+    }
+  });
+}
+
+/**
+ * Пинг бота: несколько замеров самим ботом и пинг из Tab (как считает сервер), с выводом, где задержка.
+ * Ждёт обычными таймерами, а не bot.actions.wait: замер не должен прерывать то, что бот делает.
+ */
+async function pingReport(bot, { samples: count = PING_SAMPLES, timeoutMs = PING_TIMEOUT_MS, gapMs = 250 } = {}) {
+  const samples = [];
+  for (let i = 0; i < count; i += 1) {
+    if (i) await new Promise((r) => setTimeout(r, gapMs));
+    const rtt = await measureRtt(bot, timeoutMs);
+    if (rtt === null) break; // не ответил — ждать ещё раз бессмысленно
+    samples.push(rtt);
+  }
+  const shown = bot.player && Number.isFinite(bot.player.ping) ? bot.player.ping : null;
+  const best = samples.length ? Math.min(...samples) : null;
+  const lines = [
+    best === null
+      ? `Замер ботом: сервер не ответил за ${timeoutMs / 1000} с`
+      : `Замер ботом: ${samples.join(', ')} мс — столько пакет идёт до сервера и обратно (как график пинга в F3)`,
+    shown === null ? 'Пинг в Tab: сервер его ещё не прислал' : `Пинг в Tab: ${shown} мс — так его считает сервер`,
+  ];
+  if (best !== null && shown !== null && shown > best * 2 + 40) {
+    lines.push('Связь у бота быстрая — лишнее в Tab добавляет сам сервер, когда считает пинг бота (не сеть и не панель)');
+  } else if (best !== null && best > 120) {
+    lines.push('Пакеты бота правда идут долго: задержка на пути до сервера');
+  }
+  return { ok: true, message: lines, data: { samples, best, shown } };
+}
+
+/** «#пинг»: сколько на самом деле идут пакеты бота (замер ботом) и какой пинг показывает сервер в Tab. */
+async function cmdPing({ bot }) {
+  if (!bot._client || bot._client.state !== 'play') throw new CommandError('бот сейчас не в игре (переходит на другой сервер?) — попробуй через пару секунд');
+  return pingReport(bot);
+}
+
 async function cmdStop({ bot }) {
   const had = bot.actions.stop();
   return { ok: true, message: had ? 'Остановлено' : 'Бот ничего не делал', data: { stopped: had } };
@@ -1601,6 +1671,14 @@ const COMMANDS = [
   { name: 'возьми', aliases: ['equip', 'вруку'], usage: ['#возьми <предмет>'], about: 'взять в руку; можно по-русски: земля, булыжник, доски, кирка, меч… («из сундука» — как #достань)', run: cmdEquip },
   { name: 'инвентарь', aliases: ['inv', 'инв'], usage: ['#инвентарь'], about: 'что у бота в руке и в инвентаре', observe: true, run: cmdInventory },
   { name: 'рядом', aliases: ['near', 'кто'], usage: ['#рядом'], about: 'игроки и сундуки поблизости', observe: true, run: cmdNearby },
+  {
+    name: 'пинг',
+    aliases: ['ping', 'задержка'],
+    usage: ['#пинг'],
+    about: 'задержка связи: замер самим ботом (как график пинга в F3) и пинг, который показывает сервер в Tab',
+    observe: true,
+    run: cmdPing,
+  },
   { name: 'стоп', aliases: ['stop', 'хватит', 'стой'], usage: ['#стоп'], about: 'остановить действие', run: cmdStop },
   {
     name: 'квесты',
@@ -1671,4 +1749,4 @@ async function runCommand(bot, line, log = () => {}) {
   return result;
 }
 
-module.exports = { runCommand, catalog, findCommand, findItem, itemTest, storageArgs, parseCoord, parseBlockPos, f3Yaw, f3Pitch, COMMANDS };
+module.exports = { runCommand, catalog, findCommand, findItem, itemTest, storageArgs, parseCoord, parseBlockPos, f3Yaw, f3Pitch, pingReport, COMMANDS };

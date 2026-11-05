@@ -19,7 +19,7 @@ function makeClient(over = {}) {
     timings: { restartDelay: 10, requestTimeout: over.requestTimeout || 2000, shutdownTimeout: 200 },
   });
   const events = [];
-  for (const name of ['log', 'chat', 'state', 'want-connect', 'viewer-mode', 'crash', 'restarted']) client.on(name, (p) => events.push([name, p]));
+  for (const name of ['log', 'chat', 'state', 'ping', 'want-connect', 'viewer-mode', 'crash', 'restarted']) client.on(name, (p) => events.push([name, p]));
   return { client, mem, events, config };
 }
 
@@ -58,6 +58,9 @@ test('процесс ботов: несколько ботов — свои ни
   assert.equal(await client.request('say', { bot: 'farm02', text: '#pos' }), true);
   await flush();
   assert.ok(events.some(([n, p]) => n === 'chat' && p.bot === 'farm02' && p.text === '› #pos'));
+  b.emit('ping', 87); // пинг, как его считает сервер
+  await flush();
+  assert.ok(events.some(([n, p]) => n === 'ping' && p.bot === 'farm02' && p.ping === 87));
 
   // Автореконнект — у всех ботов процесса, без строки в консоль от каждого.
   assert.equal(await client.request('autoReconnect', { on: true }), true);

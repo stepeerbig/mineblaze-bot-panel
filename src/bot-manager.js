@@ -23,6 +23,11 @@ const SILENCE_STUCK_BYTES = 256; // столько пришло за тишин�
 // Режим бога: проверить через столько после команд входа и после перехода на другой сервер.
 const GOD_AFTER_JOIN_MS = 4000;
 const GOD_AFTER_SWITCH_MS = 3000;
+// Сервер возвращает бота на место (телепорт) столько раз за SETBACK_WINDOW_MS — бот застрял: в блоках, в другом
+// игроке, в воде. Обычный клиент так не дёргается, и MineBlaze за это выкидывает в лобби («Кажется вы залагали»).
+const SETBACK_LIMIT = 8;
+const SETBACK_WINDOW_MS = 3000;
+const SETBACK_WARN_EVERY_MS = 30 * 1000;
 
 const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
 
@@ -126,6 +131,7 @@ const MAX_LINKS_PER_SESSION = 30; // чтобы спам ссылками не �
  *   'msa'   { verification_uri, user_code }                                  (вход через Microsoft)
  *   'bot'   bot | null   бот появился в мире / пропал (для «Экрана бота»; без повторов, см. getBot)
  *   'link'  { time, url, source }   сервер прислал ссылку для человека (например, проверка «я не робот»)
+ *   'ping'  мс | null   пинг бота, как его считает сервер (он же — в Tab у игроков); null — бот не в сети
  */
 class BotManager extends EventEmitter {
   /**
@@ -160,6 +166,7 @@ class BotManager extends EventEmitter {
     this.attempt = 0;
     this.announced = null; // какой бот последним объявлен событием 'bot'
     this.godMemory = new Map(); // ник → был ли включён режим бога (сервер помнит его и после перезахода)
+    this.ping = null; // пинг, как его считает сервер (см. событие 'ping')
   }
 
   /** Журнал пакетов последней сессии (или null, если бот ещё не запускался). */
@@ -492,8 +499,16 @@ class BotManager extends EventEmitter {
     // и охрана с режимом бога видят их так же.
     bot.sendCommand = (cmd) => (alive() && s.loggedIn && !s.stopping ? this._send(s, cmd) : false);
     bot.on('forcedMove', () => {
-      if (alive()) s.guard.onTeleport();
+      if (!alive()) return;
+      s.guard.onTeleport();
+      this._countSetback(s);
     });
+    // Пинг бота, как его считает сервер (он же — в Tab у игроков): сервер обновляет его раз в несколько секунд.
+    const onPlayer = (p) => {
+      if (alive() && p && p.username === bot.username) this._setPing(p.ping);
+    };
+    bot.on('playerJoined', onPlayer);
+    bot.on('playerUpdated', onPlayer);
     bot.on('respawn', () => {
       if (alive()) s.guard.onTeleport();
     });
@@ -714,6 +729,31 @@ class BotManager extends EventEmitter {
     return out;
   }
 
+  _setPing(ping) {
+    const value = Number.isFinite(ping) ? ping : null;
+    if (value === this.ping) return;
+    this.ping = value;
+    this.emit('ping', value);
+  }
+
+  /**
+   * Сервер телепортировал бота. Изредка — нормально (вход, /home, /spawn); раз за разом подряд — бот застрял
+   * (сервер не принимает его движение и возвращает назад). Сказать в консоль, пока за это не выкинули.
+   */
+  _countSetback(s) {
+    if (s.switching || !s.spawned) return;
+    const now = Date.now();
+    s.setbacks = (s.setbacks || []).filter((t) => now - t < SETBACK_WINDOW_MS);
+    s.setbacks.push(now);
+    if (s.setbacks.length < SETBACK_LIMIT || now - (s.setbackWarnedAt || 0) < SETBACK_WARN_EVERY_MS) return;
+    s.setbackWarnedAt = now;
+    const pos = s.bot && s.bot.entity && s.bot.entity.position;
+    const where = pos ? ` (${Math.floor(pos.x)} ${Math.floor(pos.y)} ${Math.floor(pos.z)})` : '';
+    this.log('warn', `Сервер раз за разом возвращает бота на место${where}: ${s.setbacks.length} раз за ${SETBACK_WINDOW_MS / 1000} с — похоже, ` +
+      'он застрял (в блоках, в другом игроке, в воде). За это MineBlaze выкидывает «за лаги» — уведи бота: /spawn или /home');
+    if (s.journal) s.journal.mark(`Сервер возвращает бота на место: ${s.setbacks.length} раз за ${SETBACK_WINDOW_MS} мс`);
+  }
+
   /** Сервер вернул бота в лобби (прокси пишет об этом в чат): это тот же кик, только без разрыва соединения. */
   _onForcedMove(s, reason) {
     const now = Date.now();
@@ -871,6 +911,7 @@ class BotManager extends EventEmitter {
     this._clearTimers(s);
     this.cur = null;
     this._announceBot();
+    this._setPing(null);
 
     const manual = !this.wantRun;
 

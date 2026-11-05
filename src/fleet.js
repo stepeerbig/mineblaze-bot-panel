@@ -85,11 +85,11 @@ class Fleet extends EventEmitter {
     this._summary();
   }
 
-  /** Боты по порядку: [{ bot, nick, state, worker }]. */
+  /** Боты по порядку: [{ bot, nick, state, worker, ping }]. */
   list() {
     return this.order.map((id) => {
       const b = this.bots.get(id);
-      return { bot: id, nick: b.nick, state: b.state, worker: b.worker };
+      return { bot: id, nick: b.nick, state: b.state, worker: b.worker, ping: b.ping === undefined ? null : b.ping };
     });
   }
 
@@ -318,6 +318,12 @@ class Fleet extends EventEmitter {
     client.on('state', (p) => this._onState(p && p.bot, p && p.state));
     client.on('link', (l) => this._emitBot('link', l));
     client.on('msa', (d) => this._emitBot('msa', d));
+    client.on('ping', (p) => {
+      const b = p && this.bots.get(p.bot);
+      if (!b) return;
+      b.ping = Number.isFinite(p.ping) ? p.ping : null;
+      this.emit('ping', { bot: b.bot, nick: b.nick, ping: b.ping });
+    });
     client.on('want-connect', (p) => this._enqueue(p && p.bot));
     client.on('viewer-mode', (mode) => this.emit('viewer-mode', mode));
     client.on('output', (o) => this.emit('output', { worker: index, ...o }));
@@ -330,6 +336,7 @@ class Fleet extends EventEmitter {
     const b = this.bots.get(id);
     if (!b || !state || b.state === state) return;
     b.state = state;
+    if (state === 'offline') b.ping = null;
     this.emit('state', { bot: id, nick: b.nick, state });
     this._summary();
   }

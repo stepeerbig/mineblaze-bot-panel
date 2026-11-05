@@ -151,6 +151,13 @@ test('флот: события ботов — с ником; убранный и
   await fleet.start();
   assert.ok(await waitFor(() => fleet.summary().online === 2));
   assert.ok(events.some(([n, p]) => n === 'log' && p.bot === 'farm02' && p.nick === 'Farm02' && p.text === 'В сети: бот появился в мире'));
+  // Пинг (как считает сервер) — у бота в списке; не в сети — пинга нет.
+  managerOf('Farm01').emit('ping', 133);
+  assert.ok(await waitFor(() => fleet.get('Farm01').ping === 133));
+  assert.equal(fleet.list()[0].ping, 133);
+  managerOf('Farm01').stop();
+  assert.ok(await waitFor(() => fleet.get('Farm01').state === 'offline'));
+  assert.equal(fleet.get('Farm01').ping, null);
   const gone = managerOf('Farm02');
   fleet.setAccounts(accounts(1));
   assert.ok(await waitFor(() => gone.calls.includes('shutdown')));

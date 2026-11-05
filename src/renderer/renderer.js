@@ -223,6 +223,18 @@ function renderChatHistory(list) {
 // ---------- список ботов ----------
 
 const stateTitle = (state) => STATE_TITLES[state] || state || '';
+const inGame = (b) => b.state === 'online' || b.state === 'connected';
+// Пинг бота, как его считает сервер (то же число, что у игроков в Tab); не в сети — не показываем.
+const pingOf = (b) => (inGame(b) && Number.isFinite(b.ping) ? b.ping : null);
+const chipTitle = (b) => `${b.nick} — ${stateTitle(b.state)}${pingOf(b) === null ? '' : `, пинг ${pingOf(b)} мс (так его считает сервер)`}`;
+
+function showPing(b) {
+  const ping = pingOf(b);
+  b.pingEl.textContent = ping === null ? '' : String(ping);
+  b.pingEl.classList.toggle('slow', ping !== null && ping >= 150 && ping < 300);
+  b.pingEl.classList.toggle('bad', ping !== null && ping >= 300);
+  b.chip.title = chipTitle(b);
+}
 
 function renderList(list, sel) {
   bots.clear();
@@ -240,9 +252,12 @@ function renderList(list, sel) {
     const name = document.createElement('span');
     name.className = 'nick';
     name.textContent = item.nick;
-    chip.append(dot, name);
-    chip.title = `${item.nick} — ${stateTitle(item.state)}`;
-    bots.set(item.bot, { bot: item.bot, nick: item.nick, state: item.state, chip, dot });
+    const pingEl = document.createElement('span');
+    pingEl.className = 'ping';
+    chip.append(dot, name, pingEl);
+    const b = { bot: item.bot, nick: item.nick, state: item.state, ping: item.ping, chip, dot, pingEl };
+    showPing(b);
+    bots.set(item.bot, b);
     chips.push(chip);
   }
   el.botList.replaceChildren(...chips);
@@ -273,14 +288,23 @@ function updateBot({ bot, state }) {
   b.state = state;
   b.chip.dataset.state = state;
   b.dot.dataset.state = state;
-  b.chip.title = `${b.nick} — ${stateTitle(state)}`;
+  showPing(b);
+  if (bot === selected) updateSelectedUi();
+}
+
+function updatePing({ bot, ping }) {
+  const b = bots.get(bot);
+  if (!b) return;
+  b.ping = ping;
+  showPing(b);
   if (bot === selected) updateSelectedUi();
 }
 
 /** Шапка чата, кнопки выбранного бота и строка ввода. */
 function updateSelectedUi() {
   const b = bots.get(selected);
-  el.chatWho.textContent = b ? `${b.nick} · ${stateTitle(b.state)}` : '— выбери бота в списке';
+  const ping = b ? pingOf(b) : null;
+  el.chatWho.textContent = b ? `${b.nick} · ${stateTitle(b.state)}${ping === null ? '' : ` · пинг ${ping} мс`}` : '— выбери бота в списке';
   el.botStart.disabled = !b || b.state !== 'offline';
   el.botStop.disabled = !b || b.state === 'offline';
   const all = el.toAll.checked;
@@ -552,6 +576,7 @@ el.openLogs.addEventListener('click', () => bridge.openLogs());
 bridge.onLog(addConsole);
 bridge.onChat(addChat);
 bridge.onState(updateBot);
+bridge.onPing(updatePing);
 bridge.onSummary(applySummary);
 bridge.onList(({ bots: list, selected: sel }) => {
   const changed = sel !== selected;
