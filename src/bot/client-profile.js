@@ -39,20 +39,28 @@ function encodeString(text) {
   return Buffer.concat([Buffer.from(len), bytes]);
 }
 
-/** Опции createBot: настройки для фазы настройки (их шлёт minecraft-protocol) и бренд. */
-function profileOptions() {
-  return { brand: BRAND, clientSettings: { ...CLIENT_SETTINGS } };
+/**
+ * Опции createBot: настройки для фазы настройки (их шлёт minecraft-protocol) и бренд.
+ * viewDistance — дальность прорисовки (2–32 чанка): сервер присылает чанки не дальше неё, так что у множества
+ * ботов это главное, сколько памяти уходит на мир каждого (обычные игроки на слабых ПК тоже ставят 2–6).
+ */
+function profileOptions({ viewDistance } = {}) {
+  const clientSettings = { ...CLIENT_SETTINGS };
+  if (Number.isInteger(viewDistance) && viewDistance >= 2 && viewDistance <= 32) clientSettings.viewDistance = viewDistance;
+  return { brand: BRAND, clientSettings };
 }
 
 /**
  * Плагин вместо встроенного settings из mineflayer: то же bot.settings и bot.setSettings(), но настройки не
  * отправляются заново после каждого входа в мир — только когда их меняют через bot.setSettings().
+ * Дальность прорисовки — та же, что ушла серверу при входе (options.clientSettings, см. profileOptions).
  */
-function settingsPlugin(bot) {
+function settingsPlugin(bot, options = {}) {
+  const sent = options && options.clientSettings ? options.clientSettings : {};
   bot.settings = {
     chat: 'enabled',
     colorsEnabled: CLIENT_SETTINGS.chatColors,
-    viewDistance: CLIENT_SETTINGS.viewDistance,
+    viewDistance: sent.viewDistance || CLIENT_SETTINGS.viewDistance,
     difficulty: 2,
     skinParts: {
       showCape: true,

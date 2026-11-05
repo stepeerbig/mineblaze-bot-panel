@@ -11,6 +11,8 @@
 //                                                  (часть пути бегом), копает и ставит блоки (площадку готовит сам)
 //         npm run stand:check -- --electron      — бот заходит через настоящий Electron (как в панели: главный
 //                                                  процесс + процесс бота); --electron=<путь к exe> — через сборку
+//         npm run stand:check -- --electron --bots=24 — 24 бота сразу (StandBot1…24, входят по одному в секунду):
+//                                                  все ли вошли и простояли, память и процессор на бота
 //         npm run stand:check -- --clicks        — клики в меню: бот берёт из сундука предметы с названиями,
 //                                                  описаниями, зачарованиями… и кладёт обратно; сервер не должен
 //                                                  ничего поправлять (значит, «отпечатки» предметов как у игры);
@@ -42,6 +44,9 @@ const CLICKS = ARGS.includes('--clicks');
 const ELECTRON_ARG = ARGS.find((a) => a === '--electron' || a.startsWith('--electron='));
 const ELECTRON = Boolean(ELECTRON_ARG);
 const ELECTRON_EXE = ELECTRON_ARG && ELECTRON_ARG.includes('=') ? ELECTRON_ARG.slice(ELECTRON_ARG.indexOf('=') + 1).replace(/^"|"$/g, '') : '';
+const BOTS_ARG = ARGS.find((a) => a.startsWith('--bots='));
+const BOTS = BOTS_ARG ? Math.max(1, Math.min(200, parseInt(BOTS_ARG.slice('--bots='.length), 10) || 1)) : 1;
+const isStandBot = (name) => name === BOT_NAME || (BOTS > 1 && new RegExp(`^${BOT_NAME}\\d+$`).test(name));
 const ROOT = path.join(__dirname, '..');
 const STAY_MS = Math.max(5, parseInt(ARGS.find((a) => /^\d+$/.test(a)), 10) || (SCENARIO || CLICKS ? 10 : 60)) * 1000;
 const LEGACY = ARGS.includes('--legacy');
@@ -122,7 +127,7 @@ function summarize(logText) {
   const other = [];
   for (const line of logText.split(/\r?\n/).map(clean)) {
     const alert = line.match(GRIM_ALERT);
-    if (alert && alert[1] === BOT_NAME) {
+    if (alert && isStandBot(alert[1])) {
       const c = checks.get(alert[2]) || { alerts: 0, maxVl: 0, lastDetails: '' };
       c.alerts += 1;
       c.maxVl = Math.max(c.maxVl, Number(alert[3]));
@@ -445,6 +450,8 @@ function runElectron(host, port, version) {
       MBP_SELFTEST_STAY: String(STAY_MS / 1000),
       MBP_SELFTEST_VERSION: version,
       MBP_SELFTEST_NICK: BOT_NAME,
+      MBP_SELFTEST_BOTS: String(BOTS),
+      MBP_SELFTEST_INTERVAL: '1',
     };
     delete env.ELECTRON_RUN_AS_NODE; // иначе Electron запустится как обычный Node (так бывает в терминале VS Code)
     const file = ELECTRON_EXE ? path.resolve(ELECTRON_EXE) : path.join(ROOT, 'node_modules', 'electron', 'dist', 'electron.exe');
@@ -466,6 +473,12 @@ function runElectron(host, port, version) {
       else if (r.error) problem = r.error;
       else if (!s || !s.online) problem = 'бот не продержался на сервере всё время';
       const kick = s ? s.logs.find((l) => l.startsWith('kick: ')) : null;
+      if (s && s.bots > 1) {
+        console.log(`  [боты] вошли ${s.joined} из ${s.bots}, простояли ${s.stayed}`);
+        const m = s.memory || {};
+        for (const p of m.processes || []) console.log(`  [процесс] ${p.name}: память ${p.memoryMB} МБ (своя ${p.privateMB} МБ), процессор ${p.cpu}%`);
+        console.log(`  [память] процессы ботов ${m.botsMB} МБ — на бота ≈ ${m.perBotMB} МБ; вся программа ${m.appMB} МБ`);
+      }
       resolve({ online: Boolean(s && s.states.includes('online')), onlineMs: s ? s.stayMs : 0, kick: kick ? kick.slice(6) : null, problem, stats: s ? s.stats : null });
     });
   });
@@ -558,7 +571,11 @@ function runBot(host, port, version, cmd) {
 }
 
 async function main() {
-  const unknown = ARGS.filter((a) => a.startsWith('-') && !KNOWN_FLAGS.has(a) && !a.startsWith('--electron='));
+  const unknown = ARGS.filter((a) => a.startsWith('-') && !KNOWN_FLAGS.has(a) && !a.startsWith('--electron=') && !a.startsWith('--bots='));
+  if (BOTS > 1 && !ELECTRON) {
+    console.error('--bots=N — только вместе с --electron (боты заходят через панель, как «Старт всех»)');
+    return 2;
+  }
   if (ELECTRON && (SCENARIO || CLICKS || ARGS.some((a) => /^--(legacy|no-)/.test(a)))) {
     console.error('--electron проверяет бота таким, какой он в панели: без --scenario, --clicks, --legacy и --no-…');
     return 2;

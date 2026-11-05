@@ -31,7 +31,7 @@ body {
 
 .app {
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr);
+  grid-template-columns: 320px minmax(0, 1fr);
   height: 100%;
 }
 
@@ -323,12 +323,92 @@ summary:focus-visible {
 
 .main {
   display: grid;
-  grid-template-rows: minmax(130px, 2fr) minmax(200px, 3fr);
+  grid-template-rows: auto minmax(120px, 2fr) minmax(180px, 3fr);
   gap: 1px;
   min-width: 0;
   min-height: 0;
   background: var(--cobble);
 }
+
+/* ---------- список ботов ---------- */
+
+.bot-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: 6px;
+  max-height: 26vh;
+  padding: 4px 16px 12px;
+  overflow-y: auto;
+}
+
+.bot-list:empty::before {
+  content: attr(data-empty);
+  color: var(--dust);
+  font: 13px var(--ui);
+}
+
+.bot-list::-webkit-scrollbar { width: 12px; }
+.bot-list::-webkit-scrollbar-thumb {
+  background: var(--cobble);
+  border: 3px solid var(--deepslate);
+  border-radius: 6px;
+}
+
+.bot {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border: 1px solid var(--cobble);
+  border-radius: 5px;
+  background: var(--slate);
+  color: var(--chalk);
+  font: 12.5px/1.5 var(--mono);
+  cursor: pointer;
+}
+
+.bot:hover { border-color: #4f5560; }
+.bot[data-state="offline"] .nick { color: var(--dust); }
+.bot.is-selected { border-color: var(--lapis); box-shadow: inset 0 0 0 1px var(--lapis); }
+
+/* Точка состояния бота — как лампа слева, только маленькая */
+.dot {
+  display: inline-block;
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: #4a4136;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .35);
+}
+
+.dot[data-state="online"] { background: #f4d36b; box-shadow: 0 0 6px rgba(244, 211, 107, .6); }
+.dot[data-state="connecting"],
+.dot[data-state="connected"] { background: #d9992f; animation: pulse 1.3s ease-in-out infinite; }
+.dot[data-state="queued"] { background: var(--lapis); }
+.dot[data-state="reconnecting"] { background: #b5473e; animation: pulse 2.2s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .dot { animation: none !important; }
+}
+
+.legend { gap: 12px; color: var(--dust); font-size: 11.5px; }
+.legend span { display: inline-flex; align-items: center; gap: 5px; }
+
+.count { margin-left: 6px; color: var(--dust); font-weight: 400; }
+.who { margin-left: 6px; color: var(--lapis); font-weight: 600; }
+
+/* Ник бота в строке консоли: нажать — выбрать этого бота */
+.who-tag { color: var(--lapis); cursor: pointer; }
+.who-tag:hover { text-decoration: underline; }
+
+.check.small { align-items: center; gap: 6px; color: var(--dust); font-size: 12px; }
+.check.small input { width: 13px; height: 13px; margin: 0; }
+
+.link:disabled { opacity: .35; cursor: not-allowed; }
+.act-start:not(:disabled) { color: var(--emerald); }
+.act-stop:not(:disabled) { color: var(--redstone); }
 
 .pane {
   display: flex;
@@ -390,6 +470,8 @@ summary:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.line[hidden] { display: none; } /* фильтр «только выбранный» */
+
 .ts { flex: none; color: #6f7681; user-select: none; }
 .tx { min-width: 0; }
 .cnt { flex: none; color: var(--dust); }
@@ -409,7 +491,8 @@ summary:focus-visible {
   border-top: 1px solid var(--cobble);
 }
 
-.chat-form input { flex: 1; min-width: 0; font-family: var(--mono); font-size: 13px; }
+.chat-form input[type="text"] { flex: 1; min-width: 0; font-family: var(--mono); font-size: 13px; }
+.chat-form .check { flex: none; }
 
 .btn.send {
   height: auto;

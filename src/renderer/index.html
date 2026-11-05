@@ -19,15 +19,15 @@
       </div>
 
       <div class="actions">
-        <button id="btnStart" class="btn start" type="button">
+        <button id="btnStart" class="btn start" type="button" title="Запустить всех ботов из списка: входят по одному">
           <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 1l9 5-9 5z"/></svg>
-          Старт
+          Старт всех
         </button>
         <button id="btnStop" class="btn stop" type="button" disabled>
           <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M1.5 1.5h9v9h-9z"/></svg>
-          Стоп
+          Стоп всех
         </button>
-        <button id="btnView" class="btn view" type="button" title="Открыть отдельное окно: что видит бот">
+        <button id="btnView" class="btn view" type="button" title="Открыть отдельное окно: что видит выбранный бот">
           <svg viewBox="0 0 12 12" aria-hidden="true"><path fill-rule="evenodd" d="M6 2.5C3.2 2.5 1.1 4.4.3 6c.8 1.6 2.9 3.5 5.7 3.5s4.9-1.9 5.7-3.5C10.9 4.4 8.8 2.5 6 2.5zm0 1.2a2.3 2.3 0 1 1 0 4.6 2.3 2.3 0 0 1 0-4.6zm0 1.1a1.2 1.2 0 1 0 0 2.4 1.2 1.2 0 0 0 0-2.4z"/></svg>
           Экран бота
         </button>
@@ -72,9 +72,6 @@
           <option value="1.16.5"></option>
           <option value="1.12.2"></option>
         </datalist>
-        <label class="field"><span id="usernameLabel">Ник бота</span>
-          <input id="username" type="text" autocomplete="off" spellcheck="false">
-        </label>
         <label class="field">Вход
           <select id="auth">
             <option value="offline">Offline (без лицензии)</option>
@@ -83,9 +80,28 @@
         </label>
       </div>
 
+      <details id="botsGroup" class="group fold" open>
+        <summary class="group-title">Боты <span id="botsTag" class="tag" hidden></span></summary>
+        <label class="field"><span id="accountsLabel">Ник или ник:пароль — по одному в строке</span>
+          <textarea id="accounts" rows="7" spellcheck="false" placeholder="Farm01:пароль&#10;Farm02:пароль&#10;Farm03"></textarea>
+        </label>
+        <p class="hint">Без пароля — общий из «Автовход». Список можно менять и при запущенных ботах: новых запустит «Старт всех», убранные остановятся.</p>
+        <div class="row">
+          <label class="field" title="Прокси не пускает частые входы с одного IP: боты входят по одному. Переподключения — тоже">Входить каждые, с
+            <input id="startInterval" type="number" min="1" max="120" step="1">
+          </label>
+          <label class="field" title="Сколько чанков вокруг себя бот просит у сервера. Меньше — меньше памяти на каждого бота">Прорисовка, чанков
+            <input id="viewDistance" type="number" min="2" max="16" step="1">
+          </label>
+        </div>
+        <label class="field" title="Больше — меньше памяти, но тики ботов могут опаздывать (античит это не любит)">Ботов в одном процессе
+          <input id="botsPerProcess" type="number" min="1" max="20" step="1">
+        </label>
+      </details>
+
       <details id="autologin" class="group fold">
         <summary class="group-title">Автовход и команды <span id="autologinTag" class="tag" hidden>настроено</span></summary>
-        <label class="field">Пароль для /login
+        <label class="field">Общий пароль для /login
           <span class="secret">
             <input id="loginPassword" type="password" autocomplete="off" spellcheck="false" placeholder="не отправлять">
             <button id="showPassword" class="eye" type="button" aria-pressed="false" aria-label="Показать пароль" title="Показать пароль">
@@ -96,41 +112,61 @@
         <label class="field">Команды после входа
           <textarea id="joinCommands" rows="3" spellcheck="false" placeholder="/server survival"></textarea>
         </label>
-        <p class="hint">Отправляются один раз после появления в мире, по одной строке с паузой. Пароль хранится зашифрованным и в чате показывается точками.</p>
+        <p class="hint">Отправляются каждым ботом один раз после появления в мире, по одной строке с паузой. Пароли хранятся зашифрованными и в чате показываются точками.</p>
       </details>
 
       <details id="guardGroup" class="group fold">
         <summary class="group-title">Охрана и режим бога <span id="guardTag" class="tag" hidden></span></summary>
         <label class="check"><input id="guardOn" type="checkbox"><span>Охрана вне спавна</span></label>
-        <p class="hint">После <b>/home</b> или <b>/rtp</b> бот раз в 5 секунд пишет <b>/near</b> и смотрит сам. Чужой ник рядом — сразу <b>/spawn</b>. На спавне и после <b>/warp ah</b> охрана молчит.</p>
+        <p class="hint">После <b>/home</b> или <b>/rtp</b> бот раз в 5 секунд пишет <b>/near</b> и смотрит сам. Чужой ник рядом — сразу <b>/spawn</b>. На спавне и после <b>/warp ah</b> охрана молчит. Свои боты из списка — не чужие.</p>
         <label class="check"><input id="godOn" type="checkbox"><span>Режим бога: <b>/god</b> после перехода на сервер</span></label>
         <label class="field">Белый список — ники, по одному в строке
           <textarea id="whitelist" rows="4" spellcheck="false" placeholder="BARABYLKAyt"></textarea>
         </label>
-        <p class="hint">Действует сразу, перезапускать бота не нужно. Можно писать и ник, и имя, которое показывает /near.</p>
+        <p class="hint">Действует сразу, перезапускать ботов не нужно. Можно писать и ник, и имя, которое показывает /near.</p>
       </details>
     </aside>
 
     <main class="main">
-      <section class="pane">
+      <section class="pane bots-pane">
         <header class="pane-head">
-          <h2>Консоль</h2>
-          <button id="clearConsole" class="link" type="button">Очистить</button>
+          <h2>Боты <span id="botsCount" class="count"></span></h2>
+          <div class="pane-tools legend" aria-hidden="true">
+            <span><i class="dot" data-state="online"></i>в сети</span>
+            <span><i class="dot" data-state="connecting"></i>входит</span>
+            <span><i class="dot" data-state="queued"></i>в очереди</span>
+            <span><i class="dot" data-state="reconnecting"></i>переподключается</span>
+            <span><i class="dot" data-state="offline"></i>не в сети</span>
+          </div>
         </header>
-        <div id="console" class="log" role="log" data-empty="Здесь появятся статусы и ошибки. Нажми «Старт»."></div>
+        <div id="botList" class="bot-list" role="listbox" aria-label="Боты" data-empty="Впиши ботов слева, в поле «Боты»: ник или ник:пароль, по одному в строке."></div>
       </section>
 
       <section class="pane">
         <header class="pane-head">
-          <h2>Чат</h2>
+          <h2>Консоль <span class="count">все боты</span></h2>
           <div class="pane-tools">
+            <label class="check small" title="Показывать строки только выбранного бота (и самой панели)"><input id="onlySelected" type="checkbox"><span>только выбранный</span></label>
+            <button id="clearConsole" class="link" type="button">Очистить</button>
+          </div>
+        </header>
+        <div id="console" class="log" role="log" data-empty="Здесь появятся статусы и ошибки ботов. Нажми «Старт всех»."></div>
+      </section>
+
+      <section class="pane">
+        <header class="pane-head">
+          <h2>Чат <span id="chatWho" class="who"></span></h2>
+          <div class="pane-tools">
+            <button id="botStart" class="link act-start" type="button" title="Запустить выбранного бота">▶ Старт</button>
+            <button id="botStop" class="link act-stop" type="button" title="Остановить выбранного бота">■ Стоп</button>
             <button id="openLogs" class="link" type="button" title="Весь чат и консоль сохраняются в файлы по дням">Логи</button>
             <button id="clearChat" class="link" type="button">Очистить</button>
           </div>
         </header>
-        <div id="chat" class="log" role="log" data-empty="Здесь будет весь чат сервера."></div>
+        <div id="chat" class="log" role="log" data-empty="Здесь будет чат выбранного бота."></div>
         <form id="chatForm" class="chat-form" autocomplete="off">
           <input id="chatInput" type="text" maxlength="256" spellcheck="false" aria-label="Сообщение или команда" placeholder="Бот не в сети" disabled>
+          <label class="check small" title="Отправить всем ботам в сети, по очереди. Только команды: /… серверу или #… боту"><input id="toAll" type="checkbox"><span>всем</span></label>
           <button id="chatSend" class="btn send" type="submit" disabled>Отправить</button>
         </form>
       </section>

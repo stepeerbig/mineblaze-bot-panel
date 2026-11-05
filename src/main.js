@@ -4,31 +4,37 @@ const { app, BrowserWindow, Menu, clipboard, ipcMain, safeStorage, session, shel
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { BotClient } = require('./bot-client');
-const { DEFAULT_CONFIG, sanitize, validate } = require('./config');
+const { Fleet } = require('./fleet');
+const { DEFAULT_CONFIG, sanitize, validate, accountsOf } = require('./config');
+const { maskSecrets } = require('./chat-utils');
 
 // Фиксированная папка для настроек и логов: %APPDATA%\MineBlazeBotPanel
 app.setPath('userData', path.join(app.getPath('appData'), 'MineBlazeBotPanel'));
 
-// Самопроверка сборки: MBP_SELFTEST_OUT=<файл> — без окон запустить процесс бота, загрузить его модули
+// Самопроверка сборки: MBP_SELFTEST_OUT=<файл> — без окон запустить процесс ботов, загрузить его модули
 // (в собранном exe — из app.asar), поднять и закрыть экран бота, записать итог в файл и выйти.
 // С MBP_SELFTEST_SERVER=<адрес:порт> бот ещё и заходит на сервер (тестовый стенд) и стоит там
 // MBP_SELFTEST_STAY секунд — так проверяется весь путь бота в настоящем Electron (npm run stand:check -- --electron).
 const SELFTEST_OUT = process.env.MBP_SELFTEST_OUT || '';
 if (SELFTEST_OUT) app.setPath('userData', fs.mkdtempSync(path.join(os.tmpdir(), 'mbp-selftest-')));
 
-const config = { ...DEFAULT_CONFIG }; // настройки панели; копию держит процесс бота
-const SECRET_FIELDS = ['loginPassword', 'joinCommands']; // хранятся зашифрованными (Windows DPAPI)
+const config = { ...DEFAULT_CONFIG }; // настройки панели; копию держат процессы ботов
+const SECRET_FIELDS = ['loginPassword', 'joinCommands', 'accounts']; // хранятся зашифрованными (Windows DPAPI)
 const ICON = path.join(__dirname, 'assets', 'icon.png');
 const VIEWER_PARTITION = 'mineblaze-viewer'; // без «persist:» — сессия окна экрана живёт только в памяти
+const CHAT_HISTORY = 300; // строк чата каждого бота: выбрал бота в списке — видишь его чат
 let configFile = '';
 let logsDir = '';
 let win = null;
-let bot = null; // связь с процессом бота (src/bot-client.js)
+let fleet = null; // все боты (src/fleet.js)
+let selectedBot = null; // чей чат в панели и кого показывает экран бота
+let appliedAccounts = null; // список ботов, который уже отдан флоту
 let viewerWin = null; // окно «Экран бота»
 let viewerOpening = null; // общий промис, пока окно открывается (защита от двойного клика)
+let viewerTarget = null; // { bot, client, url } — кого показывает экран и в каком процессе
 let quitting = false;
 let shutdownDone = false;
+const chatHistory = new Map(); // номер бота → последние строки его чата
 
 const errText = (err) => (err && err.message ? err.message : String(err));
 
@@ -57,13 +63,16 @@ function decodeSecret(value) {
 }
 
 function loadConfig() {
+  let raw = null;
   try {
-    const raw = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+    raw = JSON.parse(fs.readFileSync(configFile, 'utf8'));
     for (const key of SECRET_FIELDS) raw[key] = decodeSecret(raw[key]);
     Object.assign(config, sanitize(raw));
   } catch (_) {
     /* первый запуск или файл повреждён — остаются значения по умолчанию */
   }
+  // Раньше бот был один («Ник бота») — он становится первым в списке «Боты».
+  if (!String(config.accounts || '').trim() && config.username) config.accounts = config.username;
 }
 
 function saveConfig() {
@@ -84,7 +93,18 @@ function saveConfig() {
   } catch (err) {
     uiLog('error', `Не удалось сохранить настройки: ${err.message}`);
   }
-  if (bot) bot.setConfig({ ...config }); // процессу бота — те же настройки
+  syncFleet();
+}
+
+/** Процессам ботов — те же настройки; поменялся список ботов — флоту новый список. */
+function syncFleet() {
+  if (!fleet) return;
+  const key = `${config.auth}\n${config.accounts}`;
+  if (key !== appliedAccounts) {
+    appliedAccounts = key;
+    fleet.setAccounts(accountsOf(config).accounts);
+  }
+  fleet.pushConfig();
 }
 
 // ---------- логи в файлы: %APPDATA%\MineBlazeBotPanel\logs ----------
@@ -124,31 +144,54 @@ function closeLogs() {
   logStreams.clear();
 }
 
+const tagOf = (nick) => (nick ? `[${nick}] ` : '');
+
+// Одно и то же сообщение сервера (общий чат, объявления) видят все боты — в лог оно пишется один раз:
+// другой бот прислал тот же текст в ближайшие секунды — пропускаем.
+const CHAT_DEDUPE_MS = 3000;
+const recentChat = new Map(); // текст → { time, bot }
+
+function logChat(msg) {
+  const time = msg.time || Date.now();
+  const text = String(msg.text || '');
+  if (msg.position !== 'self') {
+    const seen = recentChat.get(text);
+    if (seen && seen.bot !== msg.bot && time - seen.time < CHAT_DEDUPE_MS) return;
+    recentChat.set(text, { time, bot: msg.bot });
+    if (recentChat.size > 5000) {
+      for (const [k, v] of recentChat) if (time - v.time >= CHAT_DEDUPE_MS) recentChat.delete(k);
+    }
+  }
+  // Спрятанные за кликабельным текстом адреса тоже сохраняем в лог.
+  const hidden = (Array.isArray(msg.links) ? msg.links : []).filter((url) => !text.includes(url));
+  appendLog('chat', time, `${tagOf(msg.nick)}${hidden.length ? `${text} [${hidden.join(' ')}]` : text}`);
+}
+
 // ---------- окно и связь с интерфейсом ----------
 
 function send(channel, payload) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
 }
 
-/** Строка в консоль панели и в лог — от самого главного процесса (как у BotManager). */
+/** Строка в консоль панели и в лог — от самого главного процесса (не от бота). */
 function uiLog(level, text) {
-  const entry = { time: Date.now(), level, text };
+  const entry = { bot: null, nick: null, time: Date.now(), level, text };
   send('bot:log', entry);
   appendLog('events', entry.time, `${level.toUpperCase().padEnd(5)} ${text}`);
 }
 
-/** Запрос процессу бота; ошибку показываем в консоли и возвращаем запасное значение. */
-async function ask(type, payload, fallback, opts) {
-  try {
-    return await bot.request(type, payload, opts);
-  } catch (err) {
-    uiLog('error', `Процесс бота: ${errText(err)}`);
-    return fallback;
-  }
+function selectBot(id) {
+  const b = fleet && fleet.get(id);
+  if (b) selectedBot = b.bot;
+  else if (!fleet || !fleet.get(selectedBot)) selectedBot = fleet && fleet.order.length ? fleet.order[0] : null;
+  return selectedBot;
 }
 
 function registerIpc() {
-  ipcMain.handle('app:init', () => ({ config: { ...config }, state: bot.state }));
+  ipcMain.handle('app:init', () => {
+    selectBot(selectedBot);
+    return { config: { ...config }, bots: fleet.list(), summary: fleet.summary(), selected: selectedBot, chat: chatHistory.get(selectedBot) || [] };
+  });
 
   ipcMain.handle('config:save', (_e, patch) => {
     Object.assign(config, sanitize(patch));
@@ -156,30 +199,65 @@ function registerIpc() {
     return { ...config };
   });
 
-  ipcMain.handle('bot:start', async (_e, patch) => {
-    Object.assign(config, sanitize(patch));
+  // Старт: ids — каких ботов (нет — всех); settings — поля формы, сохранить перед запуском.
+  ipcMain.handle('bots:start', async (_e, { ids = null, settings = null } = {}) => {
+    if (settings) Object.assign(config, sanitize(settings));
     saveConfig();
     const problem = validate(config);
     if (problem) {
       uiLog('error', problem);
       return { ok: false, config: { ...config } };
     }
-    return { ok: Boolean(await ask('start', {}, false)), config: { ...config } };
+    const started = await fleet.start(Array.isArray(ids) ? ids : null);
+    if (!ids) {
+      uiLog('info', started > 1
+        ? `Запускаю ботов: ${started} — входят по одному каждые ${config.startInterval} с (последний войдёт примерно через ${Math.ceil(((started - 1) * config.startInterval) / 60)} мин)`
+        : started ? 'Запускаю бота' : 'Все боты уже запущены');
+    }
+    return { ok: true, started, config: { ...config } };
   });
 
-  ipcMain.handle('bot:stop', async () => {
-    await ask('stop', {}, false);
-    return { ok: true };
+  ipcMain.handle('bots:stop', async (_e, { ids = null } = {}) => {
+    const stopped = await fleet.stop(Array.isArray(ids) ? ids : null);
+    if (!ids && stopped > 1) uiLog('info', `Останавливаю ботов: ${stopped}`);
+    return { ok: true, stopped };
   });
 
   ipcMain.handle('bot:auto-reconnect', async (_e, on) => {
-    const value = await ask('autoReconnect', { on: Boolean(on) }, config.autoReconnect);
-    config.autoReconnect = Boolean(value);
+    const value = await fleet.setAutoReconnect(Boolean(on));
     saveConfig();
-    return config.autoReconnect;
+    return value;
   });
 
-  ipcMain.handle('bot:say', (_e, text) => (typeof text === 'string' ? ask('say', { text }, false) : false));
+  // Сообщение или команда: выбранному боту или (all) всем ботам в сети — только команды.
+  ipcMain.handle('bot:say', async (_e, { text, all = false } = {}) => {
+    if (typeof text !== 'string' || !text.trim()) return false;
+    if (all) {
+      const r = fleet.broadcast(text);
+      if (r.refused) {
+        uiLog('warn', `Не отправлено: ${r.refused}`);
+        return false;
+      }
+      uiLog(r.targets ? 'info' : 'warn', r.targets ? `Всем ботам в сети (${r.targets}): ${maskSecrets(text.trim())}` : 'Всем ботам: в сети нет ни одного');
+      return r.targets > 0;
+    }
+    if (!selectedBot) {
+      uiLog('warn', 'Не отправлено: выбери бота в списке');
+      return false;
+    }
+    try {
+      return await fleet.say(selectedBot, text);
+    } catch (err) {
+      uiLog('error', `Процесс бота: ${errText(err)}`);
+      return false;
+    }
+  });
+
+  ipcMain.handle('bots:select', async (_e, id) => {
+    selectBot(id);
+    retargetViewer().catch((err) => uiLog('error', `Экран бота: ${errText(err)}`));
+    return { selected: selectedBot, chat: chatHistory.get(selectedBot) || [] };
+  });
 
   ipcMain.handle('app:open-logs', async () => {
     fs.mkdirSync(logsDir, { recursive: true });
@@ -189,12 +267,13 @@ function registerIpc() {
   ipcMain.handle('viewer:open', () => openViewer());
 }
 
-function createWindow() {
+function createWindow({ show = true } = {}) {
   win = new BrowserWindow({
-    width: 1180,
-    height: 760,
-    minWidth: 900,
-    minHeight: 580,
+    width: 1280,
+    height: 800,
+    minWidth: 960,
+    minHeight: 600,
+    show, // самопроверка открывает окно скрытым
     backgroundColor: '#1c1e22',
     title: 'MineBlaze Bot Panel',
     icon: ICON,
@@ -229,8 +308,13 @@ function createWindow() {
   });
 }
 
-// ---------- «Экран бота»: отдельное окно с 3D-видом мира вокруг бота ----------
-// Сервер картинки живёт в процессе бота (рядом с ботом), окно — здесь.
+// ---------- «Экран бота»: отдельное окно с 3D-видом мира вокруг выбранного бота ----------
+// Сервер картинки живёт в процессе этого бота (рядом с ним), окно — здесь.
+
+const viewerTitle = (id) => {
+  const b = fleet && fleet.get(id);
+  return b ? `Экран бота — ${b.nick}` : 'Экран бота';
+};
 
 /** Открывает окно экрана (или показывает уже открытое). true — окно есть. */
 function openViewer() {
@@ -238,6 +322,7 @@ function openViewer() {
     if (viewerWin.isMinimized()) viewerWin.restore();
     viewerWin.show();
     viewerWin.focus();
+    retargetViewer().catch((err) => uiLog('error', `Экран бота: ${errText(err)}`));
     return Promise.resolve(true);
   }
   // Пока окно открывается, повторные нажатия ждут тот же результат, а не открывают второе.
@@ -250,29 +335,60 @@ function openViewer() {
 }
 
 async function createViewer() {
+  const id = selectedBot;
+  if (!id) {
+    uiLog('warn', 'Экран бота: сначала выбери бота в списке');
+    return false;
+  }
+  let client = null;
   try {
+    client = await fleet.ensureClientOf(id);
     // Первый запуск экрана готовит его скрипты — это может занять несколько секунд.
-    const url = await bot.request('viewer:open', { mode: config.viewerMode }, { timeoutMs: 60 * 1000 });
+    const url = await client.request('viewer:open', { mode: config.viewerMode, bot: id }, { timeoutMs: 60 * 1000 });
     if (quitting || !win) {
-      bot.request('viewer:close').catch(() => {});
+      client.request('viewer:close').catch(() => {});
       return false;
     }
-    createViewerWindow(url);
+    viewerTarget = { bot: id, client, url };
+    createViewerWindow(id);
     return true;
   } catch (err) {
     if (!quitting) uiLog('error', `Не удалось открыть экран бота: ${errText(err)}`);
-    if (!viewerWin && bot) bot.request('viewer:close').catch(() => {});
+    if (!viewerWin && client) client.request('viewer:close').catch(() => {});
     return false;
   }
 }
 
-function createViewerWindow(url) {
+/** Выбрали другого бота, а экран открыт — показать его (в том же процессе — сразу, в другом — новым адресом). */
+async function retargetViewer() {
+  if (!viewerWin || viewerWin.isDestroyed() || !viewerTarget || !selectedBot || viewerTarget.bot === selectedBot) return;
+  const id = selectedBot;
+  const client = await fleet.ensureClientOf(id);
+  if (client === viewerTarget.client) {
+    await client.request('viewer:bot', { bot: id });
+    viewerTarget.bot = id;
+  } else {
+    const old = viewerTarget.client;
+    viewerTarget = null;
+    old.request('viewer:close').catch(() => {});
+    const url = await client.request('viewer:open', { mode: config.viewerMode, bot: id }, { timeoutMs: 60 * 1000 });
+    if (!viewerWin || viewerWin.isDestroyed()) {
+      client.request('viewer:close').catch(() => {});
+      return;
+    }
+    viewerTarget = { bot: id, client, url };
+    viewerWin.webContents.loadURL(url).catch(() => {});
+  }
+  if (viewerWin && !viewerWin.isDestroyed()) viewerWin.setTitle(viewerTitle(id));
+}
+
+function createViewerWindow(id) {
   const w = new BrowserWindow({
     width: 1000,
     height: 640,
     minWidth: 480,
     minHeight: 320,
-    title: 'Экран бота',
+    title: viewerTitle(id),
     backgroundColor: '#1c1e22',
     icon: ICON,
     autoHideMenuBar: true,
@@ -291,12 +407,10 @@ function createViewerWindow(url) {
   wc.setWindowOpenHandler(() => ({ action: 'deny' }));
   wc.on('will-navigate', (event, legacyUrl) => {
     const target = String((event && event.url) || legacyUrl || '');
-    if (!target.startsWith(url)) event.preventDefault();
+    if (!viewerTarget || !target.startsWith(viewerTarget.url)) event.preventDefault();
   });
-  // Страница без заголовка оставила бы окно без названия.
-  w.on('page-title-updated', (event, title) => {
-    if (!String(title || '').trim()) event.preventDefault();
-  });
+  // Заголовок окна — с ником бота; страница экрана своё название не навязывает.
+  w.on('page-title-updated', (event) => event.preventDefault());
 
   // F12 — инструменты разработчика, F5 или Ctrl+R — перезагрузить картинку (code — при любой раскладке).
   wc.on('before-input-event', (event, input) => {
@@ -318,50 +432,60 @@ function createViewerWindow(url) {
   w.on('closed', () => {
     if (viewerWin === w) viewerWin = null;
     // Окно закрыли — сервер картинки тоже больше не нужен.
-    if (bot && !quitting) bot.request('viewer:close').catch(() => {});
+    const target = viewerTarget;
+    viewerTarget = null;
+    if (target && !quitting) target.client.request('viewer:close').catch(() => {});
   });
 
-  wc.loadURL(url).catch((err) => {
+  wc.loadURL(viewerTarget.url).catch((err) => {
     // ERR_ABORTED — загрузку прервали перезагрузка страницы или закрытие окна, это не ошибка.
     if (w.isDestroyed() || (err && err.code === 'ERR_ABORTED')) return;
     uiLog('error', `Не удалось открыть экран бота: ${errText(err)}`);
   });
 }
 
-// ---------- процесс бота ----------
+// ---------- боты ----------
 
-function createBotClient() {
-  const client = new BotClient({
-    fork: () => utilityProcess.fork(path.join(__dirname, 'bot-process.js'), [], { serviceName: 'MineBlaze Bot', stdio: 'pipe' }),
+function createFleet() {
+  const f = new Fleet({
+    config,
+    fork: (index) => utilityProcess.fork(path.join(__dirname, 'bot-process.js'), [], { serviceName: `MineBlaze Bots ${index + 1}`, stdio: 'pipe' }),
     initPayload: () => ({
-      config: { ...config },
       authCacheDir: path.join(app.getPath('userData'), 'auth-cache'),
       journalDir: path.join(logsDir, 'packets'), // журнал пакетов при кике и возврате в лобби
     }),
   });
-  client.on('log', (entry) => {
+  f.on('log', (entry) => {
     send('bot:log', entry);
-    appendLog('events', entry.time, `${entry.level.toUpperCase().padEnd(5)} ${entry.text}`);
+    appendLog('events', entry.time, `${tagOf(entry.nick)}${entry.level.toUpperCase().padEnd(5)} ${entry.text}`);
   });
-  client.on('chat', (msg) => {
-    send('bot:chat', msg);
-    // Спрятанные за кликабельным текстом адреса тоже сохраняем в лог.
-    const hidden = (Array.isArray(msg.links) ? msg.links : []).filter((url) => !String(msg.text).includes(url));
-    appendLog('chat', msg.time, hidden.length ? `${msg.text} [${hidden.join(' ')}]` : msg.text);
+  f.on('chat', (msg) => {
+    let list = chatHistory.get(msg.bot);
+    if (!list) chatHistory.set(msg.bot, (list = []));
+    list.push(msg);
+    if (list.length > CHAT_HISTORY) list.splice(0, list.length - CHAT_HISTORY);
+    if (msg.bot === selectedBot) send('bot:chat', msg); // в панели — чат выбранного бота
+    logChat(msg);
   });
-  client.on('state', (state) => send('bot:state', state));
+  f.on('state', (s) => send('bot:state', s));
+  f.on('summary', (s) => send('fleet:summary', s));
+  f.on('list', (bots) => {
+    for (const id of [...chatHistory.keys()]) if (!f.get(id)) chatHistory.delete(id);
+    selectBot(selectedBot);
+    send('fleet:list', { bots, selected: selectedBot });
+  });
   // Сервер прислал ссылку (например, проверку «я не робот»): мигаем окном на панели задач,
   // чтобы успеть перейти по ней, пока сервер ждёт.
-  client.on('link', () => {
+  f.on('link', () => {
     if (win && !win.isDestroyed() && !win.isFocused()) win.flashFrame(true);
   });
-  client.on('msa', (data) => {
+  f.on('msa', (data) => {
     if (!data) return;
     // Код сразу в буфер обмена, страница входа Microsoft открывается сама.
     if (typeof data.user_code === 'string') {
       try {
         clipboard.writeText(data.user_code);
-        uiLog('info', 'Код скопирован в буфер обмена: вставь его на открывшейся странице (Ctrl+V)');
+        uiLog('info', `${data.nick ? `${data.nick}: ` : ''}код скопирован в буфер обмена — вставь его на открывшейся странице (Ctrl+V)`);
       } catch (_) {
         /* не страшно: код и так виден в консоли */
       }
@@ -371,26 +495,17 @@ function createBotClient() {
     }
   });
   // Режим переключают в самом окне экрана — запоминаем его до следующего раза.
-  client.on('viewer-mode', (mode) => {
+  f.on('viewer-mode', (mode) => {
     Object.assign(config, sanitize({ viewerMode: mode }));
     saveConfig();
   });
-  // То, что процесс бота печатает сам (предупреждения mineflayer и т.п.), — в отдельный лог.
-  client.on('output', ({ stream, line }) => appendLog('process', Date.now(), `${stream === 'stderr' ? 'ERR ' : ''}${line}`));
-
-  let resume = false; // бот был в сети, когда процесс упал
-  client.on('crash', ({ code, restarting, previousState }) => {
-    resume = previousState !== 'offline';
-    if (viewerWin && !viewerWin.isDestroyed()) viewerWin.close();
-    uiLog('error', `Процесс бота неожиданно завершился (код ${code})${restarting ? ': перезапускаю…' : '. Слишком много сбоев подряд — перезапусти программу'}`);
+  // То, что процессы ботов печатают сами (предупреждения mineflayer и т.п.), — в отдельный лог.
+  f.on('output', ({ worker, stream, line }) => appendLog('process', Date.now(), `#${worker + 1} ${stream === 'stderr' ? 'ERR ' : ''}${line}`));
+  // Упал процесс, где был бот экрана, — окно экрана закрываем (после перезапуска можно открыть снова).
+  f.on('crash', () => {
+    if (viewerTarget && !viewerTarget.client.child && viewerWin && !viewerWin.isDestroyed()) viewerWin.close();
   });
-  client.on('restarted', () => {
-    uiLog('ok', 'Процесс бота перезапущен');
-    // Бот работал и включён автореконнект — продолжаем, как после обрыва связи.
-    if (resume && config.autoReconnect) ask('start', {}, false);
-    resume = false;
-  });
-  return client;
+  return f;
 }
 
 function reportFatal(err) {
@@ -415,8 +530,9 @@ function startApp() {
     logsDir = path.join(app.getPath('userData'), 'logs');
     loadConfig();
 
-    bot = createBotClient();
-    bot.start().catch((err) => uiLog('error', `Не удалось запустить процесс бота: ${errText(err)}`));
+    fleet = createFleet();
+    syncFleet(); // процессы ботов запускаются, когда нужны (по «Старт» или для экрана бота)
+    selectBot(null);
 
     // Странице экрана бота не нужны камера, уведомления и прочие разрешения.
     session.fromPartition(VIEWER_PARTITION).setPermissionRequestHandler((_wc, permission, callback) => {
@@ -428,13 +544,13 @@ function startApp() {
     createWindow();
   });
 
-  // Перед выходом даём процессу бота выйти с сервера (не дольше нескольких секунд).
+  // Перед выходом даём ботам выйти с сервера (не дольше нескольких секунд).
   app.on('before-quit', (event) => {
     if (shutdownDone) return;
     event.preventDefault();
     if (quitting) return;
     quitting = true;
-    Promise.resolve(bot && bot.shutdown())
+    Promise.resolve(fleet && fleet.shutdown())
       .catch(() => {})
       .finally(() => {
         closeLogs();
@@ -455,61 +571,133 @@ function runSelftest() {
     }
     app.exit(code);
   };
-  setTimeout(() => finish({ ok: false, error: 'самопроверка не закончилась за 90 с' }, 2), 90 * 1000);
+  // MBP_SELFTEST_BOTS=N — на сервер заходят N ботов (StandBot1…N) через флот, как «Старт всех» в панели.
+  const count = Math.max(1, Math.min(200, parseInt(process.env.MBP_SELFTEST_BOTS, 10) || 1));
+  const interval = Math.max(1, Math.min(120, parseInt(process.env.MBP_SELFTEST_INTERVAL, 10) || 1));
+  const stay = Math.max(5, Number(process.env.MBP_SELFTEST_STAY) || 30);
+  const limitSec = 90 + (process.env.MBP_SELFTEST_SERVER ? count * interval + stay + 90 : 0);
+  setTimeout(() => finish({ ok: false, error: `самопроверка не закончилась за ${limitSec} с` }, 2), limitSec * 1000);
   app.whenReady().then(async () => {
     logsDir = path.join(app.getPath('userData'), 'logs');
-    bot = createBotClient();
+    const nick = process.env.MBP_SELFTEST_NICK || 'StandBot';
+    const nicks = count === 1 ? [nick] : Array.from({ length: count }, (_, i) => `${nick}${i + 1}`);
+    Object.assign(config, { accounts: nicks.join('\n'), username: nicks[0], startInterval: interval });
+    fleet = createFleet();
+    syncFleet();
+    selectBot(null);
     try {
-      await bot.start();
-      const pong = await bot.request('ping');
-      const details = await bot.request('selftest', {}, { timeoutMs: 60 * 1000 });
-      const server = process.env.MBP_SELFTEST_SERVER ? await selftestOnServer(process.env.MBP_SELFTEST_SERVER) : null;
-      await bot.shutdown();
-      finish({ ok: pong === 'pong' && (!server || server.online), ...details, server }, 0);
+      const client = await fleet.ensureClientOf(nicks[0]);
+      const pong = await client.request('ping');
+      const details = await client.request('selftest', {}, { timeoutMs: 60 * 1000 });
+      registerIpc();
+      createWindow({ show: false });
+      const ui = await checkUi(nicks.length);
+      const server = process.env.MBP_SELFTEST_SERVER ? await selftestOnServer(process.env.MBP_SELFTEST_SERVER, nicks, stay * 1000) : null;
+      await fleet.shutdown();
+      finish({ ok: pong === 'pong' && ui.ok && (!server || server.online), ...details, ui, server }, 0);
     } catch (err) {
       finish({ ok: false, error: errText(err) }, 1);
     }
   });
 }
 
-/** Бот заходит на сервер и стоит там: что было в консоли, какие состояния, что отправлял. */
-async function selftestOnServer(address) {
+/**
+ * Окно панели (скрытое) грузится без ошибок: видит всех ботов, выбор бота, фильтр консоли и «всем» работают.
+ * Ошибки страницы — из её консоли (так видны и необработанные исключения).
+ */
+async function checkUi(expected) {
+  const errors = [];
+  const wc = win.webContents;
+  wc.on('console-message', (event, level, message) => {
+    const lv = event && event.level !== undefined ? event.level : level;
+    const text = event && event.message !== undefined ? event.message : message;
+    if (lv === 'error' || lv === 3) errors.push(String(text));
+  });
+  wc.on('preload-error', (_event, _path, err) => errors.push(`preload: ${errText(err)}`));
+  if (wc.isLoading()) await new Promise((resolve) => wc.once('did-finish-load', resolve));
+  const result = await wc.executeJavaScript(`(async () => {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    for (let i = 0; i < 50 && document.querySelectorAll('.bot').length < ${Number(expected)}; i += 1) await sleep(100);
+    const chips = [...document.querySelectorAll('.bot')];
+    const out = { bots: chips.length, status: document.getElementById('statusText').textContent };
+    if (chips.length > 1) {
+      chips[1].click();
+      for (let i = 0; i < 20 && !chips[1].classList.contains('is-selected'); i += 1) await sleep(50);
+    }
+    out.selected = (document.querySelector('.bot.is-selected') || {}).textContent || null;
+    out.chatWho = document.getElementById('chatWho').textContent;
+    for (const id of ['onlySelected', 'toAll']) {
+      const box = document.getElementById(id);
+      box.checked = true;
+      box.dispatchEvent(new Event('change'));
+    }
+    out.placeholder = document.getElementById('chatInput').placeholder;
+    return out;
+  })()`, true);
+  const wantSelected = fleet.order.length > 1 ? fleet.get(fleet.order[1]).nick : fleet.order.length ? fleet.get(fleet.order[0]).nick : null;
+  return { ok: errors.length === 0 && result.bots === expected && result.selected === wantSelected, ...result, errors };
+}
+
+/** Память и процессор процессов ботов (Electron считает их сам): сколько уходит на бота. */
+function processMetrics() {
+  const mb = (kb) => Math.round((kb || 0) / 1024);
+  const all = app.getAppMetrics();
+  const bots = all.filter((m) => /MineBlaze Bots/.test(`${m.serviceName || ''} ${m.name || ''}`));
+  return {
+    processes: bots.map((m) => ({ name: m.name || m.serviceName, memoryMB: mb(m.memory.workingSetSize), privateMB: mb(m.memory.privateBytes), cpu: Math.round(m.cpu.percentCPUUsage) })),
+    botsMB: mb(bots.reduce((s, m) => s + m.memory.workingSetSize, 0)),
+    appMB: mb(all.reduce((s, m) => s + m.memory.workingSetSize, 0)),
+  };
+}
+
+/** Боты заходят на сервер (по очереди, как в панели) и стоят там: консоль, состояния, что отправлял первый, память. */
+async function selftestOnServer(address, nicks, stayMs) {
   const [host, port] = String(address).split(':');
-  const stayMs = Math.max(5, Number(process.env.MBP_SELFTEST_STAY) || 30) * 1000;
+  const ids = nicks.map((n) => n.toLowerCase());
+  const first = ids[0];
   const states = [];
   const logs = [];
-  bot.on('state', (s) => states.push(s));
-  bot.on('log', (e) => logs.push(`${e.level}: ${e.text}`));
-  const testConfig = {
-    ...DEFAULT_CONFIG,
+  fleet.on('state', (s) => {
+    if (s.bot === first) states.push(s.state);
+  });
+  fleet.on('log', (e) => logs.push(`${e.level}: ${e.nick && ids.length > 1 ? `[${e.nick}] ` : ''}${e.text}`));
+  Object.assign(config, {
     host,
     port: Number(port) || 25565,
-    username: process.env.MBP_SELFTEST_NICK || 'StandBot',
+    accounts: nicks.join('\n'),
+    username: nicks[0],
     version: process.env.MBP_SELFTEST_VERSION || DEFAULT_CONFIG.version,
     auth: 'offline',
     autoReconnect: false,
-  };
-  await bot.request('config', { config: testConfig });
-  await bot.request('start');
-  const online = await new Promise((resolve) => {
-    if (bot.state === 'online') return resolve(true);
-    const t = setTimeout(() => resolve(false), 60 * 1000);
-    bot.on('state', (s) => {
-      if (s === 'online') {
-        clearTimeout(t);
-        resolve(true);
-      } else if (s === 'offline') {
-        clearTimeout(t);
-        resolve(false);
-      }
-    });
   });
-  if (online) await new Promise((r) => setTimeout(r, stayMs));
-  const stillOnline = bot.state === 'online';
-  const stats = await bot.request('journalStats', { windowMs: stayMs });
-  await bot.request('stop');
-  await new Promise((r) => setTimeout(r, 1000));
-  return { online: online && stillOnline, stayMs, states, logs, stats };
+  syncFleet();
+  const stateOf = (id) => (fleet.get(id) ? fleet.get(id).state : 'offline');
+  const onlineCount = () => ids.filter((id) => stateOf(id) === 'online').length;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  await fleet.start(ids);
+  // Ждём, пока войдут все (или каждый либо вошёл, либо окончательно не смог).
+  const deadline = Date.now() + (ids.length * (config.startInterval || 1) + 60) * 1000;
+  while (Date.now() < deadline && !ids.every((id) => ['online', 'offline'].includes(stateOf(id)))) await sleep(250);
+  const joined = onlineCount();
+  processMetrics(); // отсчёт процессора — с этого момента
+  if (joined) await sleep(stayMs);
+  const stayed = onlineCount();
+  const metrics = processMetrics();
+  const client = fleet.clientOf(first);
+  const stats = client ? await client.request('journalStats', { bot: first, windowMs: stayMs }) : null;
+  await fleet.stop(ids);
+  await sleep(1500);
+  return {
+    online: joined === ids.length && stayed === ids.length,
+    bots: ids.length,
+    joined,
+    stayed,
+    stayMs,
+    states,
+    logs,
+    stats,
+    memory: { ...metrics, perBotMB: stayed ? Math.round(metrics.botsMB / stayed) : null },
+  };
 }
 
 if (SELFTEST_OUT) {

@@ -21,9 +21,13 @@ const el = {
   host: $('host'),
   port: $('port'),
   version: $('version'),
-  username: $('username'),
-  usernameLabel: $('usernameLabel'),
   auth: $('auth'),
+  botsTag: $('botsTag'),
+  accounts: $('accounts'),
+  accountsLabel: $('accountsLabel'),
+  startInterval: $('startInterval'),
+  viewDistance: $('viewDistance'),
+  botsPerProcess: $('botsPerProcess'),
   autologinTag: $('autologinTag'),
   loginPassword: $('loginPassword'),
   showPassword: $('showPassword'),
@@ -32,18 +36,26 @@ const el = {
   guardOn: $('guardOn'),
   godOn: $('godOn'),
   whitelist: $('whitelist'),
+  botList: $('botList'),
+  botsCount: $('botsCount'),
   console: $('console'),
+  onlySelected: $('onlySelected'),
+  clearConsole: $('clearConsole'),
   chat: $('chat'),
+  chatWho: $('chatWho'),
+  botStart: $('botStart'),
+  botStop: $('botStop'),
+  openLogs: $('openLogs'),
+  clearChat: $('clearChat'),
   chatForm: $('chatForm'),
   chatInput: $('chatInput'),
+  toAll: $('toAll'),
   chatSend: $('chatSend'),
-  clearConsole: $('clearConsole'),
-  clearChat: $('clearChat'),
-  openLogs: $('openLogs'),
 };
 
 const STATE_TITLES = {
   offline: 'Не в сети',
+  queued: 'В очереди на вход',
   connecting: 'Подключение…',
   connected: 'Подключен',
   online: 'В сети',
@@ -53,9 +65,13 @@ const STATE_TITLES = {
 const LEVELS = ['info', 'ok', 'warn', 'error', 'kick'];
 const MAX_LINES = 1000;
 const MAX_HISTORY = 50;
-const SETTINGS_FIELDS = [el.host, el.port, el.version, el.username, el.auth];
+// Сервер, версию и способ входа не меняем, пока боты работают: их переподключения ушли бы уже по-новому.
+const CONNECTION_FIELDS = [el.host, el.port, el.version, el.auth];
+const LIST_FIELDS = [el.startInterval, el.viewDistance, el.botsPerProcess];
 
-let state = 'offline';
+const bots = new Map(); // номер → { bot, nick, state, chip, dot }
+let selected = null; // чей чат показан и кому уходит сообщение
+let summary = { total: 0, online: 0, connected: 0, connecting: 0, queued: 0, reconnecting: 0, offline: 0 };
 let lastConsoleLine = null;
 const history = []; // отправленные сообщения, листаются стрелками ↑/↓
 let historyPos = 0;
@@ -118,12 +134,16 @@ function appendLinkified(target, text) {
   if (pos < s.length) target.appendChild(document.createTextNode(s.slice(pos)));
 }
 
-function addConsole({ time, level, text }) {
+// ---------- консоль: строки всех ботов (с ником), можно оставить только выбранного ----------
+
+const hiddenByFilter = (row) => el.onlySelected.checked && Boolean(row.dataset.bot) && row.dataset.bot !== selected;
+
+function addConsole({ bot = null, nick = null, time, level, text }) {
   const lv = LEVELS.includes(level) ? level : 'info';
 
-  // Одинаковые подряд идущие строки сворачиваем в «×N» (время — последнего повтора).
+  // Одинаковые подряд идущие строки одного бота сворачиваем в «×N» (время — последнего повтора).
   const last = lastConsoleLine;
-  if (last && last.level === lv && last.text === text && el.console.lastElementChild === last.row) {
+  if (last && last.level === lv && last.text === text && last.bot === (bot || null) && el.console.lastElementChild === last.row) {
     last.count += 1;
     last.cnt.textContent = `×${last.count}`;
     last.ts.textContent = clock(time);
@@ -131,13 +151,30 @@ function addConsole({ time, level, text }) {
   }
 
   const { row, ts, tx } = makeRow(time, `lv-${lv}`);
+  row.dataset.bot = bot || '';
+  if (nick) {
+    const tag = document.createElement('span');
+    tag.className = 'who-tag';
+    tag.dataset.bot = bot;
+    tag.title = 'Выбрать этого бота';
+    tag.textContent = nick;
+    tx.append(tag, ' ');
+  }
   appendLinkified(tx, text);
   const cnt = document.createElement('span');
   cnt.className = 'cnt';
   row.appendChild(cnt);
+  row.hidden = hiddenByFilter(row);
   pushRow(el.console, row);
-  lastConsoleLine = { level: lv, text, row, ts, cnt, count: 1 };
+  lastConsoleLine = { level: lv, text, bot: bot || null, row, ts, cnt, count: 1 };
 }
+
+function applyConsoleFilter() {
+  for (const row of el.console.children) row.hidden = hiddenByFilter(row);
+  el.console.scrollTop = el.console.scrollHeight;
+}
+
+// ---------- чат выбранного бота ----------
 
 function renderMotd(target, motd) {
   for (const seg of parseMotd(motd)) {
@@ -154,7 +191,8 @@ function renderMotd(target, motd) {
   }
 }
 
-function addChat({ time, text, motd, position, links }) {
+function addChat({ bot, time, text, motd, position, links }) {
+  if (bot && bot !== selected) return; // чат другого бота (пришёл, пока переключались)
   if (position === 'self') {
     // Команда, отправленная из панели: показываем как есть, без разбора цветов.
     const { row, tx } = makeRow(time, 'chat-line chat-self');
@@ -176,23 +214,112 @@ function addChat({ time, text, motd, position, links }) {
   pushRow(el.chat, row);
 }
 
-// ---------- состояние и форма ----------
-
-function applyState(next) {
-  state = STATE_TITLES[next] ? next : 'offline';
-  const idle = state === 'offline';
-  const canChat = state === 'connected' || state === 'online';
-  el.lamp.dataset.state = state;
-  el.statusText.textContent = STATE_TITLES[state];
-  el.btnStart.disabled = !idle;
-  el.btnStop.disabled = idle;
-  for (const field of SETTINGS_FIELDS) field.disabled = !idle;
-  el.chatInput.disabled = !canChat;
-  el.chatSend.disabled = !canChat;
-  el.chatInput.placeholder = canChat
-    ? 'Сообщение, команда серверу (/…) или боту (#помощь), Enter — отправить'
-    : 'Бот не в сети';
+function renderChatHistory(list) {
+  el.chat.replaceChildren();
+  for (const msg of Array.isArray(list) ? list : []) addChat(msg);
+  el.chat.scrollTop = el.chat.scrollHeight;
 }
+
+// ---------- список ботов ----------
+
+const stateTitle = (state) => STATE_TITLES[state] || state || '';
+
+function renderList(list, sel) {
+  bots.clear();
+  const chips = [];
+  for (const item of Array.isArray(list) ? list : []) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'bot';
+    chip.dataset.bot = item.bot;
+    chip.dataset.state = item.state;
+    chip.setAttribute('role', 'option');
+    const dot = document.createElement('i');
+    dot.className = 'dot';
+    dot.dataset.state = item.state;
+    const name = document.createElement('span');
+    name.className = 'nick';
+    name.textContent = item.nick;
+    chip.append(dot, name);
+    chip.title = `${item.nick} — ${stateTitle(item.state)}`;
+    bots.set(item.bot, { bot: item.bot, nick: item.nick, state: item.state, chip, dot });
+    chips.push(chip);
+  }
+  el.botList.replaceChildren(...chips);
+  setSelected(sel);
+}
+
+function setSelected(id) {
+  selected = id && bots.has(id) ? id : null;
+  for (const b of bots.values()) {
+    const on = b.bot === selected;
+    b.chip.classList.toggle('is-selected', on);
+    b.chip.setAttribute('aria-selected', String(on));
+  }
+  updateSelectedUi();
+  applyConsoleFilter();
+}
+
+async function choose(id) {
+  if (!id || !bots.has(id)) return;
+  const r = await bridge.select(id);
+  setSelected(r && r.selected);
+  renderChatHistory(r && r.chat);
+}
+
+function updateBot({ bot, state }) {
+  const b = bots.get(bot);
+  if (!b) return;
+  b.state = state;
+  b.chip.dataset.state = state;
+  b.dot.dataset.state = state;
+  b.chip.title = `${b.nick} — ${stateTitle(state)}`;
+  if (bot === selected) updateSelectedUi();
+}
+
+/** Шапка чата, кнопки выбранного бота и строка ввода. */
+function updateSelectedUi() {
+  const b = bots.get(selected);
+  el.chatWho.textContent = b ? `${b.nick} · ${stateTitle(b.state)}` : '— выбери бота в списке';
+  el.botStart.disabled = !b || b.state !== 'offline';
+  el.botStop.disabled = !b || b.state === 'offline';
+  const all = el.toAll.checked;
+  const canOne = Boolean(b) && (b.state === 'online' || b.state === 'connected');
+  const canAll = summary.online + summary.connected > 0;
+  const can = all ? canAll : canOne;
+  el.chatInput.disabled = !can;
+  el.chatSend.disabled = !can;
+  if (all) el.chatInput.placeholder = canAll ? 'Команда всем ботам в сети: /… серверу или #… боту' : 'Ни одного бота в сети';
+  else if (canOne) el.chatInput.placeholder = 'Сообщение, команда серверу (/…) или боту (#помощь), Enter — отправить';
+  else el.chatInput.placeholder = b ? 'Бот не в сети' : 'Выбери бота в списке';
+}
+
+/** Сводка по всем ботам: лампа, «В сети: N из M», общие кнопки. */
+function applySummary(s) {
+  summary = { ...summary, ...(s || {}) };
+  const busy = summary.connecting + summary.connected + summary.queued;
+  const running = summary.total - summary.offline;
+  let lamp = 'offline';
+  if (summary.online) lamp = 'online';
+  else if (busy) lamp = 'connecting';
+  else if (summary.reconnecting) lamp = 'reconnecting';
+  el.lamp.dataset.state = lamp;
+  el.statusText.textContent = summary.total ? `В сети: ${summary.online} из ${summary.total}` : 'Нет ботов';
+  const parts = [];
+  if (summary.queued) parts.push(`в очереди ${summary.queued}`);
+  if (summary.connecting + summary.connected) parts.push(`входят ${summary.connecting + summary.connected}`);
+  if (summary.reconnecting) parts.push(`переподключаются ${summary.reconnecting}`);
+  if (summary.total && summary.offline) parts.push(`не в сети ${summary.offline}`);
+  parts.push(`${el.host.value || '—'}:${el.port.value || '—'}`);
+  el.statusSub.textContent = parts.join(' · ');
+  el.botsCount.textContent = summary.total ? `${summary.online} / ${summary.total} в сети` : '';
+  el.btnStart.disabled = !summary.offline;
+  el.btnStop.disabled = running === 0;
+  for (const field of CONNECTION_FIELDS) field.disabled = running > 0;
+  updateSelectedUi();
+}
+
+// ---------- форма настроек ----------
 
 function setAutoReconnectUi(on) {
   el.arOn.classList.toggle('is-on', on);
@@ -201,11 +328,21 @@ function setAutoReconnectUi(on) {
   el.arOff.setAttribute('aria-pressed', String(!on));
 }
 
+/** Строки поля «Боты», которые станут ботами (без пустых и «#…»). */
+function accountLines() {
+  return el.accounts.value.split(/\r?\n/).map((s) => s.trim()).filter((s) => s && !s.startsWith('#') && !s.startsWith('//'));
+}
+
+function updateBotsTag() {
+  const n = accountLines().length;
+  el.botsTag.textContent = String(n);
+  el.botsTag.hidden = n === 0;
+}
+
 function updateLabels() {
   const microsoft = el.auth.value === 'microsoft';
-  el.usernameLabel.textContent = microsoft ? 'Почта Microsoft' : 'Ник бота';
-  el.username.placeholder = microsoft ? 'name@outlook.com' : 'латиница, 3–16 символов';
-  el.statusSub.textContent = `${el.username.value || '—'} · ${el.host.value || '—'}:${el.port.value || '—'}`;
+  el.accountsLabel.textContent = microsoft ? 'Почта Microsoft — по одной в строке' : 'Ник или ник:пароль — по одному в строке';
+  applySummary(null);
 }
 
 function updateAutologinTag() {
@@ -220,7 +357,7 @@ function whitelistCount() {
 function updateGuardTag() {
   const on = el.guardOn.checked;
   el.guardTag.textContent = on ? 'вкл' : el.godOn.checked ? '/god' : '';
-  el.guardTag.title = on ? `Охрана включена, в белом списке: ${whitelistCount()}` : '';
+  el.guardTag.title = on ? `Охрана включена, в белом списке: ${whitelistCount()} (и все боты из списка)` : '';
   el.guardTag.hidden = !on && !el.godOn.checked;
 }
 
@@ -228,17 +365,21 @@ function fillForm(cfg) {
   el.host.value = cfg.host;
   el.port.value = cfg.port;
   el.version.value = cfg.version;
-  el.username.value = cfg.username;
   el.auth.value = cfg.auth;
   el.delay.value = cfg.reconnectDelay;
+  // Поля, которые человек сейчас правит, не трогаем (иначе прыгнет курсор).
+  if (document.activeElement !== el.accounts) el.accounts.value = cfg.accounts || '';
+  el.startInterval.value = cfg.startInterval;
+  el.viewDistance.value = cfg.viewDistance;
+  el.botsPerProcess.value = cfg.botsPerProcess;
   el.loginPassword.value = cfg.loginPassword || '';
   el.joinCommands.value = cfg.joinCommands || '';
   el.guardOn.checked = cfg.guard !== false;
   el.godOn.checked = cfg.godMode !== false;
-  // Белый список не трогаем, пока человек его правит (иначе прыгнет курсор).
   if (document.activeElement !== el.whitelist) el.whitelist.value = cfg.whitelist || '';
   setAutoReconnectUi(cfg.autoReconnect);
   updateLabels();
+  updateBotsTag();
   updateAutologinTag();
   updateGuardTag();
 }
@@ -248,8 +389,11 @@ function readForm() {
     host: el.host.value,
     port: el.port.value,
     version: el.version.value,
-    username: el.username.value,
     auth: el.auth.value,
+    accounts: el.accounts.value,
+    startInterval: el.startInterval.value,
+    viewDistance: el.viewDistance.value,
+    botsPerProcess: el.botsPerProcess.value,
   };
 }
 
@@ -258,15 +402,41 @@ function readForm() {
 el.btnStart.addEventListener('click', async () => {
   el.btnStart.disabled = true; // защита от двойного клика
   try {
-    const res = await bridge.start(readForm());
+    const res = await bridge.start(null, readForm());
     if (res && res.config) fillForm(res.config);
   } finally {
-    applyState(state); // вернёт кнопку, если запуск не удался (например, не указан ник)
+    applySummary(null); // вернёт кнопку, если запуск не удался (например, неверный ник в списке)
   }
 });
 
 el.btnStop.addEventListener('click', () => {
-  bridge.stop();
+  bridge.stop(null);
+});
+
+el.botStart.addEventListener('click', async () => {
+  if (!selected) return;
+  el.botStart.disabled = true;
+  try {
+    const res = await bridge.start([selected], readForm());
+    if (res && res.config) fillForm(res.config);
+  } finally {
+    updateSelectedUi();
+  }
+});
+
+el.botStop.addEventListener('click', () => {
+  if (selected) bridge.stop([selected]);
+});
+
+el.botList.addEventListener('click', (event) => {
+  const chip = event.target.closest('.bot');
+  if (chip) choose(chip.dataset.bot);
+});
+
+// Ник в строке консоли — выбрать этого бота.
+el.console.addEventListener('click', (event) => {
+  const tag = event.target.closest('.who-tag');
+  if (tag) choose(tag.dataset.bot);
 });
 
 // «Экран бота» доступен всегда: если бот не в сети, окно экрана само это покажет.
@@ -289,15 +459,22 @@ el.delay.addEventListener('change', async () => {
   el.delay.value = cfg.reconnectDelay; // неверное значение вернётся к последнему корректному
 });
 
-// Настройки подключения сохраняются сразу, не только по «Старт».
-for (const field of SETTINGS_FIELDS) {
+// Настройки сохраняются сразу, не только по «Старт».
+for (const field of [...CONNECTION_FIELDS, ...LIST_FIELDS]) {
   field.addEventListener('change', async () => {
     const cfg = await bridge.saveConfig(readForm());
     fillForm(cfg);
   });
 }
 el.auth.addEventListener('input', updateLabels);
-el.username.addEventListener('input', updateLabels);
+el.host.addEventListener('input', () => applySummary(null));
+
+// Список ботов — когда человек закончил править (ушёл из поля): иначе недописанный ник уже стал бы ботом.
+el.accounts.addEventListener('input', updateBotsTag);
+el.accounts.addEventListener('change', async () => {
+  const cfg = await bridge.saveConfig({ accounts: el.accounts.value });
+  fillForm(cfg);
+});
 
 for (const field of [el.loginPassword, el.joinCommands]) {
   field.addEventListener('input', updateAutologinTag);
@@ -325,7 +502,7 @@ el.godOn.addEventListener('change', () => {
   bridge.saveConfig({ godMode: el.godOn.checked });
 });
 
-// Белый список уходит боту прямо во время набора (с небольшой паузой), перезапуск не нужен.
+// Белый список уходит ботам прямо во время набора (с небольшой паузой), перезапуск не нужен.
 let whitelistTimer = null;
 const saveWhitelist = () => {
   clearTimeout(whitelistTimer);
@@ -339,11 +516,14 @@ el.whitelist.addEventListener('input', () => {
 });
 el.whitelist.addEventListener('change', saveWhitelist);
 
+el.toAll.addEventListener('change', updateSelectedUi);
+el.onlySelected.addEventListener('change', applyConsoleFilter);
+
 el.chatForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const text = el.chatInput.value.trim();
   if (!text || el.chatInput.disabled) return;
-  const sent = await bridge.say(text);
+  const sent = await bridge.say(text, el.toAll.checked);
   if (!sent) return; // причина уже в консоли, текст остаётся в поле
   if (history[history.length - 1] !== text) history.push(text);
   if (history.length > MAX_HISTORY) history.shift();
@@ -371,9 +551,17 @@ el.openLogs.addEventListener('click', () => bridge.openLogs());
 
 bridge.onLog(addConsole);
 bridge.onChat(addChat);
-bridge.onState(applyState);
+bridge.onState(updateBot);
+bridge.onSummary(applySummary);
+bridge.onList(({ bots: list, selected: sel }) => {
+  const changed = sel !== selected;
+  renderList(list, sel);
+  if (changed && sel) choose(sel);
+});
 
-bridge.init().then(({ config, state: current }) => {
+bridge.init().then(({ config, bots: list, summary: s, selected: sel, chat }) => {
   fillForm(config);
-  applyState(current);
+  renderList(list, sel);
+  applySummary(s);
+  renderChatHistory(chat);
 });

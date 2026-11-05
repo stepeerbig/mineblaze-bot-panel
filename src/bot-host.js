@@ -1,13 +1,20 @@
 'use strict';
 
-// Хозяин бота — то, что работает в отдельном процессе (src/bot-process.js): BotManager и экран бота живут здесь,
-// а окно панели, настройки и логи — в главном процессе (src/bot-client.js на той стороне).
-// Зачем отдельно: тяжёлая работа окна и экрана не подвешивает тики бота, а падение бота не роняет панель.
+// Хозяин ботов — то, что работает в отдельном процессе (src/bot-process.js): несколько BotManager (по боту на
+// каждый) и экран бота живут здесь, а окно панели, настройки и логи — в главном процессе (src/fleet.js,
+// src/bot-client.js на той стороне). Зачем отдельно: тяжёлая работа окна и экрана не подвешивает тики ботов,
+// а падение процесса роняет только его ботов. Ботов много — процессов несколько (см. fleet.js).
 //
 // Сообщения главного процесса: { id, type, payload } → ответ { id, ok: true, value } или { id, ok: false, error }.
-// События отсюда: { event, payload }: log, chat, state, link, msa, viewer-mode.
+// События отсюда: { event, payload }; у событий бота в payload есть bot — его номер (ник маленькими буквами):
+//   log, chat, state { bot, state }, link, msa, want-connect { bot } — просится в общую очередь входа;
+//   viewer-mode — режим экрана переключили в его окне.
 
 const path = require('path');
+
+// Журнал пакетов каждого бота (сохраняется при кике): полминуты и не больше 20 000 пакетов. Ботов много, а на
+// людном спавне журнал за минуту — мегабайты у каждого; для разбора кика хватает и последних 30 секунд.
+const JOURNAL_LIMITS = Object.freeze({ keepMs: 30 * 1000, maxEntries: 20000 });
 
 /**
  * @param {object}   opts
@@ -17,10 +24,12 @@ const path = require('path');
  * @param {Function} [opts.exit]          завершить процесс (после shutdown)
  */
 function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
-  let manager = null;
-  let config = null;
+  const bots = new Map(); // номер бота → { account: { username, password }, config, manager }
+  let shared = null; // общие настройки панели (живой объект: меняем поля)
+  let dirs = null; // { authCacheDir, journalDir }
   let viewer = null;
   let viewerStarting = null;
+  let viewerBot = null; // какого бота показывает экран
 
   const emit = (event, payload) => {
     try {
@@ -29,7 +38,7 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
       /* канал закрыт — главный процесс уже ушёл */
     }
   };
-  const log = (level, text) => emit('log', { time: Date.now(), level, text });
+  const log = (level, text, bot = null) => emit('log', { bot, time: Date.now(), level, text });
 
   function makeManager(opts) {
     if (createManager) return createManager(opts);
@@ -43,76 +52,156 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
     return new ViewerServer(opts);
   }
 
-  function requireManager() {
-    if (!manager) throw new Error('процесс бота ещё не готов');
-    return manager;
+  function requireReady() {
+    if (!shared) throw new Error('процесс бота ещё не готов');
   }
 
-  async function openViewer(mode) {
-    const m = requireManager();
+  function entryOf(id) {
+    requireReady();
+    const entry = bots.get(String(id || ''));
+    if (!entry) throw new Error(`бота ${id} в этом процессе нет`);
+    return entry;
+  }
+
+  /** Настройки бота = общие + его ник и пароль (свой или общий). Объект тот же: менеджер читает его вживую. */
+  function refresh(entry) {
+    Object.assign(entry.config, shared, {
+      username: entry.account.username,
+      loginPassword: entry.account.password || shared.loginPassword || '',
+    });
+  }
+
+  function addBot(id, account) {
+    const entry = { account: { username: account.username, password: account.password || '' }, config: {}, manager: null };
+    refresh(entry);
+    const manager = makeManager({
+      config: entry.config,
+      authCacheDir: dirs.authCacheDir,
+      journalDir: dirs.journalDir,
+      requestConnect: () => emit('want-connect', { bot: id }),
+      journalLimits: JOURNAL_LIMITS,
+    });
+    entry.manager = manager;
+    manager.on('log', (e) => emit('log', { bot: id, ...e }));
+    manager.on('chat', (m) => emit('chat', { bot: id, ...m }));
+    manager.on('state', (state) => emit('state', { bot: id, state }));
+    manager.on('link', (l) => emit('link', { bot: id, ...l }));
+    manager.on('msa', (d) => emit('msa', { bot: id, ...d }));
+    // Экран показывает своего бота: тот появился в мире или пропал — экран узнаёт сразу.
+    manager.on('bot', (bot) => {
+      if (viewer && viewerBot === id) viewer.setBot(bot);
+    });
+    bots.set(id, entry);
+    return entry;
+  }
+
+  function removeBot(id) {
+    const entry = bots.get(id);
+    if (!entry) return;
+    bots.delete(id);
+    try {
+      entry.manager.shutdown();
+    } catch (err) {
+      log('warn', `Бот ${entry.account.username}: не остановился: ${err && err.message ? err.message : err}`, id);
+    }
+    entry.manager.removeAllListeners();
+    emit('state', { bot: id, state: 'offline' });
+    if (viewerBot === id && viewer) viewer.setBot(null);
+  }
+
+  async function openViewer(mode, id) {
+    requireReady();
     if (!viewer) {
       const created = makeViewer({
         mode,
-        log: (level, text) => m.log(level, `Экран бота: ${text}`),
+        log: (level, text) => log(level, `Экран бота: ${text}`, viewerBot),
       });
       // Режим переключают в самом окне экрана — главный процесс запомнит его до следующего раза.
       created.on('mode', (value) => emit('viewer-mode', value));
-      created.on('error', (err) => m.log('error', `Экран бота: ${err && err.message ? err.message : err}`));
+      created.on('error', (err) => log('error', `Экран бота: ${err && err.message ? err.message : err}`, viewerBot));
       viewer = created;
     }
     const server = viewer;
     if (!viewerStarting) viewerStarting = server.start().finally(() => (viewerStarting = null));
     const url = await viewerStarting;
-    server.setBot(m.getBot());
+    showOnViewer(id);
     return url;
+  }
+
+  function showOnViewer(id) {
+    viewerBot = id && bots.has(String(id)) ? String(id) : null;
+    if (viewer) viewer.setBot(viewerBot ? bots.get(viewerBot).manager.getBot() : null);
   }
 
   async function closeViewer() {
     const server = viewer;
     viewer = null;
+    viewerBot = null;
     if (!server) return;
     try {
       await server.close();
     } catch (err) {
-      if (manager) manager.log('warn', `Экран бота: сервер не остановился: ${err && err.message ? err.message : err}`);
+      log('warn', `Экран бота: сервер не остановился: ${err && err.message ? err.message : err}`);
     }
   }
 
   const handlers = {
     init({ config: cfg, authCacheDir, journalDir }) {
-      if (manager) return true;
-      config = { ...cfg };
-      manager = makeManager({ config, authCacheDir, journalDir });
-      manager.on('log', (entry) => emit('log', entry));
-      manager.on('chat', (msg) => emit('chat', msg));
-      manager.on('state', (state) => emit('state', state));
-      manager.on('link', (link) => emit('link', link));
-      manager.on('msa', (data) => emit('msa', data));
-      // Экран бота показывает того бота, который сейчас в мире.
-      manager.on('bot', (bot) => {
-        if (viewer) viewer.setBot(bot);
-      });
+      if (shared) return true;
+      shared = { ...cfg };
+      dirs = { authCacheDir, journalDir };
       return true;
     },
     config({ config: cfg }) {
-      // Живой объект настроек менеджера: меняем поля, а не подменяем объект.
-      if (config) Object.assign(config, cfg);
+      // Живые объекты настроек ботов: меняем поля, а не подменяем объекты.
+      requireReady();
+      Object.assign(shared, cfg);
+      for (const entry of bots.values()) refresh(entry);
       return true;
     },
-    start: () => requireManager().start(),
-    stop: () => {
-      requireManager().stop();
+    /** Какие боты живут в этом процессе: [{ bot, username, password }]. Новые — создать, лишние — убрать. */
+    bots({ list }) {
+      requireReady();
+      const wanted = new Map((Array.isArray(list) ? list : []).map((a) => [String(a.bot), a]));
+      for (const id of [...bots.keys()]) if (!wanted.has(id)) removeBot(id);
+      for (const [id, account] of wanted) {
+        const entry = bots.get(id);
+        if (!entry) {
+          addBot(id, account);
+        } else {
+          entry.account = { username: account.username, password: account.password || '' };
+          refresh(entry);
+        }
+      }
+      return [...bots.keys()];
+    },
+    start: ({ bot }) => entryOf(bot).manager.start(),
+    stop: ({ bot }) => {
+      entryOf(bot).manager.stop();
       return true;
     },
-    autoReconnect: ({ on }) => requireManager().setAutoReconnect(Boolean(on)),
-    say: ({ text }) => requireManager().say(text),
-    state: () => (manager ? manager.state : 'offline'),
-    'viewer:open': ({ mode }) => openViewer(mode),
+    admit: ({ bot }) => (bots.has(String(bot)) ? entryOf(bot).manager.admit() : false),
+    /** Автореконнект — у всех ботов процесса (в консоль панель пишет об этом сама, один раз). */
+    autoReconnect: ({ on }) => {
+      requireReady();
+      shared.autoReconnect = Boolean(on);
+      for (const entry of bots.values()) entry.manager.setAutoReconnect(Boolean(on), { quiet: true });
+      return shared.autoReconnect;
+    },
+    say: ({ bot, text }) => entryOf(bot).manager.say(text),
+    state: ({ bot }) => entryOf(bot).manager.state,
+    'viewer:open': ({ mode, bot }) => openViewer(mode, bot),
+    /** Экран уже открыт — показать другого бота этого процесса. */
+    'viewer:bot': ({ bot }) => {
+      showOnViewer(bot);
+      return Boolean(viewerBot);
+    },
     'viewer:close': () => closeViewer().then(() => true),
     ping: () => 'pong',
     /** Сколько пакетов какого вида бот отправил и насколько ровно шли тики — за последние windowMs. */
-    journalStats: ({ windowMs = 60 * 1000 }) => {
-      const journal = manager && manager.journal;
+    journalStats: ({ bot, windowMs = 60 * 1000 }) => {
+      const entry = bots.get(String(bot || '')) || bots.values().next().value;
+      const journal = entry && entry.manager.journal;
       if (!journal) return null;
       const { performance } = require('perf_hooks'); // те же часы, что у журнала
       return journal.stats({ sinceMs: performance.timeOrigin + performance.now() - windowMs });
@@ -122,12 +211,19 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
       const mineflayerVersion = require('mineflayer/package.json').version;
       require('./bot/physics');
       require('./bot/actions');
-      const url = await openViewer('first');
+      require('./bot-manager');
+      const url = await openViewer('first', null);
       await closeViewer();
       return { node: process.versions.node, electron: process.versions.electron || null, mineflayer: mineflayerVersion, viewer: Boolean(url) };
     },
     async shutdown() {
-      if (manager) manager.shutdown();
+      for (const entry of bots.values()) {
+        try {
+          entry.manager.shutdown();
+        } catch (_) {
+          /* выходим всё равно */
+        }
+      }
       await closeViewer();
       return true;
     },
@@ -144,10 +240,10 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
     } catch (err) {
       port.post({ id, ok: false, error: err && err.message ? err.message : String(err) });
     }
-    if (type === 'shutdown') setTimeout(() => exit(0), 300).unref?.(); // дать ответу и отключению бота уйти
+    if (type === 'shutdown') setTimeout(() => exit(0), 300).unref?.(); // дать ответу и отключению ботов уйти
   });
 
-  return { log, handlers, get manager() { return manager; }, get viewer() { return viewer; } };
+  return { log, handlers, get bots() { return bots; }, get viewer() { return viewer; } };
 }
 
 module.exports = { createBotHost, ENTRY: path.join(__dirname, 'bot-process.js') };

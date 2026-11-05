@@ -131,7 +131,7 @@ if (-not (Test-Path $props)) {
     'spawn-protection=0'
     'view-distance=8'
     'simulation-distance=6'
-    'max-players=10'
+    'max-players=100'
     'allow-flight=false'
   ) | Set-Content -Path $props -Encoding ASCII
   Write-Host 'Test settings written: 127.0.0.1:25565, offline mode (any nickname can join).'

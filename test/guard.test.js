@@ -94,6 +94,19 @@ test('белый список: по строке, через запятую, с 
   assert.deepEqual([...parseWhitelist('BARABYLKAyt\n~kkff, Friend_1  [Ender]Another\n\n')], ['barabylkayt', 'kkff', 'friend_1', 'another']);
 });
 
+test('охрана: другие боты панели (fleetNicks) — свои: у одного склада их много, уходить не из-за чего', () => {
+  const t = setup({ fleetNicks: 'Farm01\nFarm02\nkakajambbba' });
+  assert.ok(t.guard.isFriend('farm02'));
+  assert.ok(!t.guard.isFriend('Griefer'));
+  t.guard.onCommand('/home склад');
+  teleport(t);
+  t.timers.advance(1500);
+  t.guard.onChat('| Окружающие игроки: [Игрок] Farm01(2m), [Игрок] Farm02(3m), [Ender] BARABYLKAyt(9m)');
+  assert.deepEqual(t.cmds(), ['/near'], 'свои боты и белый список — остаётся');
+  t.guard.onChat('| Окружающие игроки: [Игрок] Farm01(2m), [Игрок] Griefer(30m)');
+  assert.deepEqual(t.cmds(), ['/near', '/spawn'], 'чужой среди своих — уходит');
+});
+
 test('охрана: после /home ждёт телепорта, потом /near раз в 5 с (тихо), свои — не повод уходить', () => {
   const t = setup();
   t.guard.onCommand('/home home');

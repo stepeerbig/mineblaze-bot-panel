@@ -121,7 +121,8 @@ const MAX_LINKS_PER_SESSION = 30; // чтобы спам ссылками не �
  * События:
  *   'log'   { time, level, text }   level: info | ok | warn | error | kick   (только статусы и ошибки)
  *   'chat'  { time, text, motd, position }   весь чат сервера; position 'self' — команда, отправленная из панели
- *   'state' 'offline' | 'connecting' | 'connected' | 'online' | 'reconnecting'
+ *   'state' 'offline' | 'queued' | 'connecting' | 'connected' | 'online' | 'reconnecting'
+ *           queued — ждёт своей очереди на вход (много ботов входят по одному, см. opts.requestConnect)
  *   'msa'   { verification_uri, user_code }                                  (вход через Microsoft)
  *   'bot'   bot | null   бот появился в мире / пропал (для «Экрана бота»; без повторов, см. getBot)
  *   'link'  { time, url, source }   сервер прислал ссылку для человека (например, проверка «я не робот»)
@@ -135,15 +136,21 @@ class BotManager extends EventEmitter {
    * @param {object}   [opts.compat]      что делать как обычный клиент (см. DEFAULT_COMPAT)
    * @param {Function} [opts.createBot]   подмена mineflayer.createBot (нужна для тестов)
    * @param {object}   [opts.timings]     подмена задержек (нужна для тестов)
+   * @param {Function} [opts.requestConnect] () => void — попросить общую очередь входа о месте (много ботов
+   *   входят по одному); бот ждёт в состоянии 'queued', пока ему не скажут admit(). Нет — входит сразу.
+   * @param {object}   [opts.journalLimits]  { keepMs, maxEntries } журнала пакетов (у множества ботов — меньше:
+   *   на людном спавне журнал каждого — мегабайты)
    */
-  constructor({ config, authCacheDir, journalDir = null, compat, createBot, timings } = {}) {
+  constructor({ config, authCacheDir, journalDir = null, compat, createBot, timings, requestConnect = null, journalLimits = {} } = {}) {
     super();
     this.config = config;
     this.authCacheDir = authCacheDir;
     this.journalDir = journalDir;
+    this.journalLimits = journalLimits;
     this.compat = { ...DEFAULT_COMPAT, ...compat };
     this._createBot = createBot;
     this.timings = { ...DEFAULT_TIMINGS, ...timings };
+    this._requestConnect = requestConnect;
 
     this.state = 'offline';
     this.cur = null; // текущая сессия (см. _connect)
@@ -175,6 +182,13 @@ class BotManager extends EventEmitter {
     }
     this.wantRun = true;
     this.attempt = 0;
+    this._begin();
+    return true;
+  }
+
+  /** Очередь входа дошла до этого бота: входить (если он всё ещё ждёт). true — начал вход. */
+  admit() {
+    if (!this.wantRun || this.state !== 'queued') return false;
     this._connect();
     return true;
   }
@@ -182,6 +196,13 @@ class BotManager extends EventEmitter {
   stop() {
     if (this.state === 'offline') return;
     this.wantRun = false;
+
+    // Ждал очереди на вход — просто выходим из неё.
+    if (this.state === 'queued' && !this.cur) {
+      this._setState('offline');
+      this.log('warn', 'Не в сети: вход отменён');
+      return;
+    }
 
     // Ждали переподключения — просто отменяем.
     if (this.reconnectTimer) {
@@ -213,12 +234,14 @@ class BotManager extends EventEmitter {
     s.forceTimer = later(() => this._forceClose(s, 'stopped'), s.loggedIn ? 2000 : 300);
   }
 
-  setAutoReconnect(on) {
+  /** quiet — не писать в консоль «Автоматический реконнект: ON» (у многих ботов это пишет панель один раз). */
+  setAutoReconnect(on, { quiet = false } = {}) {
     this.config.autoReconnect = Boolean(on);
-    this.log('info', `Автоматический реконнект: ${on ? 'ON' : 'OFF'}`);
+    if (!quiet) this.log('info', `Автоматический реконнект: ${on ? 'ON' : 'OFF'}`);
 
-    // Выключили, пока шло ожидание перед переподключением — отменяем его.
-    if (!on && this.reconnectTimer) {
+    // Выключили, пока шло ожидание перед переподключением (или очередь на него) — отменяем.
+    const waitingRetry = this.reconnectTimer || (this.state === 'queued' && this.attempt > 0 && !this.cur);
+    if (!on && waitingRetry) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
       this.wantRun = false;
@@ -279,6 +302,21 @@ class BotManager extends EventEmitter {
   }
 
   // ---------- внутреннее ----------
+
+  /** Начать вход: сразу или через общую очередь входа (тогда — 'queued' до admit()). */
+  _begin() {
+    if (!this._requestConnect) {
+      this._connect();
+      return;
+    }
+    this._setState('queued');
+    try {
+      this._requestConnect();
+    } catch (err) {
+      this.log('error', `Очередь входа: ${describeError(err)}`);
+      this._connect(); // без очереди — лучше войти сразу, чем стоять вечно
+    }
+  }
 
   _setState(state) {
     if (this.state === state) return;
@@ -427,7 +465,7 @@ class BotManager extends EventEmitter {
     this.cur = s;
     this.lastSession = s;
     // Журнал — ближе всех к сети, профиль — поверх него: в журнал попадает то, что ушло на сервер на самом деле.
-    s.journal = new PacketJournal({ getSelfId: () => (bot.entity ? bot.entity.id : null) });
+    s.journal = new PacketJournal({ ...this.journalLimits, getSelfId: () => (bot.entity ? bot.entity.id : null) });
     s.journal.attach(bot._client);
     if (this.compat.profile) applyClientProfile(bot._client);
     this._watchSilence(s);
@@ -669,7 +707,7 @@ class BotManager extends EventEmitter {
     }
     if (c.profile) {
       plugins.settings = settingsPlugin;
-      Object.assign(out, profileOptions());
+      Object.assign(out, profileOptions({ viewDistance: parseInt(this.config.viewDistance, 10) || undefined }));
     }
     if (c.clicks) plugins.windowClicks = windowClicksPlugin;
     if (Object.keys(plugins).length) out.plugins = plugins;
@@ -890,7 +928,7 @@ class BotManager extends EventEmitter {
     this.log('warn', `Автореконнект: подключение через ${delay} с (попытка ${this.attempt})…`);
     this.reconnectTimer = later(() => {
       this.reconnectTimer = null;
-      if (this.wantRun) this._connect();
+      if (this.wantRun) this._begin();
     }, delay * 1000);
   }
 }

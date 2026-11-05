@@ -3,7 +3,8 @@
 const DEFAULT_CONFIG = Object.freeze({
   host: 'mineblaze.net',
   port: 25565,
-  username: 'TestBot',
+  username: 'TestBot', // один бот (как было до списка ботов): если «Боты» пусты — запускается он
+  accounts: '', // боты: «ник» или «ник:пароль», по одному в строке (хранится зашифрованным)
   version: '1.21.11',
   auth: 'offline',
   autoReconnect: false,
@@ -14,9 +15,15 @@ const DEFAULT_CONFIG = Object.freeze({
   guard: true, // охрана: после /home или /rtp — /near раз в 5 с, чужой рядом → /spawn
   godMode: true, // режим бога: /god после перехода на сервер режима
   whitelist: '', // белый список охраны: ники, по одному в строке
+  // Много ботов. Входы (и переподключения) — по одному с паузой: прокси не пускает частые входы с одного IP.
+  startInterval: 5, // секунд между входами ботов
+  viewDistance: 4, // дальность прорисовки, которую бот сообщает серверу: меньше чанков — меньше памяти на бота
+  botsPerProcess: 10, // ботов в одном процессе: больше — тики начнут опаздывать, меньше — больше памяти на процессы
 });
 
 const MAX_WHITELIST_LENGTH = 5000;
+const MAX_ACCOUNTS = 200;
+const MAX_ACCOUNTS_LENGTH = 20000;
 
 const VIEWER_MODES = ['first', 'third'];
 
@@ -60,7 +67,62 @@ function sanitize(src) {
   if (typeof src.guard === 'boolean') out.guard = src.guard;
   if (typeof src.godMode === 'boolean') out.godMode = src.godMode;
   if (typeof src.whitelist === 'string') out.whitelist = src.whitelist.replace(/\r\n?/g, '\n').slice(0, MAX_WHITELIST_LENGTH);
+  if (typeof src.accounts === 'string') out.accounts = src.accounts.replace(/\r\n?/g, '\n').slice(0, MAX_ACCOUNTS_LENGTH);
+  const int = (value, min, max) => {
+    const n = parseInt(value, 10);
+    return n >= min && n <= max ? n : undefined;
+  };
+  for (const [key, min, max] of [['startInterval', 1, 120], ['viewDistance', 2, 16], ['botsPerProcess', 1, 20]]) {
+    const n = src[key] === undefined ? undefined : int(src[key], min, max);
+    if (n !== undefined) out[key] = n;
+  }
   return out;
+}
+
+const NICK_PROBLEM = 'Ник должен быть длиной 3–16 символов: латинские буквы, цифры и «_»';
+
+/**
+ * Боты из поля «Боты»: в строке «ник», «ник:пароль» или «ник пароль» (пароль — для /login; нет — общий).
+ * Пустые строки и «# …» пропускаются. Для входа через Microsoft вместо ника — почта.
+ * → { accounts: [{ username, password }], errors: [текст] }
+ */
+function parseAccounts(text, { auth = 'offline' } = {}) {
+  const accounts = [];
+  const errors = [];
+  const seen = new Set();
+  String(text || '').replace(/\r\n?/g, '\n').split('\n').forEach((raw, i) => {
+    const line = raw.trim();
+    if (!line || line.startsWith('#') || line.startsWith('//')) return;
+    const m = /^([^\s:;]+)\s*(?:[:;]\s*|\s+)?(.*)$/.exec(line);
+    const username = m ? m[1] : line;
+    const password = (m ? m[2] : '').trim().slice(0, 100);
+    const where = `Боты, строка ${i + 1}: «${username}»`;
+    if (auth !== 'microsoft' && !NICK_RE.test(username)) {
+      errors.push(`${where} — ${NICK_PROBLEM[0].toLowerCase()}${NICK_PROBLEM.slice(1)}`);
+      return;
+    }
+    const key = username.toLowerCase();
+    if (seen.has(key)) {
+      errors.push(`${where} — этот бот уже есть выше`);
+      return;
+    }
+    if (accounts.length >= MAX_ACCOUNTS) {
+      if (!errors.some((e) => e.startsWith('Ботов больше'))) errors.push(`Ботов больше ${MAX_ACCOUNTS} — столько не запустить: убери лишние`);
+      return;
+    }
+    seen.add(key);
+    accounts.push({ username, password });
+  });
+  return { accounts, errors };
+}
+
+/** Боты из настроек: список «Боты», а если он пуст — один бот из старого поля «Ник бота». */
+function accountsOf(cfg) {
+  if (String(cfg.accounts || '').trim()) return parseAccounts(cfg.accounts, { auth: cfg.auth });
+  const one = String(cfg.username || '').trim();
+  if (!one) return { accounts: [], errors: [] };
+  if (cfg.auth !== 'microsoft' && !NICK_RE.test(one)) return { accounts: [], errors: [NICK_PROBLEM] };
+  return { accounts: [{ username: one, password: '' }], errors: [] };
 }
 
 /** Возвращает текст проблемы или null, если запускать можно. */
@@ -69,14 +131,9 @@ function validate(cfg) {
   if (/\s/.test(cfg.host) || /^[a-z]+:\/\//i.test(cfg.host)) {
     return 'Адрес сервера указан неверно: нужен только домен или IP, например mineblaze.net';
   }
-  if (cfg.auth === 'microsoft') {
-    if (!cfg.username) return 'Не указана почта Microsoft-аккаунта';
-    return null;
-  }
-  if (!cfg.username) return 'Не указан ник бота';
-  if (!NICK_RE.test(cfg.username)) {
-    return 'Ник должен быть длиной 3–16 символов: латинские буквы, цифры и «_»';
-  }
+  const { accounts, errors } = accountsOf(cfg);
+  if (errors.length) return errors[0];
+  if (!accounts.length) return cfg.auth === 'microsoft' ? 'Не указана почта Microsoft-аккаунта' : 'Не указан ник бота';
   return null;
 }
 
@@ -90,4 +147,4 @@ function parseJoinCommands(text) {
     .map((line) => line.slice(0, MAX_CHAT_LENGTH));
 }
 
-module.exports = { DEFAULT_CONFIG, MAX_CHAT_LENGTH, sanitize, validate, parseJoinCommands };
+module.exports = { DEFAULT_CONFIG, MAX_CHAT_LENGTH, MAX_ACCOUNTS, sanitize, validate, parseJoinCommands, parseAccounts, accountsOf };

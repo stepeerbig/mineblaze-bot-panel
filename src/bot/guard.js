@@ -77,6 +77,14 @@ function parseWhitelist(text) {
   return out;
 }
 
+// Ники всех ботов панели (config.fleetNicks): один и тот же текст у всех ботов процесса — разбираем его один раз.
+let fleetCache = { text: null, set: new Set() };
+function fleetSet(text) {
+  const s = String(text || '');
+  if (fleetCache.text !== s) fleetCache = { text: s, set: parseWhitelist(s) };
+  return fleetCache.set;
+}
+
 /** Текст отображаемого имени игрока из списка Tab (без префикса в квадратных скобках). */
 function displayNameOf(player) {
   if (!player || !player.displayName) return '';
@@ -264,13 +272,18 @@ class Guard {
     this.pvpAt = -Infinity;
   }
 
-  /** Свой ли это: сам бот или ник из белого списка (в том числе если /near показал не ник, а псевдоним). */
+  /**
+   * Свой ли это: сам бот, ник из белого списка или другой бот панели (config.fleetNicks — все боты из списка
+   * «Боты»: у одного склада их много, и охрана каждого не должна уводить его от остальных). В том числе если
+   * /near показал не ник, а псевдоним.
+   */
   isFriend(name) {
     const n = norm(name);
     if (!n) return true;
     const bot = this.getBot();
     if (bot && (norm(bot.username) === n || norm(displayNameOf(bot.player)) === n)) return true;
     const list = parseWhitelist(this.config.whitelist);
+    for (const nick of fleetSet(this.config.fleetNicks)) list.add(nick);
     if (list.has(n)) return true;
     // Псевдоним из /near → настоящий ник по списку игроков (Tab).
     if (bot && bot.players) {

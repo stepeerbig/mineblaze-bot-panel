@@ -11,7 +11,7 @@ const SRC = path.join(__dirname, '..', 'src');
 const { BotManager } = require(path.join(SRC, 'bot-manager.js'));
 const { chatToText, describeError, describeEnd, noRetryReason, maskSecrets } = require(path.join(SRC, 'chat-utils.js'));
 const { parseMotd, readableHex } = require(path.join(SRC, 'renderer', 'motd.js'));
-const { sanitize, validate, parseJoinCommands, DEFAULT_CONFIG } = require(path.join(SRC, 'config.js'));
+const { sanitize, validate, parseJoinCommands, parseAccounts, accountsOf, DEFAULT_CONFIG, MAX_ACCOUNTS } = require(path.join(SRC, 'config.js'));
 
 class FakeBot extends EventEmitter {
   constructor(opts) {
@@ -166,6 +166,45 @@ test('стоп не вызывает реконнект, даже если он 
   assert.equal(mgr.reconnectTimer, null);
   assert.ok(lines(logs).includes('warn:Не в сети: бот остановлен'));
   await sleep(1300);
+  assert.equal(bots.length, 1);
+});
+
+test('очередь входа: ждёт разрешения (queued), admit — входит; переподключение — тоже через очередь; стоп — выходит из неё', async () => {
+  const asks = [];
+  const { mgr, bots, logs } = setup({ autoReconnect: true, reconnectDelay: 1, viewDistance: 4 }, {}, { requestConnect: () => asks.push(mgr.state) });
+  mgr.start();
+  assert.equal(mgr.state, 'queued');
+  assert.equal(bots.length, 0, 'без разрешения не подключается');
+  assert.deepEqual(asks, ['queued']);
+  assert.equal(mgr.start(), false, 'второй «Старт» в очередь второй раз не ставит');
+  assert.equal(mgr.admit(), true);
+  assert.equal(bots.length, 1);
+  assert.equal(mgr.state, 'connecting');
+  assert.equal(mgr.admit(), false, 'уже входит');
+  assert.equal(bots[0].opts.clientSettings.viewDistance, 4, 'дальность прорисовки — из настроек');
+
+  // Обрыв: переподключение ждёт очереди, а не входит само.
+  goOnline(bots[0]);
+  bots[0].emit('end', 'socketClosed');
+  assert.equal(mgr.state, 'reconnecting');
+  await sleep(1200);
+  assert.equal(mgr.state, 'queued');
+  assert.equal(asks.length, 2);
+  assert.equal(bots.length, 1);
+
+  // Автореконнект выключили, пока ждал очереди на переподключение — ждать больше нечего.
+  mgr.setAutoReconnect(false, { quiet: true });
+  assert.equal(mgr.state, 'offline');
+  assert.equal(mgr.admit(), false);
+  assert.ok(!lines(logs).some((x) => x.startsWith('info:Автоматический реконнект')), 'quiet — без строки в консоль');
+
+  // Стоп, пока ждал очереди, — просто выходит из неё.
+  mgr.start();
+  assert.equal(mgr.state, 'queued');
+  mgr.stop();
+  assert.equal(mgr.state, 'offline');
+  assert.ok(lines(logs).includes('warn:Не в сети: вход отменён'));
+  assert.equal(mgr.admit(), false);
   assert.equal(bots.length, 1);
 });
 
@@ -662,6 +701,31 @@ test('настройки: разбор и проверка', () => {
   assert.equal(validate({ ...DEFAULT_CONFIG, username: 'Bot_2024' }), null);
   assert.equal(validate({ ...DEFAULT_CONFIG, auth: 'microsoft', username: 'me@outlook.com' }), null);
   assert.equal(validate({ ...DEFAULT_CONFIG, auth: 'microsoft', username: '' }), 'Не указана почта Microsoft-аккаунта');
+});
+
+test('настройки: список ботов — «ник», «ник:пароль», «ник пароль»; ошибки с номером строки; старый «Ник бота» — один бот', () => {
+  const { accounts, errors } = parseAccounts('Farm01:pass1\nFarm02 pass 2\n\n# комментарий\nFarm03\nfarm01:dup\nab\nFarm04 ; p4');
+  assert.deepEqual(accounts, [
+    { username: 'Farm01', password: 'pass1' },
+    { username: 'Farm02', password: 'pass 2' },
+    { username: 'Farm03', password: '' },
+    { username: 'Farm04', password: 'p4' },
+  ]);
+  assert.deepEqual(errors, [
+    'Боты, строка 6: «farm01» — этот бот уже есть выше',
+    'Боты, строка 7: «ab» — ник должен быть длиной 3–16 символов: латинские буквы, цифры и «_»',
+  ]);
+  assert.match(validate({ ...DEFAULT_CONFIG, accounts: 'Farm01\nab' }), /строка 2: «ab» — ник должен быть длиной 3–16 символов/);
+  assert.equal(validate({ ...DEFAULT_CONFIG, accounts: 'Farm01\nFarm02:x' }), null);
+  assert.equal(validate({ ...DEFAULT_CONFIG, accounts: '# только комментарий', username: '' }), 'Не указан ник бота');
+  assert.deepEqual(accountsOf({ accounts: '', username: 'Solo' }).accounts, [{ username: 'Solo', password: '' }]);
+  assert.deepEqual(accountsOf({ accounts: ' \n', username: 'Solo' }).accounts, [{ username: 'Solo', password: '' }]);
+  assert.deepEqual(parseAccounts('me@outlook.com', { auth: 'microsoft' }).accounts, [{ username: 'me@outlook.com', password: '' }]);
+  const many = parseAccounts(Array.from({ length: MAX_ACCOUNTS + 5 }, (_, i) => `Bot${i}`).join('\n'));
+  assert.equal(many.accounts.length, MAX_ACCOUNTS);
+  assert.deepEqual(many.errors, [`Ботов больше ${MAX_ACCOUNTS} — столько не запустить: убери лишние`]);
+  assert.deepEqual(sanitize({ startInterval: '3', viewDistance: '1', botsPerProcess: '25', accounts: 'a\r\nb' }), { startInterval: 3, accounts: 'a\nb' });
+  assert.deepEqual(sanitize({ viewDistance: '6', botsPerProcess: '10' }), { viewDistance: 6, botsPerProcess: 10 });
 });
 
 test('настройки: режим экрана бота', () => {

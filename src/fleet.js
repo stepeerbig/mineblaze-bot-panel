@@ -1,0 +1,387 @@
+'use strict';
+
+// Много ботов сразу. Боты живут в процессах (src/bot-client.js ↔ src/bot-host.js) — по botsPerProcess в
+// каждом: все в одном — тики ботов начнут опаздывать (а за неровные тики античит кикает), по процессу на
+// бота — слишком много памяти. Входят боты по одному, через общую очередь, с паузой startInterval: прокси
+// (Velocity и т.п.) не пускает частые входы с одного IP, а лобби-антибот принимает пачку входов за атаку.
+// Переподключения идут через ту же очередь. Electron здесь не нужен: fork передаётся снаружи (в main.js —
+// utilityProcess.fork), поэтому всё проверяется обычными тестами (test/fleet.test.js).
+//
+// Бот — по нику: номер (bot) = ник маленькими буквами. События (у событий бота — bot и nick):
+//   log { bot, nick, time, level, text } (bot null — сама панель или процесс); chat; state { bot, nick, state };
+//   link; msa; list — список ботов поменялся; summary { total, online, … }; viewer-mode; output { worker, … }.
+
+const EventEmitter = require('events');
+const { BotClient } = require('./bot-client');
+
+const DEFAULT_TIMINGS = Object.freeze({
+  broadcastGap: 150, // «всем ботам»: между ботами — пауза, а не 70 команд в одну секунду
+});
+const errText = (err) => (err && err.message ? err.message : String(err));
+const RUNNING = (state) => state && state !== 'offline';
+
+class Fleet extends EventEmitter {
+  /**
+   * @param {object}   opts
+   * @param {Function} opts.fork          (index) => процесс ботов (как у BotClient)
+   * @param {Function} opts.initPayload   () => { authCacheDir, journalDir } — общие настройки fleet добавит сам
+   * @param {object}   opts.config        живой объект настроек панели (botsPerProcess, startInterval, …)
+   * @param {object}   [opts.timings]     { startGapMs, broadcastGap } — подмена задержек (для тестов)
+   * @param {object}   [opts.clientTimings] задержки BotClient (для тестов)
+   */
+  constructor({ fork, initPayload, config, timings, clientTimings } = {}) {
+    super();
+    this._fork = fork;
+    this._initPayload = initPayload || (() => ({}));
+    this.config = config;
+    this.timings = { ...DEFAULT_TIMINGS, ...timings };
+    this._clientTimings = clientTimings;
+    this.bots = new Map(); // номер → { bot, nick, username, password, worker, state }
+    this.order = []; // номера ботов в порядке списка
+    this.workers = []; // { client, ready, bots: Set, resume: [] }
+    this.queue = []; // кто ждёт входа (номера), по порядку
+    this._lastAdmitAt = -Infinity;
+    this._queueTimer = null;
+    this._summaryPending = false;
+    this._closed = false;
+  }
+
+  // ---------- список ботов ----------
+
+  /** Боты из настроек: [{ username, password }]. Новые — в процессы, где есть место; убранные — остановить. */
+  setAccounts(accounts) {
+    const next = new Map();
+    for (const a of accounts || []) next.set(String(a.username).toLowerCase(), a);
+    const touched = new Set();
+    for (const id of [...this.bots.keys()]) {
+      if (next.has(id)) continue;
+      const b = this.bots.get(id);
+      this.bots.delete(id);
+      this.queue = this.queue.filter((q) => q !== id);
+      const w = this.workers[b.worker];
+      if (w) {
+        w.bots.delete(id);
+        touched.add(b.worker);
+      }
+    }
+    for (const [id, a] of next) {
+      const b = this.bots.get(id);
+      if (b) {
+        if (b.username !== a.username || b.password !== (a.password || '')) touched.add(b.worker);
+        Object.assign(b, { nick: a.username, username: a.username, password: a.password || '' });
+        continue;
+      }
+      const worker = this._pickWorker();
+      this.workers[worker].bots.add(id);
+      touched.add(worker);
+      this.bots.set(id, { bot: id, nick: a.username, username: a.username, password: a.password || '', worker, state: 'offline' });
+    }
+    this.order = [...next.keys()];
+    for (const index of touched) {
+      const w = this.workers[index];
+      if (w && w.client && w.client.child) this._syncWorker(index).catch((err) => this._log('error', `Процесс ботов №${index + 1}: ${errText(err)}`));
+    }
+    this.emit('list', this.list());
+    this._summary();
+  }
+
+  /** Боты по порядку: [{ bot, nick, state, worker }]. */
+  list() {
+    return this.order.map((id) => {
+      const b = this.bots.get(id);
+      return { bot: id, nick: b.nick, state: b.state, worker: b.worker };
+    });
+  }
+
+  get(id) {
+    return this.bots.get(String(id || '').toLowerCase()) || null;
+  }
+
+  /** Сколько ботов в каком состоянии. */
+  summary() {
+    const out = { total: 0, online: 0, connected: 0, connecting: 0, queued: 0, reconnecting: 0, offline: 0 };
+    for (const b of this.bots.values()) {
+      out.total += 1;
+      out[b.state] = (out[b.state] || 0) + 1;
+    }
+    out.processes = this.workers.filter((w) => w.client && w.client.child).length;
+    return out;
+  }
+
+  // ---------- управление ----------
+
+  /** Запустить ботов (по номерам; без них — всех). Входить они будут по очереди. Возвращает, скольких. */
+  async start(ids = null) {
+    const list = this._pick(ids).filter((b) => !RUNNING(b.state));
+    const failed = new Set();
+    await Promise.all([...new Set(list.map((b) => b.worker))].map((index) => this._ensureWorker(index).catch((err) => {
+      failed.add(index);
+      this._log('error', `Процесс ботов №${index + 1} не запустился: ${errText(err)}`);
+    })));
+    let started = 0;
+    // По одному и по порядку: в каком порядке боты попросятся в очередь входа, в таком и войдут.
+    for (const b of list) {
+      const w = this.workers[b.worker];
+      if (failed.has(b.worker) || !w || !w.client || !this.bots.has(b.bot)) continue;
+      try {
+        if (await w.client.request('start', { bot: b.bot })) started += 1;
+      } catch (err) {
+        this._log('error', `Не запустился: ${errText(err)}`, b.bot);
+      }
+    }
+    return started;
+  }
+
+  /** Остановить ботов (по номерам; без них — всех). Возвращает, скольких. */
+  async stop(ids = null) {
+    const list = this._pick(ids).filter((b) => RUNNING(b.state));
+    const stopping = new Set(list.map((b) => b.bot));
+    this.queue = this.queue.filter((id) => !stopping.has(id));
+    await Promise.all(list.map((b) => {
+      const w = this.workers[b.worker];
+      if (!w || !w.client || !w.client.child) return null;
+      return w.client.request('stop', { bot: b.bot }).catch((err) => this._log('error', `Не остановился: ${errText(err)}`, b.bot));
+    }));
+    return list.length;
+  }
+
+  /** Сообщение или команда одному боту. */
+  async say(id, text) {
+    const b = this.get(id);
+    if (!b) return false;
+    const w = this.workers[b.worker];
+    if (!w || !w.client || !w.client.child) return false;
+    return Boolean(await w.client.request('say', { bot: b.bot, text }));
+  }
+
+  /**
+   * Команда всем ботам в сети — по очереди, с паузой. Только команды («/…» серверу и «#…» боту): одно и то же
+   * сообщение от 70 ботов в общий чат — это спам. Возвращает { targets } сразу, рассылка идёт дальше сама.
+   */
+  broadcast(text) {
+    const msg = String(text || '').trim();
+    if (!/^[/#]/.test(msg)) return { targets: 0, refused: 'всем ботам — только команды: «/…» серверу или «#…» боту' };
+    const targets = this.order.map((id) => this.bots.get(id)).filter((b) => b.state === 'online' || b.state === 'connected');
+    (async () => {
+      for (const [i, b] of targets.entries()) {
+        if (this._closed) return;
+        if (i) await new Promise((r) => later(r, this.timings.broadcastGap));
+        if (b.state !== 'online' && b.state !== 'connected') continue;
+        try {
+          await this.say(b.bot, msg);
+        } catch (err) {
+          this._log('error', `Не отправилось: ${errText(err)}`, b.bot);
+        }
+      }
+    })();
+    return { targets: targets.length };
+  }
+
+  /** Автореконнект — у всех ботов (в консоль — одна строка). */
+  async setAutoReconnect(on) {
+    this.config.autoReconnect = Boolean(on);
+    this._log('info', `Автоматический реконнект: ${on ? 'ON' : 'OFF'}`);
+    await Promise.all(this._running().map((w) => w.client.request('autoReconnect', { on: Boolean(on) }).catch(() => {})));
+    return this.config.autoReconnect;
+  }
+
+  /** Настройки поменялись — всем запущенным процессам (боты читают их вживую). */
+  pushConfig() {
+    for (const w of this._running()) w.client.setConfig(this._sharedConfig());
+  }
+
+  /** Процесс бота (BotClient) — для экрана бота и проверок. */
+  clientOf(id) {
+    const b = this.get(id);
+    const w = b ? this.workers[b.worker] : null;
+    return w && w.client && w.client.child ? w.client : null;
+  }
+
+  /** Запустить процесс бота (если ещё нет) — например, чтобы открыть экран до старта. */
+  async ensureClientOf(id) {
+    const b = this.get(id);
+    if (!b) throw new Error(`бота ${id} нет в списке`);
+    await this._ensureWorker(b.worker);
+    return this.workers[b.worker].client;
+  }
+
+  /** Выход из программы: все боты выходят с сервера, процессы завершаются. */
+  async shutdown() {
+    this._closed = true;
+    clearTimeout(this._queueTimer);
+    this._queueTimer = null;
+    this.queue = [];
+    await Promise.all(this.workers.map((w) => (w.client ? w.client.shutdown().catch(() => {}) : null)));
+  }
+
+  // ---------- очередь входа ----------
+
+  _gapMs() {
+    if (this.timings.startGapMs !== undefined) return this.timings.startGapMs;
+    return Math.max(1, Number(this.config.startInterval) || 5) * 1000;
+  }
+
+  _enqueue(id) {
+    const b = this.bots.get(id);
+    if (!b || this._closed) return;
+    if (!this.queue.includes(id)) this.queue.push(id);
+    this._pump();
+  }
+
+  /** Пустить следующего, если пауза после прошлого входа прошла; иначе — подождать её. */
+  _pump() {
+    if (this._queueTimer || this._closed) return;
+    while (this.queue.length) {
+      const id = this.queue[0];
+      const b = this.bots.get(id);
+      if (!b || b.state !== 'queued') {
+        this.queue.shift(); // остановили, убрали из списка или уже входит
+        continue;
+      }
+      const gap = this._gapMs();
+      const wait = this._lastAdmitAt + gap - Date.now();
+      if (wait > 0 && wait <= gap) {
+        this._queueTimer = later(() => {
+          this._queueTimer = null;
+          this._pump();
+        }, wait);
+        return;
+      }
+      this.queue.shift();
+      this._lastAdmitAt = Date.now();
+      const w = this.workers[b.worker];
+      if (w && w.client && w.client.child) {
+        w.client.request('admit', { bot: id }).catch((err) => this._log('error', `Не удалось начать вход: ${errText(err)}`, id));
+      }
+    }
+  }
+
+  // ---------- процессы ----------
+
+  _pickWorker() {
+    const per = Math.max(1, Number(this.config.botsPerProcess) || 10);
+    let index = this.workers.findIndex((w) => w.bots.size < per);
+    if (index < 0) {
+      index = this.workers.length;
+      this.workers.push({ client: null, ready: null, bots: new Set(), resume: [] });
+    }
+    return index;
+  }
+
+  _pick(ids) {
+    const wanted = ids ? ids.map((id) => String(id).toLowerCase()) : this.order;
+    return wanted.map((id) => this.bots.get(id)).filter(Boolean);
+  }
+
+  _running() {
+    return this.workers.filter((w) => w.client && w.client.child);
+  }
+
+  _sharedConfig() {
+    const { accounts, ...rest } = this.config; // пароли всех ботов процессам не нужны: у каждого — свой
+    // Ники всех ботов панели: охрана каждого считает остальных своими (у одного склада их много).
+    rest.fleetNicks = this.order.map((id) => this.bots.get(id).username).join('\n');
+    return rest;
+  }
+
+  _ensureWorker(index) {
+    const w = this.workers[index];
+    if (!w) return Promise.reject(new Error(`нет процесса ботов №${index + 1}`));
+    if (!w.client) w.client = this._makeClient(index);
+    if (w.client.child && w.ready) return w.ready;
+    const ready = w.client.start().then(() => this._syncWorker(index));
+    w.ready = ready;
+    ready.catch(() => {
+      if (w.ready === ready) w.ready = null;
+    });
+    return ready;
+  }
+
+  _syncWorker(index) {
+    const w = this.workers[index];
+    const list = [...w.bots].map((id) => this.bots.get(id)).filter(Boolean)
+      .map((b) => ({ bot: b.bot, username: b.username, password: b.password }));
+    return w.client.request('bots', { list });
+  }
+
+  _makeClient(index) {
+    const client = new BotClient({
+      fork: () => this._fork(index),
+      initPayload: () => ({ ...this._initPayload(), config: this._sharedConfig() }),
+      timings: this._clientTimings,
+    });
+    client.on('log', (e) => {
+      if (e && e.bot) this._emitBot('log', e);
+      else this.emit('log', { ...e, bot: null, nick: null });
+    });
+    client.on('chat', (m) => this._emitBot('chat', m));
+    client.on('state', (p) => this._onState(p && p.bot, p && p.state));
+    client.on('link', (l) => this._emitBot('link', l));
+    client.on('msa', (d) => this._emitBot('msa', d));
+    client.on('want-connect', (p) => this._enqueue(p && p.bot));
+    client.on('viewer-mode', (mode) => this.emit('viewer-mode', mode));
+    client.on('output', (o) => this.emit('output', { worker: index, ...o }));
+    client.on('crash', ({ code, restarting }) => this._onCrash(index, code, restarting));
+    client.on('restarted', () => this._onRestarted(index));
+    return client;
+  }
+
+  _onState(id, state) {
+    const b = this.bots.get(id);
+    if (!b || !state || b.state === state) return;
+    b.state = state;
+    this.emit('state', { bot: id, nick: b.nick, state });
+    this._summary();
+  }
+
+  _onCrash(index, code, restarting) {
+    const w = this.workers[index];
+    w.ready = null;
+    const affected = [...w.bots].map((id) => this.bots.get(id)).filter((b) => b && RUNNING(b.state));
+    w.resume = affected.map((b) => b.bot);
+    for (const b of affected) this._onState(b.bot, 'offline');
+    this._log('error', `Процесс ботов №${index + 1} неожиданно завершился (код ${code}), в сети было ботов: ${affected.length}` +
+      (restarting ? ' — перезапускаю…' : ' — слишком много сбоев подряд, их боты остановлены (запусти их снова)'));
+    this.emit('crash', { worker: index, code, restarting, bots: w.resume.slice() });
+  }
+
+  _onRestarted(index) {
+    const w = this.workers[index];
+    const resume = w.resume;
+    w.resume = [];
+    const ready = this._syncWorker(index);
+    w.ready = ready;
+    ready.catch((err) => this._log('error', `Процесс ботов №${index + 1}: ${errText(err)}`));
+    this._log('ok', `Процесс ботов №${index + 1} перезапущен`);
+    // Боты работали и включён автореконнект — продолжаем, как после обрыва связи (через очередь входа).
+    if (this.config.autoReconnect && resume.length) ready.then(() => this.start(resume)).catch(() => {});
+  }
+
+  _emitBot(name, payload) {
+    const b = payload && this.bots.get(payload.bot);
+    if (!b) return; // бота уже убрали из списка
+    this.emit(name, { ...payload, nick: b.nick });
+  }
+
+  _log(level, text, bot = null) {
+    const b = bot ? this.bots.get(bot) : null;
+    this.emit('log', { bot: b ? b.bot : null, nick: b ? b.nick : null, time: Date.now(), level, text });
+  }
+
+  _summary() {
+    if (this._summaryPending) return;
+    this._summaryPending = true;
+    setImmediate(() => {
+      this._summaryPending = false;
+      this.emit('summary', this.summary());
+    });
+  }
+}
+
+function later(fn, ms) {
+  const t = setTimeout(fn, ms);
+  if (t && typeof t.unref === 'function') t.unref();
+  return t;
+}
+
+module.exports = { Fleet };

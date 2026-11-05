@@ -1,11 +1,12 @@
 'use strict';
 
-// Связь главного процесса с процессом бота (src/bot-process.js, внутри — src/bot-host.js): запуск, запросы
-// с ответами, события, перезапуск после аварии. Electron здесь не нужен: fork передаётся снаружи
-// (в main.js — utilityProcess.fork), поэтому всё это проверяется обычными тестами.
+// Связь главного процесса с одним процессом ботов (src/bot-process.js, внутри — src/bot-host.js): запуск,
+// запросы с ответами, события, перезапуск после аварии. Electron здесь не нужен: fork передаётся снаружи
+// (в main.js — utilityProcess.fork), поэтому всё это проверяется обычными тестами. Процессов несколько,
+// кто чем занят — решает src/fleet.js.
 //
-// События: log, chat, state, link, msa, viewer-mode — как у BotManager; crash { code, restarting, previousState };
-// restarted; output { stream, line } — то, что процесс бота печатает сам (предупреждения mineflayer и т.п.).
+// События: log, chat, state, link, msa, want-connect, viewer-mode — от ботов процесса (в payload.bot — чей);
+// crash { code, restarting }; restarted; output { stream, line } — то, что процесс печатает сам.
 
 const EventEmitter = require('events');
 
@@ -16,7 +17,7 @@ const DEFAULT_TIMINGS = Object.freeze({
   crashWindow: 60 * 1000,
 });
 const MAX_CRASHES = 3; // столько аварий за минуту — и больше не перезапускаем: что-то сломано всерьёз
-const EVENTS = new Set(['log', 'chat', 'state', 'link', 'msa', 'viewer-mode']);
+const EVENTS = new Set(['log', 'chat', 'state', 'link', 'msa', 'want-connect', 'viewer-mode']);
 
 class BotClient extends EventEmitter {
   /**
@@ -31,7 +32,6 @@ class BotClient extends EventEmitter {
     this._initPayload = initPayload;
     this.timings = { ...DEFAULT_TIMINGS, ...timings };
     this.child = null;
-    this.state = 'offline';
     this.stopping = false;
     this._nextId = 1;
     this._pending = new Map();
@@ -133,7 +133,6 @@ class BotClient extends EventEmitter {
       return;
     }
     if (!EVENTS.has(message.event)) return;
-    if (message.event === 'state') this.state = message.payload;
     this.emit(message.event, message.payload);
   }
 
@@ -146,19 +145,14 @@ class BotClient extends EventEmitter {
       reject(new Error('процесс бота завершился'));
     }
     this._pending.clear();
-    const previousState = this.state;
-    if (this.state !== 'offline') {
-      this.state = 'offline';
-      this.emit('state', 'offline');
-    }
     if (this.stopping) return;
 
-    // Авария: перезапускаем, но не бесконечно.
+    // Авария: перезапускаем, но не бесконечно. Что было с ботами процесса — знает fleet.js.
     const now = Date.now();
     this._crashes = this._crashes.filter((t) => now - t < this.timings.crashWindow);
     this._crashes.push(now);
     const restarting = this._crashes.length <= MAX_CRASHES;
-    this.emit('crash', { code, restarting, previousState }); // previousState — был ли бот в сети до аварии
+    this.emit('crash', { code, restarting });
     if (!restarting) return;
     this._restartTimer = setTimeout(() => {
       this._restartTimer = null;
