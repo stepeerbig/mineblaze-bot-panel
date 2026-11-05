@@ -27,6 +27,21 @@ const math = require('mineflayer/lib/math');
 const conv = require('mineflayer/lib/conversions');
 const { createDoneTask, createTask } = require('mineflayer/lib/promise_utils');
 
+/**
+ * Во что умножить скорость из entity_velocity, чтобы получить блоки за тик: в 1.21.9+ это lpVec3 (уже блоки
+ * за тик) — 1, раньше — целые в 1/8000 блока.
+ */
+function entityVelocityScale(registry) {
+  try {
+    const fields = registry.protocol.play.toClient.types.packet_entity_velocity[1];
+    const velocity = fields.find((f) => f.name === 'velocity');
+    if (velocity && velocity.type === 'lpVec3') return 1;
+  } catch (_) {
+    /* нет схемы протокола — считаем по-старому */
+  }
+  return 1 / 8000;
+}
+
 const TICK_MS = 50;
 const MAX_CATCHUP_TICKS = 10; // столько тиков подряд догоняет обычный клиент после подвисания
 const MIN_MOVE_SQ = 2.0e-4 * 2.0e-4; // меньший сдвиг обычный клиент не отправляет
@@ -546,6 +561,18 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
 
   // ---------- пакеты сервера ----------
 
+  // Скорость от сервера (отбрасывание от удара моба или игрока, толчки плагинов). В 1.21.9+ она приходит как
+  // lpVec3 — уже в блоках за тик, а mineflayer 4.39 всё равно делит её на 8000, как старые vec3i16: бот почти не
+  // отлетает, и античит это видит (Grim: AntiKB, откат). Для своей сущности — как обычный клиент
+  // (setDeltaMovement скоростью из пакета); этот обработчик идёт после mineflayer и поправляет его значение.
+  const velocityScale = entityVelocityScale(bot.registry);
+  bot._client.on('entity_velocity', (packet) => {
+    if (!bot.physicsEnabled || !bot.entity || packet.entityId !== bot.entity.id) return;
+    const v = packet.velocity || { x: packet.velocityX, y: packet.velocityY, z: packet.velocityZ };
+    if (!v || !Number.isFinite(v.x) || !Number.isFinite(v.y) || !Number.isFinite(v.z)) return;
+    bot.entity.velocity.set(v.x * velocityScale, v.y * velocityScale, v.z * velocityScale);
+  });
+
   bot._client.on('explosion', (explosion) => {
     if (!bot.physicsEnabled || bot.game.gameMode === 'creative') return;
     if (explosion.playerKnockback) {
@@ -659,4 +686,4 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
   bot.on('end', stopTicking);
 }
 
-module.exports = { createPhysicsPlugin, wrapDegrees, TICK_MS, MAX_CATCHUP_TICKS, MOUSE_STEP, TURN_SPEED };
+module.exports = { createPhysicsPlugin, wrapDegrees, entityVelocityScale, TICK_MS, MAX_CATCHUP_TICKS, MOUSE_STEP, TURN_SPEED };

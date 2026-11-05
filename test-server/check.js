@@ -17,6 +17,8 @@
 //                                                  описаниями, зачарованиями… и кладёт обратно; сервер не должен
 //                                                  ничего поправлять (значит, «отпечатки» предметов как у игры);
 //                                                  --clicks --no-clicks — то же без исправления (для сравнения)
+//         npm run stand:check -- --fight         — бой: бот в стеклянном загоне бьёт пауков командой #бей (как в
+//                                                  панели); Grim смотрит дальность, наводку и порядок пакетов ударов
 // Перед первым запуском один раз открой test-server\start-test-server.bat: он скачает сервер и спросит про EULA.
 // Код выхода 0 — бот простоял всё время, его не кикнули, и ни Grim, ни сервер ничего не заметили.
 // Журнал пакетов каждой проверки: test-server\server\journals.
@@ -38,9 +40,10 @@ const BOT_NAME = 'StandBot';
 const HELPER_NAME = 'Helper'; // второй игрок в сценарии — для команд по нику
 
 const ARGS = process.argv.slice(2);
-const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--no-clicks', '--scenario', '--clicks', '--electron']);
+const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--no-clicks', '--scenario', '--clicks', '--fight', '--electron']);
 const SCENARIO = ARGS.includes('--scenario');
 const CLICKS = ARGS.includes('--clicks');
+const FIGHT = ARGS.includes('--fight');
 const ELECTRON_ARG = ARGS.find((a) => a === '--electron' || a.startsWith('--electron='));
 const ELECTRON = Boolean(ELECTRON_ARG);
 const ELECTRON_EXE = ELECTRON_ARG && ELECTRON_ARG.includes('=') ? ELECTRON_ARG.slice(ELECTRON_ARG.indexOf('=') + 1).replace(/^"|"$/g, '') : '';
@@ -48,7 +51,7 @@ const BOTS_ARG = ARGS.find((a) => a.startsWith('--bots='));
 const BOTS = BOTS_ARG ? Math.max(1, Math.min(200, parseInt(BOTS_ARG.slice('--bots='.length), 10) || 1)) : 1;
 const isStandBot = (name) => name === BOT_NAME || (BOTS > 1 && new RegExp(`^${BOT_NAME}\\d+$`).test(name));
 const ROOT = path.join(__dirname, '..');
-const STAY_MS = Math.max(5, parseInt(ARGS.find((a) => /^\d+$/.test(a)), 10) || (SCENARIO || CLICKS ? 10 : 60)) * 1000;
+const STAY_MS = Math.max(5, parseInt(ARGS.find((a) => /^\d+$/.test(a)), 10) || (SCENARIO || CLICKS || FIGHT ? 10 : 60)) * 1000;
 const LEGACY = ARGS.includes('--legacy');
 const COMPAT = {
   physics: !LEGACY && !ARGS.includes('--no-physics'),
@@ -291,6 +294,37 @@ async function runScenario(manager, cmd) {
   } finally {
     helper.stop();
   }
+}
+
+/**
+ * Бой — той же командой, что в панели: #бей пауков N. Консоль сервера строит загон из стекла (ночь — пауки
+ * злые и сами идут к боту, сами мобы не появляются), даёт боту железный меч и «сопротивление» (урона нет — как
+ * режим бога на MineBlaze) и ставит пауков по углам. Возвращает 0 — всех убил (а Grim — в общем итоге).
+ */
+async function runFightCheck(manager, cmd) {
+  if (!cmd) throw new Error('для боя сервер должна запускать сама проверка: закрой окно тестового сервера и запусти снова');
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  await wait(2000);
+  const bot = manager.getBot();
+  if (!bot || !bot.actions) throw new Error('у бота нет безопасных действий (они работают только со своей физикой)');
+  const COUNT = 4;
+  for (const c of [
+    'difficulty easy',
+    'gamerule doMobSpawning false',
+    'time set midnight',
+    `effect give ${BOT_NAME} minecraft:resistance infinite 255 true`,
+    `effect give ${BOT_NAME} minecraft:saturation infinite 255 true`,
+    `execute at ${BOT_NAME} run fill ~-4 ~-1 ~-4 ~4 ~3 ~4 minecraft:glass hollow`,
+    `give ${BOT_NAME} minecraft:iron_sword`,
+    ...[[2, 2], [-2, 2], [2, -2], [-2, -2]].map(([x, z]) => `execute at ${BOT_NAME} run summon minecraft:spider ~${x} ~ ~${z}`),
+  ]) cmd(c);
+  await wait(2500);
+  const started = Date.now();
+  const r = await runCommand(bot, `#бей пауков ${COUNT}`);
+  console.log(`  [бой] #бей пауков ${COUNT} → ${r.ok ? 'да' : 'НЕТ'} (${((Date.now() - started) / 1000).toFixed(1)} с): ${[].concat(r.message).join(' | ')}`);
+  cmd('kill @e[type=minecraft:spider]');
+  cmd('time set day');
+  return r.data && r.data.total >= COUNT ? 0 : 1;
 }
 
 // Предметы для проверки кликов: как в меню NPC на MineBlaze (название с цветом, описание из нескольких строк)
@@ -547,13 +581,13 @@ function runBot(host, port, version, cmd) {
         onlineAt = Date.now();
         onlineAtJournal = performance.timeOrigin + performance.now();
         clearTimeout(onlineTimer);
-        if (SCENARIO || CLICKS) {
-          console.log(SCENARIO ? 'Бот в мире: готовлю площадку и действую…' : 'Бот в мире: проверяю клики в меню…');
-          const what = SCENARIO ? 'сценарий' : 'клики';
-          (SCENARIO ? runScenario : runClickCheck)(manager, cmd).then(
+        if (SCENARIO || CLICKS || FIGHT) {
+          console.log(SCENARIO ? 'Бот в мире: готовлю площадку и действую…' : CLICKS ? 'Бот в мире: проверяю клики в меню…' : 'Бот в мире: готовлю загон и пауков…');
+          const what = SCENARIO ? 'сценарий' : CLICKS ? 'клики' : 'бой';
+          (SCENARIO ? runScenario : CLICKS ? runClickCheck : runFightCheck)(manager, cmd).then(
             (failed) => {
-              console.log(`${SCENARIO ? 'Сценарий закончен' : 'Клики проверены'}, бот стоит ещё ${STAY_MS / 1000} с…`);
-              const why = SCENARIO ? `не выполнено команд — ${failed}` : `неудачных проверок — ${failed}`;
+              console.log(`${SCENARIO ? 'Сценарий закончен' : CLICKS ? 'Клики проверены' : 'Бой окончен'}, бот стоит ещё ${STAY_MS / 1000} с…`);
+              const why = SCENARIO ? `не выполнено команд — ${failed}` : CLICKS ? `неудачных проверок — ${failed}` : 'убил не всех пауков';
               stayTimer = setTimeout(() => finish(failed ? `${what}: ${why}` : null), STAY_MS);
             },
             (err) => finish(`${what}: ${err.message}`),
@@ -576,12 +610,12 @@ async function main() {
     console.error('--bots=N — только вместе с --electron (боты заходят через панель, как «Старт всех»)');
     return 2;
   }
-  if (ELECTRON && (SCENARIO || CLICKS || ARGS.some((a) => /^--(legacy|no-)/.test(a)))) {
-    console.error('--electron проверяет бота таким, какой он в панели: без --scenario, --clicks, --legacy и --no-…');
+  if (ELECTRON && (SCENARIO || CLICKS || FIGHT || ARGS.some((a) => /^--(legacy|no-)/.test(a)))) {
+    console.error('--electron проверяет бота таким, какой он в панели: без --scenario, --clicks, --fight, --legacy и --no-…');
     return 2;
   }
-  if (SCENARIO && CLICKS) {
-    console.error('--scenario и --clicks — разные проверки: запусти их по очереди');
+  if ([SCENARIO, CLICKS, FIGHT].filter(Boolean).length > 1) {
+    console.error('--scenario, --clicks и --fight — разные проверки: запусти их по очереди');
     return 2;
   }
   if (unknown.length) {
@@ -625,7 +659,7 @@ async function main() {
 
     console.log('');
     console.log('===== Итог =====');
-    const stayed = `${Math.round(result.onlineMs / 1000)} с${SCENARIO || CLICKS ? ' (проверка и пауза после неё)' : ` из ${STAY_MS / 1000}`}`;
+    const stayed = `${Math.round(result.onlineMs / 1000)} с${SCENARIO || CLICKS || FIGHT ? ' (проверка и пауза после неё)' : ` из ${STAY_MS / 1000}`}`;
     console.log(`Бот в мире: ${result.online ? stayed : 'не появился'}`);
     if (result.kick) console.log(`Кик: ${result.kick}`);
     if (result.problem) console.log(`Проблема: ${result.problem}`);

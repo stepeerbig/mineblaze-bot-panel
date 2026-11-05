@@ -103,18 +103,47 @@ const ITEM_WORDS = [
   [w('слиз'), ['slime_ball']], [w('стрел'), ['arrow']], [w('бр[её]вн|древесин'), ['oak_log']], [w('гриб'), ['brown_mushroom', 'red_mushroom']],
 ];
 
-/** «пшеницу, морковь, картофель или свёклу» → ['wheat', 'carrot', 'potato', 'beetroot']; неизвестное — пропускается. */
-function deliverItems(what) {
+/** Слова через запятую, «или», «и» → id по словарю words (неизвестное — пропускается, повторы — один раз). */
+function wordsToIds(what, words) {
   const out = [];
   const parts = String(what || '').toLowerCase().split(/\s*,\s*|\s+или\s+|\s+и\s+/);
   for (const raw of parts) {
     const part = raw.trim();
     if (!part) continue;
-    const hit = ITEM_WORDS.find(([re]) => re.test(part));
+    const hit = words.find(([re]) => re.test(part));
     if (hit) for (const id of hit[1]) if (!out.includes(id)) out.push(id);
   }
   return out;
 }
+
+/** «пшеницу, морковь, картофель или свёклу» → ['wheat', 'carrot', 'potato', 'beetroot']; неизвестное — пропускается. */
+const deliverItems = (what) => wordsToIds(what, ITEM_WORDS);
+
+// Кого убить (задания «Убейте…», команда #бей): русские слова в любом падеже → мобы. Сначала составные.
+const MOB_WORDS = [
+  [w('пещерн\\S*\\s+паук'), ['cave_spider']], [w('паук'), ['spider', 'cave_spider']],
+  [w('(?:зомби|зомбифиц\\S*)[\\s-]*пиглин'), ['zombified_piglin']], [w('пиглин\\S*[\\s-]+громил|громил'), ['piglin_brute']],
+  [w('пиглин'), ['piglin', 'piglin_brute']], [w('ифрит|блейз'), ['blaze']],
+  [w('скелет\\S*[\\s-]+иссушит|иссушит'), ['wither_skeleton']], [w('скелет'), ['skeleton']], [w('зимогор|бродяг'), ['stray']],
+  [w('зомби[\\s-]+жител'), ['zombie_villager']], [w('кадавр'), ['husk']], [w('утопленник'), ['drowned']], [w('зомби'), ['zombie']],
+  [w('крипер'), ['creeper']], [w('эндермен|странник\\S*\\s+края'), ['enderman']], [w('ведьм'), ['witch']],
+  [w('магм\\S*\\s+куб|лавов\\S*\\s+слиз'), ['magma_cube']], [w('слизн|слизе'), ['slime']], [w('гаст'), ['ghast']],
+  [w('фантом'), ['phantom']], [w('чешуйниц'), ['silverfish']], [w('древн\\S*\\s+страж'), ['elder_guardian']], [w('страж'), ['guardian']],
+  [w('разбойник'), ['pillager']], [w('поборник'), ['vindicator']], [w('хоглин'), ['hoglin']], [w('зоглин'), ['zoglin']],
+  [w('коров'), ['cow']], [w('кур(?:иц|ы|ей|а|$)'), ['chicken']], [w('свин'), ['pig']], [w('овц|овеч'), ['sheep']], [w('кролик'), ['rabbit']],
+];
+const MOB_NAMES = {
+  spider: 'паук', cave_spider: 'пещерный паук', zombified_piglin: 'зомбифицированный пиглин', piglin_brute: 'пиглин-громила',
+  piglin: 'пиглин', blaze: 'ифрит', wither_skeleton: 'скелет-иссушитель', skeleton: 'скелет', stray: 'зимогор',
+  zombie_villager: 'зомби-житель', husk: 'кадавр', drowned: 'утопленник', zombie: 'зомби', creeper: 'крипер', enderman: 'эндермен',
+  witch: 'ведьма', magma_cube: 'магмовый куб', slime: 'слизень', ghast: 'гаст', phantom: 'фантом', silverfish: 'чешуйница',
+  elder_guardian: 'древний страж', guardian: 'страж', pillager: 'разбойник', vindicator: 'поборник', hoglin: 'хоглин', zoglin: 'зоглин',
+  cow: 'корова', chicken: 'курица', pig: 'свинья', sheep: 'овца', rabbit: 'кролик',
+};
+
+/** «пауков» → ['spider', 'cave_spider'], «пиглинов или ифритов» → ['piglin', 'piglin_brute', 'blaze']. */
+const mobsOf = (what) => wordsToIds(what, MOB_WORDS);
+const mobName = (id) => MOB_NAMES[id] || id;
 
 const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
 
@@ -187,6 +216,7 @@ function parseQuest(slot, title, lore, icon = '') {
     done: false,
     items: kind === 'deliver' ? deliverItems(what) : [],
   };
+  if (kind === 'kill') quest.mobs = mobsOf(what);
   quest.done = (quest.need > 0 && quest.have >= quest.need) || DONE_RE.test(text);
   if (u) quest.unlock = { npc: questNpc(u[1]) || clean(u[1]), level: Number(u[2]) };
   return quest;
@@ -309,6 +339,7 @@ function describeQuest(q) {
   if (q.done) state = 'выполнено, ';
   let items = q.items.length ? ` (${q.items.join(', ')})` : '';
   if (q.kind === 'deliver' && !q.items.length) items = ' (какие это предметы — бот пока не знает)';
+  if (q.kind === 'kill') items = q.mobs && q.mobs.length ? ` (${q.mobs.join(', ')})` : ' (кто это — бот пока не знает)';
   return `[${q.slot}] ${q.title} — ${state}${q.goal}${items}: ${progress}${q.reward ? `; награда: ${q.reward}` : ''}`;
 }
 
@@ -332,5 +363,5 @@ function matchesQuery(text, query) {
 
 module.exports = {
   parseQuest, parseQuestMenu, parseOffer, deliverItems, describeQuest, parseNumber, parseDuration, matchesQuery, parseQuestChat, sameTitle,
-  questNpc, questRules, KIND_NAMES, QUEST_NPCS, MAX_NPC_LEVEL, ITEM_WORDS,
+  questNpc, questRules, mobsOf, mobName, KIND_NAMES, QUEST_NPCS, MAX_NPC_LEVEL, ITEM_WORDS, MOB_WORDS,
 };

@@ -10,7 +10,7 @@ const { Vec3 } = require('vec3');
 const { FACE_VECTORS } = require('./actions');
 const { chatToText } = require('../chat-utils');
 const {
-  parseQuestMenu, parseOffer, describeQuest, matchesQuery, deliverItems, parseQuestChat, sameTitle, questNpc, questRules,
+  parseQuestMenu, parseOffer, describeQuest, matchesQuery, deliverItems, parseQuestChat, sameTitle, questNpc, questRules, mobsOf, mobName,
 } = require('./quests');
 const { isStorageWindow } = require('./window-clicks');
 const { moveStacks, countIn, itemsIn, storageSlots, playerSlots } = require('./chests');
@@ -756,7 +756,13 @@ const hasQuests = (w) => {
 const hasOffers = (w) => menuSlots(w).some((s) => parseOffer(s));
 const openQuests = (bot, npc) => openNpcSection(bot, npc, hasQuests, /улучшени|задани|квест/i, 'Улучшения');
 const openShop = (bot, npc) => openNpcSection(bot, npc, hasOffers, /покупк|купить|магазин/i, 'Покупка');
-const readQuests = (bot) => (bot.currentWindow ? parseQuestMenu(menuSlots(bot.currentWindow)) : { quests: [], level: null });
+/** Задания из открытого меню. Заодно запоминаем «Убейте…» — для #бей без слов. */
+function readQuests(bot) {
+  if (!bot.currentWindow) return { quests: [], level: null };
+  const menu = parseQuestMenu(menuSlots(bot.currentWindow));
+  rememberKillGoals(bot, windowTitle(bot.currentWindow), menu.quests);
+  return menu;
+}
 
 /** Кликнуть по ячейке меню и дождаться, пока сервер пересоберёт меню. */
 async function clickAndSettle(bot, slot) {
@@ -1645,6 +1651,155 @@ async function cmdNearby({ bot }) {
   };
 }
 
+// ---------- бой: «#бей пауков 20» и задания «Убейте…» ----------
+
+const FIGHT_IDLE_MS = 60 * 1000; // столько никого в досягаемости — бой окончен
+const FIGHT_MAX_MS = 30 * 60 * 1000; // и не дольше получаса за раз (дальше — снова командой)
+const FIGHT_WAIT_MS = 250; // пауза, пока ждём, что кто-нибудь подойдёт
+const KILL_CONFIRM_MS = 4000; // цель умерла в течение стольких после нашего удара — наш счёт
+const FIGHT_MIN_HEALTH = 6; // здоровья меньше (режим бога не спас) — из боя уходим
+const MAX_KILLS = 1000;
+const lastKillGoals = new Map(); // ник бота → Map(NPC → [{ title, mobs, left }]): «Убейте…» из последнего взгляда на задания
+
+/** Задания «Убейте…» из меню заданий NPC — запомнить для #бей без слов (меню без заданий не трогает). */
+function rememberKillGoals(bot, title, quests) {
+  if (!quests.length) return;
+  const npc = String(title || '').split('›')[0].trim() || '?';
+  const goals = quests
+    .filter((q) => q.kind === 'kill' && q.taken && !q.done && q.mobs && q.mobs.length && q.need > q.have)
+    .map((q) => ({ title: q.title, mobs: q.mobs, left: q.need - q.have }));
+  const key = norm(bot.username);
+  if (!lastKillGoals.has(key)) lastKillGoals.set(key, new Map());
+  lastKillGoals.get(key).set(npc, goals);
+}
+
+/** Пауза между ударами под оружие (полная сила удара в 1.21): меч — 0,625 с, топор — около 1 с. */
+function cooldownFor(item) {
+  const name = item ? item.name : '';
+  if (/_sword$/.test(name)) return 13;
+  if (/_axe$/.test(name)) return 21;
+  if (name === 'trident') return 19;
+  if (name === 'mace') return 34;
+  return 10;
+}
+
+const hasCustomName = (e) => {
+  try {
+    return typeof e.getCustomName === 'function' && Boolean(e.getCustomName());
+  } catch (_) {
+    return false;
+  }
+};
+
+/**
+ * Кого бить: мобы нужных видов, до которых бот достаёт ударом не сходя с места (и не сквозь стену), ближние
+ * первыми. Игроков (и NPC-«игроков») и мобов с именем (чьи-то питомцы, NPC) — никогда.
+ */
+function fightTargets(bot, wanted) {
+  const me = bot.entity.position;
+  return Object.values(bot.entities || {})
+    .filter((e) => e && e !== bot.entity && e.type !== 'player' && e.position && wanted.has(e.name) && !hasCustomName(e))
+    .filter((e) => bot.actions.canHit(e))
+    .sort((a, b) => a.position.distanceTo(me) - b.position.distanceTo(me));
+}
+
+/**
+ * Бой на месте: бить мобов из goals ([{ mobs, left }] — left уменьшается по ходу), пока каждой цели не наберётся
+ * или никого нет idleMs. Убитый — тот, кто умер вскоре после нашего удара. → { kills: Map(моб → сколько), note }
+ */
+async function fight(bot, goals, { idleMs = FIGHT_IDLE_MS, maxMs = FIGHT_MAX_MS } = {}) {
+  const hitAt = new Map();
+  const kills = new Map();
+  const wanted = () => new Set(goals.filter((g) => g.left > 0).flatMap((g) => g.mobs));
+  const onDead = (e) => {
+    if (!e || !hitAt.has(e.id) || Date.now() - hitAt.get(e.id) > KILL_CONFIRM_MS) return;
+    hitAt.delete(e.id);
+    kills.set(e.name, (kills.get(e.name) || 0) + 1);
+    const g = goals.find((x) => x.left > 0 && x.mobs.includes(e.name));
+    if (g) g.left -= 1;
+  };
+  bot.on('entityDead', onDead);
+  const started = Date.now();
+  let idle = 0;
+  let note = '';
+  try {
+    for (;;) {
+      const mobs = wanted();
+      if (!mobs.size) break; // всё набрали
+      if (Date.now() - started > maxMs) {
+        note = `прошло ${Math.round(maxMs / 60000)} мин — на один раз хватит`;
+        break;
+      }
+      if (Number.isFinite(bot.health) && bot.health > 0 && bot.health < FIGHT_MIN_HEALTH) {
+        note = `мало здоровья (${Math.round(bot.health)} из 20) — режим бога не помог`;
+        break;
+      }
+      const target = fightTargets(bot, mobs)[0];
+      if (!target) {
+        if (idle >= idleMs) {
+          note = `рядом никого ${Math.round(idleMs / 1000)} с`;
+          break;
+        }
+        await bot.actions.wait(FIGHT_WAIT_MS);
+        idle += FIGHT_WAIT_MS;
+        continue;
+      }
+      idle = 0;
+      hitAt.set(target.id, Date.now()); // до удара: сервер может ответить смертью раньше, чем удар «вернётся»
+      try {
+        await bot.actions.attack(target, { cooldownTicks: cooldownFor(bot.heldItem) });
+        hitAt.set(target.id, Date.now());
+      } catch (err) {
+        if (err && (err.code === 'stopped' || err.code === 'replaced')) throw err;
+        // цель пропала, отошла или за блоком — берём следующую
+      }
+    }
+  } finally {
+    bot.removeListener('entityDead', onDead);
+  }
+  return { kills, note };
+}
+
+/** «#бей пауков 20», «#бей ифритов», «#бей» — для заданий «Убейте…», которые бот видел у NPC. */
+async function cmdFight({ bot, args }) {
+  const num = args.find((a) => /^\d+$/.test(a));
+  const text = args.filter((a) => a !== num).join(' ');
+  let goals;
+  if (text) {
+    const mobs = mobsOf(text);
+    if (!mobs.length) throw new CommandError(`не знаю, кто это: «${text}». Например: #бей пауков 20, #бей ифритов, #бей зомби`);
+    goals = [{ title: null, mobs, left: num ? Math.min(MAX_KILLS, Math.max(1, parseInt(num, 10))) : Infinity }];
+  } else {
+    goals = [...(lastKillGoals.get(norm(bot.username)) || new Map()).values()].flat().filter((g) => g.left > 0);
+    if (!goals.length) {
+      throw new CommandError('кого бить? Например: #бей пауков 20. Без слов — для заданий «Убейте…», но таких бот не видел: сначала #квесты у NPC');
+    }
+  }
+  // Оружие: лучший меч, нет — лучший топор, нет и его — чем есть.
+  for (const word of ['меч', 'топор']) {
+    let item = null;
+    try {
+      item = findItem(bot, word);
+    } catch (_) {
+      continue;
+    }
+    if (!bot.heldItem || bot.heldItem.name !== item.name) await bot.actions.equip(item.name);
+    break;
+  }
+  const r = await fight(bot, goals);
+  const total = [...r.kills.values()].reduce((a, b) => a + b, 0);
+  const lines = [total ? `Убил: ${[...r.kills.entries()].map(([id, n]) => `${mobName(id)} ×${n}`).join(', ')} — всего ${total}` : 'Никого не убил'];
+  const finite = goals.filter((g) => Number.isFinite(g.left));
+  const left = finite.filter((g) => g.left > 0);
+  const reached = finite.length > 0 && !left.length;
+  if (reached) lines.push(`Готово${goals.some((g) => g.title) ? ': для заданий хватит (засчитывается само)' : ''}`);
+  if (r.note) lines.push(`Остановился: ${r.note}`);
+  if (left.length) lines.push(`Ещё нужно: ${left.map((g) => `${g.title ? `${quote(g)} — ` : ''}${g.mobs.map(mobName).join('/')} ${g.left}`).join('; ')}`);
+  const kills = Object.fromEntries(r.kills);
+  const ok = total > 0 || reached;
+  return { ok, code: ok ? undefined : 'no_targets', message: lines, data: { kills, total, left: left.map((g) => ({ title: g.title, mobs: g.mobs, left: g.left })) } };
+}
+
 // ---------- пинг ----------
 
 const PING_SAMPLES = 3;
@@ -1809,6 +1964,14 @@ const COMMANDS = [
   { name: 'возьми', aliases: ['equip', 'вруку'], usage: ['#возьми <предмет>'], about: 'взять в руку; можно по-русски: земля, булыжник, доски, кирка, меч… («из сундука» — как #достань)', run: cmdEquip },
   { name: 'инвентарь', aliases: ['inv', 'инв'], usage: ['#инвентарь'], about: 'что у бота в руке и в инвентаре', observe: true, run: cmdInventory },
   { name: 'рядом', aliases: ['near', 'кто'], usage: ['#рядом'], about: 'игроки и сундуки поблизости', observe: true, run: cmdNearby },
+  {
+    name: 'бей',
+    aliases: ['убей', 'бить', 'attack', 'fight'],
+    usage: ['#бей пауков 20', '#бей ифритов', '#бей'],
+    about: 'бить мобов рядом, не сходя с места (в досягаемости, не сквозь стену; игроков и мобов с именем не трогает): ' +
+      'N штук или пока подходят; без слов — сколько нужно для заданий «Убейте…» (бот запоминает их у NPC)',
+    run: cmdFight,
+  },
   {
     name: 'пинг',
     aliases: ['ping', 'задержка'],

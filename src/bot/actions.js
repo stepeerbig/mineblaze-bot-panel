@@ -611,34 +611,62 @@ function inject(bot, { random, now }) {
     });
   }
 
+  const entityBox = (entity) => {
+    const w = (entity.width || 0.6) / 2;
+    const p = entity.position;
+    return [p.x - w, p.y, p.z - w, p.x + w, p.y + (entity.height || 1.8), p.z + w];
+  };
+  const aimPoint = (entity) => entity.position.offset(0, (entity.height || 1.8) * 0.7, 0);
+
+  /** Блок на пути взгляда до сущности (на расстоянии t по лучу dir) — стена между ботом и целью. */
+  function wallBefore(eye, dir, t) {
+    return raycastBlocks(blockAt, eye, dir, Math.max(0, t - 1e-3), shapesFor(null));
+  }
+
+  /**
+   * Достанет ли бот до сущности ударом, не сходя с места: она в досягаемости и между глазами и ею нет блока
+   * (ударить сквозь стену обычный клиент не может — античит это видит).
+   */
+  function canHit(entity) {
+    if (!entity || !entity.position || !bot.entity) return false;
+    const eye = eyePosition();
+    const box = entityBox(entity);
+    if (eye.distanceTo(closestPointOnBox(box, eye)) > ENTITY_REACH) return false;
+    const to = aimPoint(entity).minus(eye);
+    const len = to.norm();
+    if (len < 1e-6) return true;
+    const dir = to.scaled(1 / len);
+    const t = rayBox(eye, dir, box);
+    return !wallBefore(eye, dir, t === null ? len : t);
+  }
+
   /** Ударить сущность: взгляд на неё, удар и взмах; между ударами — пауза восстановления. */
   function attack(entity, { cooldownTicks = ATTACK_COOLDOWN_TICKS } = {}) {
     return run('ударить', async (signal) => {
       if (!entity || !entity.position) throw new ActionError('не на кого нападать');
-      const boxOf = () => {
-        const w = (entity.width || 0.6) / 2;
-        const p = entity.position;
-        return [p.x - w, p.y, p.z - w, p.x + w, p.y + (entity.height || 1.8), p.z + w];
-      };
+      const boxOf = () => entityBox(entity);
       await standStill(signal);
       for (let i = 0; i < LOOK_TIMEOUT_TICKS; i += 1) {
         if (!bot.entities || !bot.entities[entity.id]) throw new ActionError('цель пропала');
         const eye = eyePosition();
         const box = boxOf();
         if (eye.distanceTo(closestPointOnBox(box, eye)) > ENTITY_REACH) throw new ActionError('цель слишком далеко');
-        const aim = entity.position.offset(0, (entity.height || 1.8) * 0.7, 0);
-        const a = anglesTo(eye, aim);
+        const a = anglesTo(eye, aimPoint(entity));
         bot.look(a.yaw, a.pitch, true);
         const ready = bot.serverView.lookSettled && ticks() - lastAttackTick >= cooldownTicks;
         if (ready) {
           const done = await inTick(() => {
-            const t = rayBox(eyePosition(), currentLook(), boxOf());
+            const from = eyePosition();
+            const dir = currentLook();
+            const t = rayBox(from, dir, boxOf());
             if (t === null || t > ENTITY_REACH) return false;
+            if (wallBefore(from, dir, t)) return 'wall'; // взгляд упирается в блок раньше цели
             bot._client.write('use_entity', { target: entity.id, mouse: 1, sneaking: Boolean(bot.getControlState('sneak')) });
             swing();
             lastAttackTick = ticks();
             return true;
           }, signal);
+          if (done === 'wall') throw new ActionError('цель за блоком — сквозь стену не бью', 'blocked');
           if (done) return { target: entity.username || entity.name || entity.id };
         } else {
           await inTick(() => {}, signal);
@@ -811,6 +839,7 @@ function inject(bot, { random, now }) {
     place,
     activate,
     attack,
+    canHit,
     interact,
     clickSlot,
     closeMenu,

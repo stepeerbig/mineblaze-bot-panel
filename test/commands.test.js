@@ -432,7 +432,7 @@ test('команды: #квесты у Фермера — показать, вз
     'Задания (Фермер › Уровень 1 → 2): 3, взято 1, выполнено 0',
     '[11] Грядки без истерики. — Передайте пшеницу, морковь, картофель или свёклу (wheat, carrot, potato, beetroot): 0/224; награда: 24 хлеба',
     '[14] Посиди у костра. — не взято, Проведите на сервере: 0 мин из 3 ч; награда: 2 500 монет',
-    '[21] Ночная прополка. — не взято, Убейте пауков: 0/20; награда: 24 нити',
+    '[21] Ночная прополка. — не взято, Убейте пауков (spider, cave_spider): 0/20; награда: 24 нити',
     'Уровень: Ещё не все задания уровня выполнены до конца.',
   ]);
   assert.equal(bot.currentWindow, null, 'посмотрел — закрыл меню');
@@ -878,6 +878,74 @@ test('команды: #квесты купить — «Купите у Ферм�
     'Купил у Фермер для «Аванс на семена.»: «Тюк сена» (×32) ×1, «Морковь» (×32) ×1 — потрачено 8900: 0 → 8900 из 12000',
     'Докупить не вышло: сервер не продал — «У вас недостаточно средств» — дай боту денег: /pay Farm01 3100',
   ]);
+});
+
+test('команды: #бей — только нужные мобы в досягаемости и не сквозь стену; игроков и мобов с именем не трогает; без слов — для заданий «Убейте…»', async () => {
+  const json = (text) => JSON.stringify({ text });
+  const mob = (id, name, x, z, extra = {}) => ({ id, type: 'hostile', name, position: new Vec3(x, 64, z), width: 1.4, height: 0.9, hp: 2, ...extra });
+  const spiders = [mob(301, 'spider', 0.5, 2.5), mob(302, 'spider', -1.5, 0.5), mob(303, 'cave_spider', 0.5, -1.5)];
+  const walled = mob(304, 'spider', 3.5, 0.5);
+  const far = mob(305, 'spider', 0.5, 7.5);
+  const named = mob(306, 'spider', -1.5, -1.5, { getCustomName: () => ({ toString: () => 'Пушок' }) });
+  const zombie = { ...mob(307, 'zombie', 1.5, 1.5), width: 0.6, height: 1.95 };
+  const player = { id: 308, type: 'player', username: 'Spider', name: 'player', position: new Vec3(-0.5, 64, 1.5), width: 0.6, height: 1.8 };
+  const s = setup({ entities: [...spiders, walled, far, named, zombie, player], inventory: [['iron_sword', 1], ['wooden_sword', 1]] });
+  for (const y of [64, 65]) s.world.set(new Vec3(2, y, 0), 'stone'); // стена между ботом и пауком 304
+  const attacked = [];
+  const write = s.bot._client.write;
+  s.bot._client.write = (name, params) => {
+    write(name, params);
+    if (name !== 'use_entity' || params.mouse !== 1) return;
+    attacked.push(params.target);
+    const e = s.bot.entities[params.target];
+    if (e && e.hp !== undefined && (e.hp -= 1) <= 0) {
+      delete s.bot.entities[params.target];
+      s.bot.emit('entityDead', e);
+    }
+  };
+
+  assert.match((await s.run('#бей')).message, /кого бить\? Например: #бей пауков 20/);
+  assert.match((await s.run('#бей драконов')).message, /не знаю, кто это: «драконов»/);
+
+  const r = await s.run('#бей пауков 3', 60000);
+  assert.equal(r.ok, true, [].concat(r.message).join('\n'));
+  assert.deepEqual(r.message, ['Убил: паук ×2, пещерный паук ×1 — всего 3', 'Готово']);
+  assert.deepEqual([...new Set(attacked)].sort(), [301, 302, 303], 'только видимые пауки в досягаемости');
+  assert.equal(attacked.length, 6, 'по два удара на паука');
+  assert.equal(s.bot.heldItem && s.bot.heldItem.name, 'iron_sword', 'лучший меч в руке');
+
+  // Пауки остались — но за стеной, далеко или с именем: бить некого, ждёт и уходит.
+  const idle = await s.run('#бей пауков', 90000);
+  assert.equal(idle.ok, false);
+  assert.deepEqual(idle.message, ['Никого не убил', 'Остановился: рядом никого 60 с']);
+  assert.ok(!attacked.some((id) => [304, 305, 306, 307, 308].includes(id)), 'стена, даль, имя, зомби и игрок — не цели');
+
+  // Задания «Убейте пауков: 18/20» — бот видит у NPC и потом бьёт, сколько нужно.
+  const quests = () => ({
+    id: 9,
+    title: json('Фермер › Уровень 1 → 2'),
+    inventoryStart: 54,
+    slots: Object.assign(new Array(90).fill(null), {
+      21: { name: 'string', count: 1, customName: json('Ночная прополка.'), customLore: [json('▪ Награда: 24 нити'), json('Убейте пауков: 18/20')] },
+    }),
+  });
+  s.bot.entities[401] = { id: 401, type: 'mob', name: 'villager', position: new Vec3(0.5, 64, 2.5), height: 1.95, width: 0.6, getCustomName: () => ({ json: { text: 'Фермер' }, toString: () => 'Фермер' }) };
+  s.bot.npcMenus = quests;
+  const npcWrite = s.bot._client.write;
+  s.bot._client.write = (name, params) => {
+    npcWrite(name, params);
+    if (name === 'use_entity' && params.mouse === 0 && params.target === 401) {
+      s.bot.currentWindow = quests();
+      s.bot.emit('windowOpen', s.bot.currentWindow);
+    }
+  };
+  const shown = await s.run('#квесты');
+  assert.ok([].concat(shown.message).includes('[21] Ночная прополка. — Убейте пауков (spider, cave_spider): 18/20; награда: 24 нити'));
+  for (const m of [mob(311, 'spider', 1.5, -0.5), mob(312, 'spider', -0.5, -0.5)]) s.bot.entities[m.id] = m;
+  const forQuest = await s.run('#бей', 60000);
+  assert.equal(forQuest.ok, true, [].concat(forQuest.message).join('\n'));
+  assert.deepEqual(forQuest.message, ['Убил: паук ×2 — всего 2', 'Готово: для заданий хватит (засчитывается само)']);
+  assert.match((await s.run('#бей')).message, /кого бить\?/, 'для заданий больше не нужно');
 });
 
 test('команды: сундук на чужой территории — сервер не даёт открыть, бот так и пишет', async () => {

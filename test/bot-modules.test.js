@@ -194,6 +194,31 @@ test('профиль: пакеты собираются протоколом 1.2
 
 const { fakeClock, physicsBot, teleport, names, take } = require('./fake-bot');
 
+test('физика: отбрасывание (entity_velocity) — в 1.21.9+ скорость уже в блоках за тик, бот правда отлетает (Grim: AntiKB)', () => {
+  const { entityVelocityScale } = require(path.join(SRC, 'physics.js'));
+  assert.equal(entityVelocityScale(require('prismarine-registry')('1.21.11')), 1, '1.21.11: lpVec3 — без деления');
+  assert.equal(entityVelocityScale(require('prismarine-registry')('1.21.4')), 1 / 8000, '1.21.4: vec3i16 — в 1/8000 блока');
+  assert.equal(entityVelocityScale(null), 1 / 8000);
+
+  const clock = fakeClock();
+  const bot = physicsBot({ clock });
+  bot.emit('login');
+  teleport(bot);
+  clock.advance(100);
+  take(bot);
+  // Чужая сущность — не наша забота.
+  bot._client.emit('entity_velocity', { entityId: 7, velocity: { x: 1, y: 1, z: 1 } });
+  assert.deepEqual([bot.entity.velocity.x, bot.entity.velocity.z], [0, 0]);
+  // Удар: сервер толкает бота на +x и вверх — как обычный клиент, бот летит с этой скоростью.
+  const x0 = bot.entity.position.x;
+  bot._client.emit('entity_velocity', { entityId: bot.entity.id, velocity: { x: 0.4, y: 0.36, z: 0 } });
+  assert.deepEqual([bot.entity.velocity.x, bot.entity.velocity.y, bot.entity.velocity.z], [0.4, 0.36, 0]);
+  clock.advance(50);
+  assert.ok(bot.entity.position.x - x0 > 0.3, `бот отлетел: ${(bot.entity.position.x - x0).toFixed(3)} блока`);
+  const moved = take(bot).filter((p) => /^position/.test(p.name));
+  assert.ok(moved.length >= 1, 'и сообщил серверу, куда отлетел');
+});
+
 test('физика: tick_end в конце каждого тика — ровно 20 в секунду, и только в игре', () => {
   const clock = fakeClock();
   const bot = physicsBot({ clock });

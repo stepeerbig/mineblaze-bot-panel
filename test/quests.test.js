@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   parseQuest, parseQuestMenu, parseOffer, deliverItems, describeQuest, parseNumber, parseDuration, matchesQuery, parseQuestChat, sameTitle,
-  questNpc, questRules, MAX_NPC_LEVEL, ITEM_WORDS,
+  questNpc, questRules, MAX_NPC_LEVEL, ITEM_WORDS, mobsOf, MOB_WORDS,
 } = require('../src/bot/quests');
 const { VERSION } = require('./fake-bot');
 
@@ -129,6 +129,25 @@ test('задания Алхимика (скриншоты 5 ноября): вс�
   assert.deepEqual(deliverItems('маринованные паучьи глаза'), ['fermented_spider_eye']);
   assert.deepEqual(deliverItems('сверкающие ломтики арбуза, сахар или сахарный тростник'), ['glistering_melon_slice', 'sugar', 'sugar_cane']);
   assert.deepEqual(deliverItems('светокаменную пыль или слёзы гаста'), ['glowstone_dust', 'ghast_tear']);
+});
+
+test('кого убить: мобы по-русски в любом падеже, составные раньше простых; задания «Убейте…» знают своих мобов', () => {
+  assert.deepEqual(mobsOf('пауков'), ['spider', 'cave_spider']);
+  assert.deepEqual(mobsOf('пещерных пауков'), ['cave_spider']);
+  assert.deepEqual(mobsOf('пиглинов'), ['piglin', 'piglin_brute']);
+  assert.deepEqual(mobsOf('зомбифицированных пиглинов'), ['zombified_piglin']);
+  assert.deepEqual(mobsOf('ифритов'), ['blaze']);
+  assert.deepEqual(mobsOf('скелетов-иссушителей или зомби'), ['wither_skeleton', 'zombie']);
+  assert.deepEqual(mobsOf('коров или куриц'), ['cow', 'chicken']);
+  assert.deepEqual(mobsOf('драконов'), []);
+  const { quests } = parseQuestMenu(ALCHEMIST);
+  const by = Object.fromEntries(quests.map((q) => [q.slot, q]));
+  assert.deepEqual(by[14].mobs, ['piglin', 'piglin_brute']);
+  assert.deepEqual(by[21].mobs, ['blaze']);
+  assert.equal(describeQuest(by[21]), '[21] Пожарный экзамен. — Убейте ифритов (blaze): 0/45; награда: 24 огненного порошка');
+  // Все мобы из словаря есть в игре (1.21.11).
+  const registry = require('prismarine-registry')(VERSION);
+  assert.deepEqual(MOB_WORDS.flatMap(([, ids]) => ids).filter((id) => !registry.entitiesByName[id]), []);
 });
 
 test('Оружейник закрыт (уровень 0 → 1): условия «Прокачайте Фермера до 4 уровня» — тоже задания, с прогрессом в уровнях', () => {
