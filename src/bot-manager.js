@@ -703,12 +703,23 @@ class BotManager extends EventEmitter {
 
   /** Команда боту из строки чата («#goto 10 64 -5»): выполняется здесь, на сервер не уходит. */
   _command(line) {
+    this.command(line);
+    return true;
+  }
+
+  /**
+   * Команда боту («#…») с ожиданием результата: { ok, code, message } — например, для «всем по очереди»:
+   * следующий бот начинает, когда этот закончил. Строки ответа — в консоль, как обычно.
+   */
+  async command(line) {
     const shown = `› ${line}`;
     this.emit('chat', { time: Date.now(), text: shown, motd: shown, position: 'self' });
-    runCommand(this.getBot(), line, (level, text) => this.log(level, text)).catch((err) => {
+    try {
+      return await runCommand(this.getBot(), line, (level, text) => this.log(level, text));
+    } catch (err) {
       this.log('error', `${line}: ${describeError(err)}`);
-    });
-    return true;
+      return { ok: false, code: 'failed', message: describeError(err) };
+    }
   }
 
   /** Опции createBot, чтобы бот вёл себя как обычный клиент (см. DEFAULT_COMPAT и src/bot/). */

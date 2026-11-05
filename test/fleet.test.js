@@ -23,7 +23,7 @@ function makeFleet({ perProcess = 3, gapMs = 30, autoReconnect = false } = {}) {
     clientTimings: { restartDelay: 10, requestTimeout: 2000, shutdownTimeout: 200 },
   });
   const events = [];
-  for (const name of ['log', 'state', 'chat', 'list', 'crash']) fleet.on(name, (p) => events.push([name, p]));
+  for (const name of ['log', 'state', 'chat', 'list', 'crash', 'turn']) fleet.on(name, (p) => events.push([name, p]));
   const managers = () => mem.children.filter((c) => !c.dead).flatMap((c) => c.managers);
   const managerOf = (nick) => managers().find((m) => m.opts.config.username === nick);
   return { fleet, mem, config, events, managers, managerOf };
@@ -127,6 +127,38 @@ test('флот: «всем ботам» — только команды, все�
   assert.equal(await fleet.say('nobody', 'привет'), false);
   assert.equal(await fleet.setAutoReconnect(true), true);
   assert.ok(managerOf('Farm01').calls.includes('autoReconnect:true:quiet'));
+  await fleet.shutdown();
+});
+
+test('флот: «всем по очереди» — команда боту по одному (следующий — когда закончил предыдущий); «#стоп» всем — останавливает', async () => {
+  const { fleet, managers, managerOf, events } = makeFleet({ perProcess: 2, gapMs: 1 });
+  fleet.setAccounts(accounts(4));
+  await fleet.start();
+  assert.ok(await waitFor(() => fleet.summary().online === 4));
+  assert.deepEqual(fleet.runInTurn('/warp ah'), { targets: 0, refused: 'по очереди — только команды боту «#…» (у «/…» нет конца, который можно ждать)' });
+  managerOf('Farm03').failCommands = true;
+  assert.deepEqual(fleet.runInTurn('#квесты принести'), { targets: 4 });
+  assert.match(fleet.runInTurn('#где').refused, /^уже идёт очередь «#квесты принести» \(0 из 4\)/);
+  assert.ok(await waitFor(() => events.some(([n]) => n === 'turn')));
+  const runs = managers().flatMap((m) => (m.runs || []).map((r) => ({ ...r, nick: m.opts.config.username }))).sort((a, b) => a.started - b.started);
+  assert.deepEqual(runs.map((r) => r.nick), ['Farm01', 'Farm02', 'Farm03', 'Farm04'], 'по порядку списка');
+  for (let i = 1; i < runs.length; i += 1) assert.ok(runs[i].started >= runs[i - 1].ended - 1, `${runs[i].nick} начал, когда ${runs[i - 1].nick} закончил`);
+  const done = events.find(([n]) => n === 'turn')[1];
+  assert.deepEqual(done, { line: '#квесты принести', total: 4, ok: 3, failed: ['Farm03'], cancelled: false });
+  assert.ok(events.some(([n, p]) => n === 'log' && p.text === 'По очереди «#квесты принести»: готово — без ошибок 3 из 4; не вышло: Farm03'));
+
+  // «#стоп» всем: тот, кто начал, доделывает, новые не начинают.
+  events.length = 0;
+  for (const m of managers()) m.commandMs = 80;
+  fleet.runInTurn('#квесты купить');
+  await flush(20);
+  fleet.broadcast('#стоп');
+  assert.ok(await waitFor(() => events.some(([n]) => n === 'turn')));
+  const stopped = events.find(([n]) => n === 'turn')[1];
+  assert.equal(stopped.cancelled, true);
+  assert.equal(managers().filter((m) => (m.runs || []).some((r) => r.line === '#квесты купить')).length, 1, 'начал только первый');
+  assert.ok(managerOf('Farm04').calls.includes('say:#стоп'), '#стоп ушёл и самим ботам');
+  assert.deepEqual(fleet.runInTurn('#где'), { targets: 4 }, 'после остановки можно новую очередь');
   await fleet.shutdown();
 });
 

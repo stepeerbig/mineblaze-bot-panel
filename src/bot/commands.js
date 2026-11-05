@@ -774,6 +774,7 @@ function questArgs(args, words) {
     сдать: 'give', сдай: 'give', отдать: 'give', отдай: 'give', give: 'give', deliver: 'give',
     принести: 'bring', принеси: 'bring', bring: 'bring',
     уровень: 'level', повысить: 'level', повысь: 'level', улучшить: 'level', улучши: 'level', level: 'level', up: 'level',
+    купить: 'buy', купи: 'buy', закупить: 'buy', закупи: 'buy', buy: 'buy',
   };
   let action = 'show';
   const rest = [];
@@ -836,6 +837,14 @@ async function cmdQuests({ bot, args, words }) {
       lines.push(...[].concat(gave.message));
       const up = await levelUpAfterGiving(bot, npc, gave.data.gave, lines);
       return { ok: !up || up.up, code: up && !up.up ? 'unconfirmed' : undefined, message: lines, data: { ...gave.data, levelUp: up } };
+    }
+    if (action === 'buy') {
+      const r = await buyForQuests(bot, npc);
+      if (!r) return { ok: true, message: 'Покупать нечего: заданий «Купите…» нет или они уже выполнены', data: { npc, spent: 0 } };
+      lines.push(...r.lines);
+      const up = await levelUpAfterGiving(bot, npc, [r.quest], lines); // купили последнее — новый уровень
+      const ok = r.ok && (!up || up.up);
+      return { ok, code: ok ? undefined : 'not_bought', message: lines, data: { npc, spent: r.spent, bought: r.bought, left: r.left, levelUp: up } };
     }
     return showQuests(bot, npc);
   } catch (err) {
@@ -1004,6 +1013,106 @@ async function giveQuests(bot, npc) {
   return { ok: true, message: lines, data: { npc, gave } };
 }
 
+// ---------- задания «Купите у NPC товаров на N» ----------
+
+const MAX_QUEST_PURCHASES = 40; // за один раз не больше стольких покупок: деньги тратятся настоящие
+
+/**
+ * Что купить следующим, чтобы набрать left (деньги настоящие — главное не переплатить): самый дорогой товар,
+ * который не больше остатка (без переплаты и с меньшим числом кликов); остаток меньше любой цены — самый
+ * дешёвый (переплата меньше самой маленькой цены). Только то, что продаётся и не кончилось.
+ */
+function pickPurchase(offers, left) {
+  const can = offers.filter((o) => o && o.buyable && o.price > 0 && o.left !== 0);
+  const fits = can.filter((o) => o.price <= left).sort((a, b) => b.price - a.price);
+  return fits[0] || can.sort((a, b) => a.price - b.price)[0] || null;
+}
+
+/** Задания «Купите…» этого NPC, которые ещё не набраны: [{ q, left }]. */
+const buyTodo = (quests) => quests.filter((q) => q.kind === 'buy' && q.taken && !q.done && q.need > q.have);
+
+/**
+ * «Купите у Фермера товаров на: 0/12000» — купить в «Покупке» на недостающую сумму за деньги бота (ТЗ).
+ * Первая покупка проверяется по самому заданию: не засчиталась — дальше не покупаем. Меню заданий должно быть
+ * открыто (читаем из него); в конце открыто снова оно же, уже с новым прогрессом.
+ * → null (покупать нечего) или { lines, ok, spent, bought: [{ title, times }], left }
+ */
+async function buyForQuests(bot, npc) {
+  const before = buyTodo(readQuests(bot).quests);
+  if (!before.length) return null;
+  const quest = before.reduce((a, b) => (b.need - b.have > a.need - a.have ? b : a));
+  let left = quest.need - quest.have;
+  const bought = new Map();
+  let spent = 0;
+  let purchases = 0;
+  let note = '';
+  const shop = async () => {
+    await closeAfter(bot);
+    await openShop(bot, npc);
+  };
+  const buyNext = async () => {
+    const offer = pickPurchase(menuSlots(bot.currentWindow).map(parseOffer), left);
+    if (!offer) {
+      note = 'в «Покупке» больше нечего купить';
+      return false;
+    }
+    const r = await buyOnce(bot, offer.slot);
+    if (!r.ok) {
+      note = r.why;
+      return false;
+    }
+    purchases += 1;
+    spent += offer.price;
+    left -= offer.price;
+    const key = `«${offer.title}»${offer.count > 1 ? ` (×${offer.count})` : ''}`;
+    bought.set(key, (bought.get(key) || 0) + 1);
+    return true;
+  };
+  await shop();
+  let firstOk = await buyNext();
+  if (firstOk) {
+    // Засчиталась ли покупка в задание? Нет — деньги дальше не тратим.
+    await closeAfter(bot);
+    await openQuests(bot, npc);
+    const now = readQuests(bot).quests.find((q) => q.slot === quest.slot && sameTitle(q.title, quest.title));
+    if (now && !now.done && now.have <= quest.have) {
+      firstOk = false;
+      note = `покупка не засчиталась в задание (${quest.have} → ${now.have} из ${quest.need}) — дальше не покупаю`;
+    } else if (now) {
+      left = now.done ? 0 : now.need - now.have;
+    }
+    if (firstOk && left > 0) {
+      await shop();
+      while (left > 0 && purchases < MAX_QUEST_PURCHASES && (await buyNext()));
+      if (left > 0 && purchases >= MAX_QUEST_PURCHASES && !note) note = `за раз не больше ${MAX_QUEST_PURCHASES} покупок — продолжу в следующий раз`;
+    }
+  }
+  // Итог — по самому заданию.
+  await closeAfter(bot);
+  await openQuests(bot, npc);
+  const after = readQuests(bot).quests.find((q) => q.slot === quest.slot && sameTitle(q.title, quest.title));
+  const done = Boolean(after && after.done);
+  const list = [...bought.entries()].map(([title, times]) => ({ title, times }));
+  const lines = [];
+  if (list.length) {
+    const what = list.map((x) => `${x.title} ×${x.times}`).join(', ');
+    const progress = after ? `: ${quest.have} → ${after.have} из ${quest.need}${done ? ' — выполнено' : ''}` : '';
+    lines.push(`Купил у ${npc} для ${quote(quest)}: ${what} — потрачено ${spent}${progress}`);
+  }
+  const remaining = done ? 0 : Math.max(0, Math.ceil(after ? after.need - after.have : left));
+  // Похоже, кончились деньги — подсказать, сколько дать: столько не хватает до задания.
+  const money = /денег|средств|баланс|монет/i.test(note) ? ` — дай боту денег: /pay ${bot.username || '<ник бота>'} ${remaining}` : '';
+  if (!done && note) lines.push(`${list.length ? 'Докупить' : `Купить для ${quote(quest)}`} не вышло: ${note}${money}`);
+  return {
+    lines,
+    ok: done || (list.length > 0 && !note),
+    spent,
+    bought: list,
+    left: remaining,
+    quest: { slot: quest.slot, title: quest.title, done },
+  };
+}
+
 // ---------- задания «Передайте…» целиком: склад → NPC → склад наград ----------
 
 const NPC_WARP = '/warp ah'; // где стоят NPC с заданиями (ТЗ)
@@ -1131,6 +1240,20 @@ async function bringQuests(bot, npc, storageHome, rewardsHome) {
       if (up) data.levelUps.push({ up: up.up, level: up.level });
       const took = await takeQuests(bot, npc);
       if (took.data.took.length) lines.push([].concat(took.message)[0]);
+      // «Купите у NPC товаров на N» — пока бот у NPC, за свои деньги. Купили последнее — сразу новый уровень.
+      const bought = await buyForQuests(bot, npc);
+      if (bought) {
+        lines.push(...bought.lines);
+        data.bought = { spent: bought.spent, items: bought.bought, left: bought.left };
+        if (bought.quest.done) {
+          const again = await levelUpBeforeTaking(bot, npc, lines);
+          if (again) {
+            data.levelUps.push({ up: again.up, level: again.level });
+            const more = await takeQuests(bot, npc);
+            if (more.data.took.length) lines.push([].concat(more.message)[0]);
+          }
+        }
+      }
       quests = readQuests(bot).quests;
     } finally {
       await closeAfter(bot);
@@ -1207,14 +1330,36 @@ async function bringQuests(bot, npc, storageHome, rewardsHome) {
 }
 
 /** «#купи сено 2 у Фермер» — купить у NPC в разделе «Покупка». */
+/**
+ * Купить товар из ячейки slot открытой «Покупки» один раз. Покупку подтверждает «Осталось»: уменьшилось —
+ * куплено (счётчика нет — верим клику). → { ok } или { ok: false, why } (с тем, что сервер написал в чат).
+ */
+async function buyOnce(bot, slot) {
+  const read = () => parseOffer(menuSlots(bot.currentWindow).find((s) => s.slot === slot) || { lore: [] });
+  const before = read();
+  if (before && before.left === 0) return { ok: false, why: 'товар закончился' };
+  const chat = watchChat(bot);
+  try {
+    await clickAndSettle(bot, slot);
+  } finally {
+    chat.stop();
+  }
+  const after = read();
+  if (before && after && before.left !== null && after.left !== null && after.left >= before.left) {
+    const said = serverSaid(chat.lines, 1);
+    return { ok: false, why: `сервер не продал${said ? ` — «${said}»` : ' (не хватило денег?)'}` };
+  }
+  return { ok: true };
+}
+
 async function cmdBuy({ bot, args, words }) {
   const at = words.indexOf('у');
-  const npc = at >= 0 ? args.slice(at + 1).join(' ') : QUEST_NPC;
+  const npc = at >= 0 ? npcName(args.slice(at + 1).join(' ')) : QUEST_NPC;
   const head = at >= 0 ? args.slice(0, at) : args;
   const numIdx = head.findIndex((a) => /^\d+$/.test(a));
   const times = numIdx >= 0 ? Math.min(MAX_BUY, Math.max(1, parseInt(head[numIdx], 10))) : 1;
   const query = head.filter((_, i) => i !== numIdx).join(' ');
-  if (!query) throw new CommandError('что купить? Например: #купи сено 2 (или #купи сено 2 у Алхимик)');
+  if (!query) throw new CommandError('что купить? Например: #купи сено 2 (или #купи сено 2 у Алхимика)');
   try {
     await openShop(bot, npc);
     const offers = menuSlots(bot.currentWindow).map(parseOffer).filter(Boolean);
@@ -1223,16 +1368,9 @@ async function cmdBuy({ bot, args, words }) {
     let bought = 0;
     let note = '';
     for (let i = 0; i < times; i += 1) {
-      const before = parseOffer(menuSlots(bot.currentWindow).find((s) => s.slot === offer.slot) || { lore: [] });
-      if (before && before.left === 0) {
-        note = 'товар закончился';
-        break;
-      }
-      await clickAndSettle(bot, offer.slot);
-      const after = parseOffer(menuSlots(bot.currentWindow).find((s) => s.slot === offer.slot) || { lore: [] });
-      // Покупку подтверждает «Осталось»: уменьшилось — куплено. Если счётчика нет, верим клику.
-      if (before && after && before.left !== null && after.left !== null && after.left >= before.left) {
-        note = 'сервер не продал (не хватило денег?)';
+      const r = await buyOnce(bot, offer.slot);
+      if (!r.ok) {
+        note = r.why;
         break;
       }
       bought += 1;
@@ -1683,10 +1821,10 @@ const COMMANDS = [
   {
     name: 'квесты',
     aliases: ['quests', 'задания'],
-    usage: ['#квесты', '#квесты взять', '#квесты сдать', '#квесты уровень', '#квесты принести урожай награды', '#квесты у Алхимика', '#квесты взять у Оружейника'],
-    about: 'задания NPC (по умолчанию Фермер, у /warp ah): показать; взять все новые; сдать из инвентаря; уровень — повысить ' +
-      '(взять, сдать и принести повышают сами, когда все задания выполнены); принести — всё для «Передайте…» со склада ' +
-      '(/home урожай), сдать и сложить награды (/home награды)',
+    usage: ['#квесты', '#квесты взять', '#квесты сдать', '#квесты купить', '#квесты уровень', '#квесты принести урожай награды', '#квесты у Алхимика', '#квесты взять у Оружейника'],
+    about: 'задания NPC (по умолчанию Фермер, у /warp ah): показать; взять все новые; сдать из инвентаря; купить — для «Купите у NPC ' +
+      'товаров на N» (за деньги бота); уровень — повысить (взять, сдать, купить и принести повышают сами, когда все задания выполнены); ' +
+      'принести — всё для «Передайте…» со склада (/home урожай), «Купите…» у NPC, сдать и сложить награды (/home награды)',
     notes: questRules(), // правила заданий (какой NPC когда открывается) — для ИИ
     run: cmdQuests,
   },

@@ -790,6 +790,96 @@ test('команды: #пинг — замер ботом (ping_request → ping
   bot.actions.stop();
 });
 
+test('команды: #квесты купить — «Купите у Фермера товаров на N»: без лишней переплаты, первая покупка — проверка по заданию; нет денег — сколько дать', async () => {
+  const json = (text) => JSON.stringify({ text });
+  const PRICES = { 12: 8400, 13: 500 };
+  const TITLES = { 12: ['Тюк сена', 'hay_block'], 13: ['Морковь', 'carrot'] };
+  const ready = { name: 'sunflower', count: 1, customName: json('Доступно улучшение'), customLore: [json(''), json('Нажмите, чтобы перейти на новый уровень!')] };
+  const notReady = { name: 'sunflower', count: 1, customLore: [json('Ещё не все задания уровня'), json('выполнены до конца.')] };
+
+  async function scenario({ money, counts = true }) {
+    let bot = null;
+    const state = { money, spent: 0, stock: { 12: 6, 13: 20 }, level: 1, purchases: 0 };
+    const menu = (id, title, filled) => {
+      const w = { id, title: json(title), inventoryStart: 54, slots: new Array(90).fill(null) };
+      for (const [i, it] of Object.entries(filled)) w.slots[i] = it;
+      for (let j = 0; j < 36; j += 1) w.slots[54 + j] = bot.inventory.slots[9 + j] || null;
+      return w;
+    };
+    const say = (text) => bot.emit('message', { json: { text }, toString: () => text }, 'system');
+    const have = () => Math.min(state.spent, 12000);
+    const questItem = () => ({
+      name: 'gold_ingot', count: 1, customName: json('Аванс на семена.'),
+      customLore: [json('Помоги распродать витрину.'), json(`Купите у Фермера товаров на: ${have()}/12000`)],
+    });
+    const offer = (slot) => ({
+      name: TITLES[slot][1], count: 32, customName: json(TITLES[slot][0]),
+      customLore: [json(`‖ Осталось › ${state.stock[slot]}`), json(`‖ Цена › ${PRICES[slot]}.0`), json('› Нажмите, чтобы купить')],
+    });
+    const mainMenu = () => menu(5, `Фермер › Уровень ${state.level}`, {
+      20: { name: 'hay_block', count: 1, customName: json('Покупка'), customLore: [json('Вам доступны товары 1 уровня')] },
+      22: { name: 'experience_bottle', count: 1, customName: json('Улучшения'), customLore: [json('Повышайте уровень доверия фермера')] },
+    });
+    const questsMenu = () => menu(6, 'Фермер › Уровень 1 → 2', { 10: questItem(), 40: have() >= 12000 ? ready : notReady });
+    const shopMenu = () => menu(7, 'Фермер › Покупка', { 12: offer(12), 13: offer(13) });
+    const onClick = (w, slot) => {
+      if (w.id === 5 && slot === 22) return questsMenu();
+      if (w.id === 5 && slot === 20) return shopMenu();
+      if (w.id === 7 && PRICES[slot]) {
+        if (state.money < PRICES[slot]) {
+          say('| У вас недостаточно средств');
+          return null;
+        }
+        state.money -= PRICES[slot];
+        state.stock[slot] -= 1;
+        state.purchases += 1;
+        if (counts) state.spent += PRICES[slot];
+        w.slots[slot] = offer(slot);
+      }
+      if (w.id === 6 && slot === 40 && have() >= 12000) {
+        state.level = 2;
+        say('| Уровень доверия повышен! Текущий уровень: 2 ↑');
+        bot.currentWindow = null;
+      }
+      return null;
+    };
+    const npc = { id: 401, type: 'player', username: '#1479d9c455b1f85', position: new Vec3(0.5, 64, 2.5), height: 1.8, width: 0.6 };
+    const sign = { id: 402, type: 'object', name: 'armor_stand', position: new Vec3(0.5, 66.4, 2.5), getCustomName: () => ({ json: { text: 'Фермер' }, toString: () => 'Фермер' }) };
+    const s = setup({ entities: [npc, sign], npcs: { 401: mainMenu }, onClick });
+    bot = s.bot;
+    bot.username = 'Farm01';
+    const r = await s.run('#квесты купить', 180000);
+    return { r, state, bot };
+  }
+
+  // Денег хватает: сначала самый дорогой товар, что не больше остатка, остаток — дешёвым (переплата < 500).
+  const full = await scenario({ money: 30000 });
+  assert.equal(full.r.ok, true, [].concat(full.r.message).join('\n'));
+  assert.deepEqual(full.r.message, [
+    'Купил у Фермер для «Аванс на семена.»: «Тюк сена» (×32) ×1, «Морковь» (×32) ×8 — потрачено 12400: 0 → 12000 из 12000 — выполнено',
+    'Фермер: уровень повышен — теперь 2',
+  ]);
+  assert.deepEqual([full.state.money, full.state.purchases, full.state.level], [17600, 9, 2]);
+  assert.equal(full.bot.currentWindow, null);
+
+  // Покупка в задание не засчиталась — после первой больше не тратит.
+  const wrong = await scenario({ money: 30000, counts: false });
+  assert.equal(wrong.r.ok, false);
+  assert.equal(wrong.state.purchases, 1);
+  assert.deepEqual(wrong.r.message, [
+    'Купил у Фермер для «Аванс на семена.»: «Тюк сена» (×32) ×1 — потрачено 8400: 0 → 0 из 12000',
+    'Докупить не вышло: покупка не засчиталась в задание (0 → 0 из 12000) — дальше не покупаю',
+  ]);
+
+  // Деньги кончились — сервер так и написал, бот говорит, сколько дать.
+  const poor = await scenario({ money: 9000 });
+  assert.equal(poor.r.ok, false);
+  assert.deepEqual(poor.r.message, [
+    'Купил у Фермер для «Аванс на семена.»: «Тюк сена» (×32) ×1, «Морковь» (×32) ×1 — потрачено 8900: 0 → 8900 из 12000',
+    'Докупить не вышло: сервер не продал — «У вас недостаточно средств» — дай боту денег: /pay Farm01 3100',
+  ]);
+});
+
 test('команды: сундук на чужой территории — сервер не даёт открыть, бот так и пишет', async () => {
   const { run, world } = setup({ storage: { '1,64,2': { deny: true } } });
   world.set(new Vec3(1, 64, 2), 'chest');

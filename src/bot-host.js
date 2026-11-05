@@ -191,6 +191,11 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
       return shared.autoReconnect;
     },
     say: ({ bot, text }) => entryOf(bot).manager.say(text),
+    /** Команда боту «#…» с ожиданием конца: { ok, code, message } (для «всем по очереди»). */
+    command: async ({ bot, line }) => {
+      const r = await entryOf(bot).manager.command(String(line || ''));
+      return { ok: Boolean(r && r.ok), code: (r && r.code) || null, message: [].concat((r && r.message) || []).map(String) };
+    },
     state: ({ bot }) => entryOf(bot).manager.state,
     'viewer:open': ({ mode, bot }) => openViewer(mode, bot),
     /** Экран уже открыт — показать другого бота этого процесса. */

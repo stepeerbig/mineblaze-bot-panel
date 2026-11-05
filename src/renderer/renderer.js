@@ -49,7 +49,7 @@ const el = {
   clearChat: $('clearChat'),
   chatForm: $('chatForm'),
   chatInput: $('chatInput'),
-  toAll: $('toAll'),
+  sendMode: $('sendMode'),
   chatSend: $('chatSend'),
 };
 
@@ -307,13 +307,14 @@ function updateSelectedUi() {
   el.chatWho.textContent = b ? `${b.nick} · ${stateTitle(b.state)}${ping === null ? '' : ` · пинг ${ping} мс`}` : '— выбери бота в списке';
   el.botStart.disabled = !b || b.state !== 'offline';
   el.botStop.disabled = !b || b.state === 'offline';
-  const all = el.toAll.checked;
+  const mode = el.sendMode.value;
   const canOne = Boolean(b) && (b.state === 'online' || b.state === 'connected');
   const canAll = summary.online + summary.connected > 0;
-  const can = all ? canAll : canOne;
+  const can = mode === 'one' ? canOne : canAll;
   el.chatInput.disabled = !can;
   el.chatSend.disabled = !can;
-  if (all) el.chatInput.placeholder = canAll ? 'Команда всем ботам в сети: /… серверу или #… боту' : 'Ни одного бота в сети';
+  if (mode === 'all') el.chatInput.placeholder = canAll ? 'Команда всем ботам в сети сразу: /… серверу или #… боту' : 'Ни одного бота в сети';
+  else if (mode === 'turn') el.chatInput.placeholder = canAll ? 'Команда боту (#…) всем по очереди: следующий начнёт, когда закончит предыдущий' : 'Ни одного бота в сети';
   else if (canOne) el.chatInput.placeholder = 'Сообщение, команда серверу (/…) или боту (#помощь), Enter — отправить';
   else el.chatInput.placeholder = b ? 'Бот не в сети' : 'Выбери бота в списке';
 }
@@ -540,14 +541,14 @@ el.whitelist.addEventListener('input', () => {
 });
 el.whitelist.addEventListener('change', saveWhitelist);
 
-el.toAll.addEventListener('change', updateSelectedUi);
+el.sendMode.addEventListener('change', updateSelectedUi);
 el.onlySelected.addEventListener('change', applyConsoleFilter);
 
 el.chatForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const text = el.chatInput.value.trim();
   if (!text || el.chatInput.disabled) return;
-  const sent = await bridge.say(text, el.toAll.checked);
+  const sent = await bridge.say(text, el.sendMode.value);
   if (!sent) return; // причина уже в консоли, текст остаётся в поле
   if (history[history.length - 1] !== text) history.push(text);
   if (history.length > MAX_HISTORY) history.shift();

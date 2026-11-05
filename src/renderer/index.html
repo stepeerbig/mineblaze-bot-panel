@@ -166,7 +166,11 @@
         <div id="chat" class="log" role="log" data-empty="Здесь будет чат выбранного бота."></div>
         <form id="chatForm" class="chat-form" autocomplete="off">
           <input id="chatInput" type="text" maxlength="256" spellcheck="false" aria-label="Сообщение или команда" placeholder="Бот не в сети" disabled>
-          <label class="check small" title="Отправить всем ботам в сети, по очереди. Только команды: /… серверу или #… боту"><input id="toAll" type="checkbox"><span>всем</span></label>
+          <select id="sendMode" class="send-mode" aria-label="Кому отправить" title="Выбранному боту; всем ботам в сети сразу (только команды /… и #…); или команду боту #… всем по очереди — следующий начнёт, когда закончит предыдущий">
+            <option value="one">выбранному</option>
+            <option value="all">всем сразу</option>
+            <option value="turn">всем по очереди</option>
+          </select>
           <button id="chatSend" class="btn send" type="submit" disabled>Отправить</button>
         </form>
       </section>

@@ -74,6 +74,15 @@ class FakeManager extends EventEmitter {
     return true;
   }
 
+  /** Команда «#…» с ожиданием: идёт commandMs (по умолчанию 30 мс), runs — когда шла. */
+  async command(line) {
+    const started = Date.now();
+    this.calls.push(`command:${line}`);
+    await new Promise((r) => setTimeout(r, this.commandMs || 30));
+    (this.runs = this.runs || []).push({ line, started, ended: Date.now() });
+    return { ok: !this.failCommands, message: [`${line}: готово`] };
+  }
+
   setAutoReconnect(on, opts = {}) {
     this.calls.push(`autoReconnect:${on}${opts.quiet ? ':quiet' : ''}`);
     this.opts.config.autoReconnect = on;

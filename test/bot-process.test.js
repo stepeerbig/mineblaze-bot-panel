@@ -58,6 +58,8 @@ test('процесс ботов: несколько ботов — свои ни
   assert.equal(await client.request('say', { bot: 'farm02', text: '#pos' }), true);
   await flush();
   assert.ok(events.some(([n, p]) => n === 'chat' && p.bot === 'farm02' && p.text === '› #pos'));
+  // Команда с ожиданием конца (для «всем по очереди»).
+  assert.deepEqual(await client.request('command', { bot: 'farm02', line: '#где' }), { ok: true, code: null, message: ['#где: готово'] });
   b.emit('ping', 87); // пинг, как его считает сервер
   await flush();
   assert.ok(events.some(([n, p]) => n === 'ping' && p.bot === 'farm02' && p.ping === 87));

@@ -229,16 +229,18 @@ function registerIpc() {
     return value;
   });
 
-  // Сообщение или команда: выбранному боту или (all) всем ботам в сети — только команды.
-  ipcMain.handle('bot:say', async (_e, { text, all = false } = {}) => {
+  // Сообщение или команда: mode 'one' — выбранному боту; 'all' — всем ботам в сети сразу (только команды);
+  // 'turn' — команда боту «#…» всем по очереди: следующий начинает, когда закончил предыдущий.
+  ipcMain.handle('bot:say', async (_e, { text, mode = 'one' } = {}) => {
     if (typeof text !== 'string' || !text.trim()) return false;
-    if (all) {
-      const r = fleet.broadcast(text);
+    if (mode === 'all' || mode === 'turn') {
+      const r = mode === 'turn' ? fleet.runInTurn(text) : fleet.broadcast(text);
       if (r.refused) {
         uiLog('warn', `Не отправлено: ${r.refused}`);
         return false;
       }
-      uiLog(r.targets ? 'info' : 'warn', r.targets ? `Всем ботам в сети (${r.targets}): ${maskSecrets(text.trim())}` : 'Всем ботам: в сети нет ни одного');
+      if (!r.targets) uiLog('warn', 'Всем ботам: в сети нет ни одного');
+      else if (mode === 'all') uiLog('info', `Всем ботам в сети (${r.targets}): ${maskSecrets(text.trim())}`);
       return r.targets > 0;
     }
     if (!selectedBot) {
@@ -627,11 +629,12 @@ async function checkUi(expected) {
     }
     out.selected = (document.querySelector('.bot.is-selected') || {}).textContent || null;
     out.chatWho = document.getElementById('chatWho').textContent;
-    for (const id of ['onlySelected', 'toAll']) {
-      const box = document.getElementById(id);
-      box.checked = true;
-      box.dispatchEvent(new Event('change'));
-    }
+    const only = document.getElementById('onlySelected');
+    only.checked = true;
+    only.dispatchEvent(new Event('change'));
+    const mode = document.getElementById('sendMode');
+    mode.value = 'turn';
+    mode.dispatchEvent(new Event('change'));
     out.placeholder = document.getElementById('chatInput').placeholder;
     return out;
   })()`, true);

@@ -16,7 +16,9 @@ const { BotClient } = require('./bot-client');
 
 const DEFAULT_TIMINGS = Object.freeze({
   broadcastGap: 150, // «всем ботам»: между ботами — пауза, а не 70 команд в одну секунду
+  turnTimeout: 15 * 60 * 1000, // «по очереди»: столько ждём одного бота (#квесты принести — минуты)
 });
+const STOP_RE = /^#\s*(?:стоп|stop|хватит|стой)(?:\s|$)/i;
 const errText = (err) => (err && err.message ? err.message : String(err));
 const RUNNING = (state) => state && state !== 'offline';
 
@@ -40,6 +42,7 @@ class Fleet extends EventEmitter {
     this.order = []; // номера ботов в порядке списка
     this.workers = []; // { client, ready, bots: Set, resume: [] }
     this.queue = []; // кто ждёт входа (номера), по порядку
+    this._turn = null; // идущая очередь «по очереди» (см. runInTurn)
     this._lastAdmitAt = -Infinity;
     this._queueTimer = null;
     this._summaryPending = false;
@@ -134,6 +137,7 @@ class Fleet extends EventEmitter {
 
   /** Остановить ботов (по номерам; без них — всех). Возвращает, скольких. */
   async stop(ids = null) {
+    if (!ids) this.cancelTurn(); // «Стоп всех» останавливает и очередь
     const list = this._pick(ids).filter((b) => RUNNING(b.state));
     const stopping = new Set(list.map((b) => b.bot));
     this.queue = this.queue.filter((id) => !stopping.has(id));
@@ -161,6 +165,7 @@ class Fleet extends EventEmitter {
   broadcast(text) {
     const msg = String(text || '').trim();
     if (!/^[/#]/.test(msg)) return { targets: 0, refused: 'всем ботам — только команды: «/…» серверу или «#…» боту' };
+    if (STOP_RE.test(msg)) this.cancelTurn(); // «#стоп» всем — и очередь тоже
     const targets = this.order.map((id) => this.bots.get(id)).filter((b) => b.state === 'online' || b.state === 'connected');
     (async () => {
       for (const [i, b] of targets.entries()) {
@@ -175,6 +180,62 @@ class Fleet extends EventEmitter {
       }
     })();
     return { targets: targets.length };
+  }
+
+  /**
+   * Команда боту «#…» всем ботам в сети по очереди: следующий начинает, когда предыдущий закончил (together —
+   * сколько сразу). Для дел у одного склада и NPC (#квесты принести): 70 ботов разом — толпа и драка за сундуки.
+   * Возвращает { targets } сразу, очередь идёт дальше сама; остановить — cancelTurn() («#стоп» всем, «Стоп всех»).
+   */
+  runInTurn(text, { together = 1 } = {}) {
+    const line = String(text || '').trim();
+    if (!line.startsWith('#')) return { targets: 0, refused: 'по очереди — только команды боту «#…» (у «/…» нет конца, который можно ждать)' };
+    if (this._turn) {
+      return { targets: 0, refused: `уже идёт очередь «${this._turn.line}» (${this._turn.done} из ${this._turn.total}); остановить — «#стоп» всем` };
+    }
+    const targets = this.order.map((id) => this.bots.get(id)).filter((b) => b.state === 'online' || b.state === 'connected');
+    if (!targets.length) return { targets: 0 };
+    const turn = { line, total: targets.length, done: 0, ok: 0, failed: [], cancelled: false };
+    this._turn = turn;
+    this._log('info', `По очереди, ботов: ${targets.length} — ${line}`);
+    const queue = targets.slice();
+    const lane = async () => {
+      while (queue.length && !turn.cancelled && !this._closed) {
+        const b = queue.shift();
+        const w = this.workers[b.worker];
+        if (!this.bots.has(b.bot) || (b.state !== 'online' && b.state !== 'connected') || !w || !w.client || !w.client.child) {
+          turn.done += 1;
+          turn.failed.push(`${b.nick} (не в сети)`);
+          continue;
+        }
+        this._log('info', `По очереди: ${turn.done + 1} из ${turn.total} — начинаю`, b.bot);
+        try {
+          const r = await w.client.request('command', { bot: b.bot, line }, { timeoutMs: this.timings.turnTimeout });
+          if (r && r.ok) turn.ok += 1;
+          else turn.failed.push(b.nick);
+        } catch (err) {
+          turn.failed.push(b.nick);
+          this._log('error', `По очереди: ${errText(err)}`, b.bot);
+        }
+        turn.done += 1;
+      }
+    };
+    Promise.all(Array.from({ length: Math.max(1, together) }, lane)).then(() => {
+      if (this._turn === turn) this._turn = null;
+      const failed = turn.failed.length ? `; не вышло: ${turn.failed.slice(0, 10).join(', ')}${turn.failed.length > 10 ? ` и ещё ${turn.failed.length - 10}` : ''}` : '';
+      this._log(turn.failed.length || turn.cancelled ? 'warn' : 'ok',
+        `По очереди «${line}»: ${turn.cancelled ? 'остановлено' : 'готово'} — без ошибок ${turn.ok} из ${turn.total}${failed}`);
+      this.emit('turn', { line, total: turn.total, ok: turn.ok, failed: turn.failed.slice(), cancelled: turn.cancelled });
+    });
+    return { targets: targets.length };
+  }
+
+  /** Остановить очередь «по очереди»: бот, который уже начал, доделает своё, новые не начнут. */
+  cancelTurn() {
+    if (!this._turn || this._turn.cancelled) return false;
+    this._turn.cancelled = true;
+    this._log('warn', `По очереди «${this._turn.line}»: останавливаю — новые боты не начнут`);
+    return true;
   }
 
   /** Автореконнект — у всех ботов (в консоль — одна строка). */

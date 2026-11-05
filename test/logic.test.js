@@ -237,6 +237,16 @@ test('пинг бота (как его считает сервер) — собы
   assert.deepEqual(pings, [0, 133, null], 'не в сети — пинга нет');
 });
 
+test('команда боту с ожиданием конца: результат команды, строка «› …» в чате', async () => {
+  const { mgr, chats } = setup();
+  const r = await mgr.command('#помощь');
+  assert.equal(r.ok, true);
+  assert.equal([].concat(r.message)[0], 'Команды боту (пишутся здесь, на сервер не уходят):');
+  assert.equal(chats.at(-1).text, '› #помощь');
+  const offline = await mgr.command('#где');
+  assert.deepEqual([offline.ok, offline.code], [false, 'not_ready'], 'бот не в мире — так и отвечает');
+});
+
 test('повторное нажатие «Стоп» не дублирует остановку', () => {
   const { mgr, bots, logs } = setup();
   mgr.start();

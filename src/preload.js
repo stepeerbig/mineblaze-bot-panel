@@ -14,7 +14,8 @@ contextBridge.exposeInMainWorld('api', {
   stop: (ids) => ipcRenderer.invoke('bots:stop', { ids: Array.isArray(ids) ? ids : null }),
   select: (id) => ipcRenderer.invoke('bots:select', String(id || '')),
   setAutoReconnect: (on) => ipcRenderer.invoke('bot:auto-reconnect', Boolean(on)),
-  say: (text, all) => ipcRenderer.invoke('bot:say', { text: String(text), all: Boolean(all) }),
+  // mode: 'one' — выбранному боту, 'all' — всем сразу, 'turn' — всем по очереди (команды «#…»)
+  say: (text, mode) => ipcRenderer.invoke('bot:say', { text: String(text), mode: ['all', 'turn'].includes(mode) ? mode : 'one' }),
   openLogs: () => ipcRenderer.invoke('app:open-logs'),
   openViewer: () => ipcRenderer.invoke('viewer:open'), // окно «Экран бота» выбранного бота; true, если открылось
   onLog: listen('bot:log'),
