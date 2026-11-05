@@ -17,6 +17,7 @@ const VERBS = [
   ['Добудьте', 'other'], ['Поймайте', 'other'], ['Соберите', 'other'], ['Вырастите', 'other'], ['Приготовьте', 'other'],
   ['Скрафтите', 'other'], ['Создайте', 'other'], ['Сломайте', 'other'], ['Выловите', 'other'], ['Наловите', 'other'],
   ['Найдите', 'other'], ['Посетите', 'other'], ['Используйте', 'other'], ['Съешьте', 'other'], ['Выкопайте', 'other'],
+  ['Прокачайте', 'unlock'],
 ];
 const KIND_OF = new Map(VERBS.map(([v, k]) => [v.toLowerCase(), k]));
 // Число: «12 000» (тысячи через пробел), «224», «8400.0».
@@ -29,6 +30,9 @@ const OBJECTIVE_RE = new RegExp(
 // Время: «Проведите на сервере: 1 ч. 20 м./3 ч.» — у сделанного и нужного может быть по нескольку частей.
 const DURATION = String.raw`(?:\d+\s*(?:ч|мин|м|сек|с)\.?\s*)+`;
 const TIME_RE = new RegExp(`(Проведите\\s+[^:]*?):\\s*(${DURATION})\\/\\s*(${DURATION})`, 'iu');
+// Условие открытия NPC — «задание» уровня 0 → 1 (Оружейник, скриншоты 5 ноября):
+//   «Прокачайте Фермера до 4 уровня. Выполнено!», «Прокачайте Алхимика до 4 уровня. 1/4».
+const UNLOCK_RE = /Прокачайте\s+(.+?)\s+до\s+(\d+)(?:-?го)?\s+уровня[.:!]?\s*(?:(\d+)\s*\/\s*(\d+)|(Выполнено))/iu;
 const TAKE_RE = /нажмите,?\s*чтобы\s*взять\s*задание/i;
 const DONE_RE = /задание\s+(?:выполнено|завершено)/i;
 const REWARD_RE = /награда:\s*(.+)/i;
@@ -66,6 +70,15 @@ function parseDuration(text) {
 // Основы — с начала слова, чтобы «нит» не нашлась в «граните», а «мёд» — в «меди».
 const w = (stem) => new RegExp(`(?:^|[\\s-])(?:${stem})`);
 const ITEM_WORDS = [
+  // Незер и зелья (задания Алхимика, скриншоты 5 ноября): составные — раньше простых («золотая морковь» ≠ «морковь»).
+  [w('огненн\\S*\\s+порош|порош\\S*\\s+ифрит'), ['blaze_powder']], [w('незерск\\S*\\s+нарост|адск\\S*\\s+нарост|нарост'), ['nether_wart']],
+  [w('магм\\S*\\s+крем|сгуст\\S*\\s+магм'), ['magma_cream']], [w('пес\\S*\\s+душ'), ['soul_sand']], [w('почв\\S*\\s+душ'), ['soul_soil']],
+  [w('факел\\S*\\s+душ'), ['soul_torch']], [w('полированн\\S*\\s+чернокам'), ['polished_blackstone']], [w('чернокам'), ['blackstone']],
+  [w('полированн\\S*\\s+базальт'), ['polished_basalt']], [w('гладк\\S*\\s+базальт'), ['smooth_basalt']], [w('базальт'), ['basalt']],
+  [w('светокам\\S*\\s+пыл|светопыл'), ['glowstone_dust']], [w('светокам'), ['glowstone']], [w('огненн\\S*\\s+заряд'), ['fire_charge']],
+  [w('золот\\S*\\s+морков'), ['golden_carrot']], [w('(?:маринован|ферментирован)\\S*\\s+паучь'), ['fermented_spider_eye']],
+  [w('(?:сверкающ|блестящ|искрящ)\\S*\\s+(?:ломтик\\S*\\s+)?арбуз'), ['glistering_melon_slice']], [w('сл[её]з\\S*\\s+гаст|гаст\\S*\\s+сл[её]з'), ['ghast_tear']],
+  [w('сахар(?!н)'), ['sugar']], [w('незер+ак|адск\\S*\\s+камен'), ['netherrack']],
   [w('семен\\S*\\s+пшениц'), ['wheat_seeds']], [w('семен\\S*\\s+тыкв'), ['pumpkin_seeds']], [w('семен\\S*\\s+арбуз'), ['melon_seeds']],
   [w('семен\\S*\\s+св[её]кл'), ['beetroot_seeds']], [w('семен'), ['wheat_seeds']],
   [w('бел\\S*\\s+шерст'), ['white_wool']], [w('шерст'), ['white_wool']],
@@ -106,6 +119,19 @@ function deliverItems(what) {
 const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
 
 /**
+ * Награда задания: всё от «Награда:» до самой цели — сервер переносит длинную награду на вторую строку
+ * («▪ Награда: 32 полированных / чернокамня», Алхимик). Цель раньше награды — тогда только строка награды.
+ */
+function rewardOf(lines, text, goalAt) {
+  const r = /награда:\s*/i.exec(text);
+  if (!r) return null;
+  const bullets = (s) => s.replace(/^[▪•·\s]+|[▪•·\s]+$/g, '');
+  if (goalAt > r.index) return bullets(clean(text.slice(r.index + r[0].length, goalAt))) || null;
+  const line = lines.find((l) => REWARD_RE.test(l));
+  return line ? bullets(clean(REWARD_RE.exec(line)[1])) : null;
+}
+
+/**
  * Задание из предмета меню. lore — строки описания. null — это не задание (стекло, «Назад», кнопка уровня…).
  */
 function parseQuest(slot, title, lore, icon = '') {
@@ -118,7 +144,14 @@ function parseQuest(slot, title, lore, icon = '') {
   let unit = '';
   const t = TIME_RE.exec(text);
   const m = t ? null : OBJECTIVE_RE.exec(text);
-  if (t) {
+  const u = t || m ? null : UNLOCK_RE.exec(text);
+  if (u) {
+    // «Прокачайте Алхимика до 4 уровня. 1/4» — прогресс в уровнях; «Выполнено!» — условие уже есть.
+    verb = 'Прокачайте';
+    what = `${clean(u[1])} до ${u[2]} уровня`;
+    need = u[4] ? parseNumber(u[4]) : Number(u[2]);
+    have = u[5] ? need : parseNumber(u[3]);
+  } else if (t) {
     verb = 'Проведите';
     what = t[1].replace(/^Проведите\s+/i, '');
     have = parseDuration(t[2]);
@@ -138,8 +171,7 @@ function parseQuest(slot, title, lore, icon = '') {
     return null;
   }
   const kind = KIND_OF.get(verb.toLowerCase()) || 'other';
-  const rewardLine = lines.find((l) => REWARD_RE.test(l));
-  const reward = rewardLine ? clean(REWARD_RE.exec(rewardLine)[1]).replace(/^[▪•·\s]+/, '') : null;
+  const reward = rewardOf(lines, text, (u || t || m).index);
   const goal = clean(`${verb} ${what}`);
   const quest = {
     slot,
@@ -156,6 +188,7 @@ function parseQuest(slot, title, lore, icon = '') {
     items: kind === 'deliver' ? deliverItems(what) : [],
   };
   quest.done = (quest.need > 0 && quest.have >= quest.need) || DONE_RE.test(text);
+  if (u) quest.unlock = { npc: questNpc(u[1]) || clean(u[1]), level: Number(u[2]) };
   return quest;
 }
 
@@ -210,12 +243,15 @@ const QUEST_CHAT = [
   ['gave', new RegExp(`${CHAT_START}Вы передали\\s+(.+?)\\s*$`, 'i')],
   ['done', new RegExp(`${CHAT_START}Задание\\s+(.+?)\\s+(?:выполнено|завершено)[.!]?\\s*$`, 'i')],
   ['reward', new RegExp(`${CHAT_START}Вы получаете награду:\\s*(.+?)\\s*$`, 'i')],
+  // У NPC пройдены все уровни: на «Улучшения» сервер отвечает в чате, меню не открывает (Фермер 4-го уровня).
+  ['finished', new RegExp(`${CHAT_START}((?:Эта\\s+)?цепочка\\s+(?:квестов\\s+|заданий\\s+)?(?:уже\\s+)?(?:полностью\\s+)?(?:завершена|пройдена)[.!]*)\\s*$`, 'i')],
+  ['nochain', new RegExp(`${CHAT_START}(Цепочка\\s+(?:квестов|заданий)\\s+не\\s+найдена[.!]*)\\s*$`, 'i')],
 ];
 const LEVEL_CHAT_RE = new RegExp(`${CHAT_START}Уровень доверия повышен[!.]?(?:\\s*Текущий уровень:?\\s*(\\d+))?`, 'i');
 
 /**
  * Сообщение сервера о задании → { type: took | gave | done | reward, text } или null (не о задании).
- * Новый уровень NPC → { type: 'level', text: '4', level: 4 }.
+ * Новый уровень NPC → { type: 'level', text: '4', level: 4 }; заданий у NPC больше нет → finished | nochain.
  */
 function parseQuestChat(line) {
   const s = clean(line);
@@ -231,14 +267,48 @@ function parseQuestChat(line) {
 /** То же название задания в меню и в чате: «Ночная прополка.» = «Ночная прополка». */
 const sameTitle = (a, b) => clean(a).replace(/[.!]+$/, '').toLowerCase() === clean(b).replace(/[.!]+$/, '').toLowerCase();
 
-const KIND_NAMES = { buy: 'купить у NPC', deliver: 'сдать', breed: 'развести', kill: 'убить', time: 'время на сервере', other: 'задание' };
+const KIND_NAMES = {
+  buy: 'купить у NPC', deliver: 'сдать', breed: 'развести', kill: 'убить', time: 'время на сервере', unlock: 'прокачать другого NPC', other: 'задание',
+};
+
+// NPC с заданиями (у /warp ah) — по порядку (пользователь, 5 ноября). Уровни 1 → 2 → 3 → 4, на 4-м заданий больше
+// нет: на «Улучшения» сервер пишет «Эта цепочка уже полностью завершена!». Алхимик открывается, когда Фермер
+// 3-го уровня; Оружейник — когда Фермер и Алхимик 4-го. Открытие — уровень 0 → 1: в его «Улучшениях» вместо
+// заданий условия («Прокачайте Фермера до 4 уровня. Выполнено!»), потом кнопка «Доступно улучшение».
+const MAX_NPC_LEVEL = 4;
+const QUEST_NPCS = [
+  { name: 'Фермер', opens: [] },
+  { name: 'Алхимик', opens: [{ npc: 'Фермер', level: 3 }] },
+  { name: 'Оружейник', opens: [{ npc: 'Фермер', level: 4 }, { npc: 'Алхимик', level: 4 }] },
+];
+
+/** «Алхимика», «оружейнику» → «Алхимик», «Оружейник» (по началу слова); не NPC с заданиями — null. */
+function questNpc(text) {
+  const hit = QUEST_NPCS.find((n) => matchesQuery(n.name, text));
+  return hit ? hit.name : null;
+}
+
+/** Правила заданий NPC словами — для справки и для ИИ, который будет сам вести бота по заданиям. */
+function questRules() {
+  const lines = [
+    `NPC с заданиями стоят у /warp ah: ${QUEST_NPCS.map((n) => n.name).join(', ')}. Уровни 1 → ${MAX_NPC_LEVEL}; ` +
+      `на ${MAX_NPC_LEVEL}-м заданий больше нет («Эта цепочка уже полностью завершена!»).`,
+  ];
+  for (const n of QUEST_NPCS.filter((x) => x.opens.length)) {
+    lines.push(`${n.name} открывается, когда ${n.opens.map((o) => `${o.npc} ${o.level}-го уровня`).join(' и ')}: ` +
+      'условия — в его «Улучшениях» (уровень 0 → 1), потом кнопка «Доступно улучшение».');
+  }
+  lines.push('Все задания уровня выполнены — повысить уровень (#квесты уровень; взять, сдать и принести делают это сами).');
+  return lines;
+}
 
 /** Строка о задании для человека. */
 function describeQuest(q) {
   const progress = q.unit === 'мин' ? `${fmtMinutes(q.have)} из ${fmtMinutes(q.need)}` : `${fmtNum(q.have)}/${fmtNum(q.need)}`;
   let state = q.taken ? '' : 'не взято, ';
   if (q.done) state = 'выполнено, ';
-  const items = q.items.length ? ` (${q.items.join(', ')})` : '';
+  let items = q.items.length ? ` (${q.items.join(', ')})` : '';
+  if (q.kind === 'deliver' && !q.items.length) items = ' (какие это предметы — бот пока не знает)';
   return `[${q.slot}] ${q.title} — ${state}${q.goal}${items}: ${progress}${q.reward ? `; награда: ${q.reward}` : ''}`;
 }
 
@@ -261,5 +331,6 @@ function matchesQuery(text, query) {
 }
 
 module.exports = {
-  parseQuest, parseQuestMenu, parseOffer, deliverItems, describeQuest, parseNumber, parseDuration, matchesQuery, parseQuestChat, sameTitle, KIND_NAMES,
+  parseQuest, parseQuestMenu, parseOffer, deliverItems, describeQuest, parseNumber, parseDuration, matchesQuery, parseQuestChat, sameTitle,
+  questNpc, questRules, KIND_NAMES, QUEST_NPCS, MAX_NPC_LEVEL, ITEM_WORDS,
 };

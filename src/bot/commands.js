@@ -9,7 +9,9 @@
 const { Vec3 } = require('vec3');
 const { FACE_VECTORS } = require('./actions');
 const { chatToText } = require('../chat-utils');
-const { parseQuestMenu, parseOffer, describeQuest, matchesQuery, deliverItems, parseQuestChat, sameTitle } = require('./quests');
+const {
+  parseQuestMenu, parseOffer, describeQuest, matchesQuery, deliverItems, parseQuestChat, sameTitle, questNpc, questRules,
+} = require('./quests');
 const { isStorageWindow } = require('./window-clicks');
 const { moveStacks, countIn, itemsIn, storageSlots, playerSlots } = require('./chests');
 
@@ -653,7 +655,6 @@ async function cmdClose({ bot }) {
 // ---------- задания и покупки у NPC (Фермер, Алхимик, Оружейник — /warp ah) ----------
 
 const QUEST_NPC = 'Фермер';
-const QUEST_NPCS = ['Фермер', 'Алхимик', 'Оружейник']; // NPC с заданиями у /warp ah (ТЗ)
 const NPC_REACH = 2.5; // ближе — можно нажимать (дотянуться можно на 2,9 от глаз)
 const MENU_WAIT_MS = 2000; // меню NPC сервер присылает не сразу
 const AFTER_CLICK_MS = 400; // после клика сервер пересобирает меню несколькими пакетами
@@ -715,17 +716,35 @@ async function openNpcSection(bot, npc, isSection, buttonRe, what) {
   if (isSection(w)) return w;
   const btn = findButton(w, buttonRe);
   if (btn === null) throw new CommandError(`в меню «${windowTitle(w)}» нет кнопки «${what}»`);
-  await bot.actions.clickSlot(btn);
-  const next = await waitNewWindow(bot, w, MENU_WAIT_MS);
-  if (!next || !isSection(next)) throw new CommandError(`раздел «${what}» не открылся${next ? ` (открылось «${windowTitle(next)}»)` : ''}`);
-  return next;
+  const chat = watchChat(bot);
+  let next = null;
+  try {
+    await bot.actions.clickSlot(btn);
+    next = await waitNewWindow(bot, w, MENU_WAIT_MS);
+  } finally {
+    chat.stop();
+  }
+  if (next && isSection(next)) return next;
+  // Вместо меню — ответ в чате: у NPC пройдены все уровни (Фермер 4-го уровня, скриншот 5 ноября).
+  const said = chat.lines.map(parseQuestChat).filter((x) => x && (x.type === 'finished' || x.type === 'nochain'));
+  if (said.length) {
+    const finished = said.some((x) => x.type === 'finished');
+    const level = /уровень\s*(\d+)/i.exec(windowTitle(w));
+    const err = new CommandError(finished
+      ? `${npc}: ${level ? `${level[1]}-й уровень, ` : ''}все задания пройдены — больше заданий нет`
+      : `${npc}: заданий нет (сервер: «${said[0].text}»)`);
+    err.code = finished ? 'finished' : 'no_quests';
+    throw err;
+  }
+  const server = serverSaid(chat.lines);
+  throw new CommandError(`раздел «${what}» не открылся${next ? ` (открылось «${windowTitle(next)}»)` : ''}${server ? ` (сервер: «${server}»)` : ''}`);
 }
 
 /** Имя NPC из слов команды: «у Алхимика», «оружейнику» → «Алхимик», «Оружейник»; другое — как написали. */
 function npcName(text) {
   const t = String(text || '').trim().replace(/^у(?:\s+|$)/i, '');
   if (!t) return QUEST_NPC;
-  return QUEST_NPCS.find((n) => matchesQuery(n, t)) || t;
+  return questNpc(t) || t;
 }
 
 // Меню заданий: в нём задания, кнопка уровня или заголовок «Фермер › Уровень 1 → 2» (когда всё выполнено,
@@ -820,6 +839,10 @@ async function cmdQuests({ bot, args, words }) {
     }
     return showQuests(bot, npc);
   } catch (err) {
+    // Не ошибка: у NPC просто больше нет заданий (все уровни пройдены) — так и сказать.
+    if (err && (err.code === 'finished' || err.code === 'no_quests')) {
+      return { ok: true, code: err.code, message: [...lines, err.message], data: { npc, finished: err.code === 'finished' } };
+    }
     if (!lines.length) throw err;
     lines.push(`Остановился: ${err && err.message ? err.message : err}`);
     return { ok: false, code: (err && err.code) || 'failed', message: lines };
@@ -1113,6 +1136,9 @@ async function bringQuests(bot, npc, storageHome, rewardsHome) {
       await closeAfter(bot);
     }
     const todo = quests.filter((q) => q.kind === 'deliver' && q.taken && !q.done && q.items.length && q.need > q.have);
+    // «Передайте …» с незнакомыми словами: что приносить, бот не знает — сказать, а не молча пропустить.
+    const unknown = quests.filter((q) => q.kind === 'deliver' && q.taken && !q.done && !q.items.length);
+    if (unknown.length) lines.push(`Не знаю, какие это предметы — пропускаю: ${unknown.map((q) => `${quote(q)} («${q.goal}»)`).join('; ')}`);
     if (!todo.length) {
       lines.push('Приносить нечего: заданий «Передайте…» нет или все выполнены');
       return finish();
@@ -1169,6 +1195,11 @@ async function bringQuests(bot, npc, storageHome, rewardsHome) {
     }
     return finish();
   } catch (err) {
+    // У NPC все уровни пройдены — приносить некуда; это не сбой.
+    if (err && (err.code === 'finished' || err.code === 'no_quests')) {
+      lines.push(err.message);
+      return finish();
+    }
     // Что успели — в ответе; дальше — почему остановились.
     lines.push(`Остановился: ${err && err.message ? err.message : err}`);
     return { ok: false, code: (err && err.code) || 'failed', message: lines, data };
@@ -1578,6 +1609,7 @@ const COMMANDS = [
     about: 'задания NPC (по умолчанию Фермер, у /warp ah): показать; взять все новые; сдать из инвентаря; уровень — повысить ' +
       '(взять, сдать и принести повышают сами, когда все задания выполнены); принести — всё для «Передайте…» со склада ' +
       '(/home урожай), сдать и сложить награды (/home награды)',
+    notes: questRules(), // правила заданий (какой NPC когда открывается) — для ИИ
     run: cmdQuests,
   },
   {
@@ -1602,9 +1634,11 @@ function findCommand(word) {
   return COMMANDS.find((c) => norm(c.name) === w || c.aliases.some((a) => norm(a) === w)) || null;
 }
 
-/** Описание всех команд (для ИИ и справки): имя, другие имена, как писать, что делает. */
+/** Описание всех команд (для ИИ и справки): имя, другие имена, как писать, что делает; notes — правила игры к команде. */
 function catalog() {
-  return COMMANDS.map(({ name, aliases, usage, about, observe }) => ({ name, aliases: [...aliases], usage: [...usage], about, observe: Boolean(observe) }));
+  return COMMANDS.map(({ name, aliases, usage, about, observe, notes }) => ({
+    name, aliases: [...aliases], usage: [...usage], about, observe: Boolean(observe), ...(notes ? { notes: [...notes] } : {}),
+  }));
 }
 
 /**

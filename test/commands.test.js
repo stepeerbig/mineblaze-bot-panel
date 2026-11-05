@@ -675,6 +675,85 @@ test('команды: #квесты уровень — «Доступно улу
   assert.equal(bot.currentWindow, null);
 });
 
+test('команды: Фермер 4-го уровня — заданий больше нет (без ошибок); 3 → 4 и сразу «всё пройдено»; Оружейник — условия', async () => {
+  const json = (text) => JSON.stringify({ text });
+  let bot = null;
+  const state = { farmer: 3 };
+  const menu = (id, title, filled) => {
+    const w = { id, title: json(title), inventoryStart: 54, slots: new Array(90).fill(null) };
+    for (const [i, it] of Object.entries(filled)) w.slots[i] = it;
+    for (let j = 0; j < 36; j += 1) w.slots[54 + j] = bot.inventory.slots[9 + j] || null;
+    return w;
+  };
+  const say = (text) => bot.emit('message', { json: { text }, toString: () => text }, 'system');
+  const quest = (title, icon, lore) => ({ name: icon, count: 1, customName: json(title), customLore: lore.map(json) });
+  // Главное меню NPC, как на скриншоте Фермера 4-го уровня.
+  const upgrades = (whose) => ({
+    name: 'experience_bottle', count: 1, customName: json('Улучшения'),
+    customLore: [json(`Повышайте уровень доверия ${whose}`), json('чтобы стали доступны новые предметы'), json(''), json(`Вам доступны товары ${state.farmer} уровня`)],
+  });
+  const farmerMain = () => menu(5, `Фермер › Уровень ${state.farmer}`, { 22: upgrades('фермера') });
+  const farmerQuests = () => menu(6, 'Фермер › Уровень 3 → 4', {
+    11: quest('Грядки без истерики.', 'wheat', ['▪ Награда: 24 хлеба', 'Передайте пшеницу: 224/224']),
+    40: { name: 'sunflower', count: 1, customName: json('Доступно улучшение'), customLore: [json(''), json('Нажмите, чтобы перейти на новый уровень!')] },
+  });
+  const smithMain = () => menu(7, 'Оружейник › Уровень 0', { 22: upgrades('оружейника') });
+  const smithQuests = () => menu(8, 'Оружейник › Уровень 0 → 1', {
+    10: quest('Рекомендация от Фермера.', 'hay_block', ['Добейся максимального доверия у', 'главного по урожаю.', '', `Прокачайте Фермера до 4 уровня. ${state.farmer >= 4 ? 'Выполнено!' : `${state.farmer}/4`}`]),
+    11: quest('Печать Алхимика.', 'brewing_stand', ['Алхимик тоже должен подтвердить', 'твою ценность.', '', 'Прокачайте Алхимика до 4', 'уровня. 1/4']),
+    40: { name: 'sunflower', count: 1, customLore: [json('Ещё не все задания уровня'), json('выполнены до конца.')] },
+  });
+  const onClick = (w, slot) => {
+    if (w.id === 5 && slot === 22) {
+      if (state.farmer < 4) return farmerQuests();
+      say('| Эта цепочка уже полностью завершена!'); // меню заданий сервер не открывает
+      say('| Цепочка квестов не найдена!');
+      return null;
+    }
+    if (w.id === 6 && slot === 40) {
+      state.farmer = 4;
+      say('| Уровень доверия повышен! Текущий уровень: 4 ↑');
+      bot.currentWindow = null;
+    }
+    if (w.id === 7 && slot === 22) return smithQuests();
+    return null;
+  };
+  const npc = (id, x, z, name) => [
+    { id, type: 'player', username: `#${id}c455b1f85`, position: new Vec3(x, 64, z), height: 1.8, width: 0.6 },
+    { id: id + 1, type: 'object', name: 'armor_stand', position: new Vec3(x, 66.4, z), getCustomName: () => ({ json: { text: name }, toString: () => name }) },
+  ];
+  const s = setup({ entities: [...npc(401, 0.5, 2.5, 'Фермер'), ...npc(403, 2.5, 0.5, 'Оружейник')], npcs: { 401: farmerMain, 403: smithMain }, onClick });
+  bot = s.bot;
+
+  // Оружейник закрыт: в «Улучшениях» — условия, с прогрессом.
+  const closed = await s.run('#квесты у Оружейника');
+  assert.deepEqual(closed.message, [
+    'Задания (Оружейник › Уровень 0 → 1): 2, взято 2, выполнено 0',
+    '[10] Рекомендация от Фермера. — Прокачайте Фермера до 4 уровня: 3/4',
+    '[11] Печать Алхимика. — Прокачайте Алхимика до 4 уровня: 1/4',
+    'Уровень: Ещё не все задания уровня выполнены до конца.',
+  ]);
+
+  // Все задания 3-го уровня выполнены: «#квесты взять» — новый уровень, а заданий на 4-м уже нет.
+  const FINISHED = 'Фермер: 4-й уровень, все задания пройдены — больше заданий нет';
+  const up = await s.run('#квесты взять');
+  assert.equal(up.ok, true, [].concat(up.message).join('\n'));
+  assert.deepEqual(up.message, ['Фермер: уровень повышен — теперь 4', FINISHED]);
+  assert.equal(bot.currentWindow, null);
+
+  // Дальше — не ошибка, а ответ: заданий больше нет (и никаких /home).
+  bot.sendCommand = () => assert.fail('на 4-м уровне склад не нужен');
+  for (const line of ['#квесты', '#квесты уровень', '#квесты сдать', '#квесты принести урожай награды']) {
+    const r = await s.run(line);
+    assert.equal(r.ok, true, `${line}: ${[].concat(r.message).join('\n')}`);
+    assert.deepEqual([].concat(r.message), [FINISHED], line);
+    assert.equal(bot.currentWindow, null, line);
+  }
+
+  // Условие Фермера у Оружейника теперь выполнено.
+  assert.equal((await s.run('#квесты оружейник')).message[1], '[10] Рекомендация от Фермера. — выполнено, Прокачайте Фермера до 4 уровня: 4/4');
+});
+
 test('команды: сундук на чужой территории — сервер не даёт открыть, бот так и пишет', async () => {
   const { run, world } = setup({ storage: { '1,64,2': { deny: true } } });
   world.set(new Vec3(1, 64, 2), 'chest');
