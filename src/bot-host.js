@@ -191,10 +191,19 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
       return shared.autoReconnect;
     },
     say: ({ bot, text }) => entryOf(bot).manager.say(text),
-    /** Команда боту «#…» с ожиданием конца: { ok, code, message } (для «всем по очереди»). */
-    command: async ({ bot, line }) => {
-      const r = await entryOf(bot).manager.command(String(line || ''));
-      return { ok: Boolean(r && r.ok), code: (r && r.code) || null, message: [].concat((r && r.message) || []).map(String) };
+    /**
+     * Команда боту «#…» с ожиданием конца: { ok, code, message, data } (для «всем по очереди», ИИ и автопилота
+     * заданий). data — как есть, но только то, что переживёт передачу между процессами (JSON).
+     */
+    command: async ({ bot, line, quiet = false }) => {
+      const r = await entryOf(bot).manager.command(String(line || ''), { quiet: Boolean(quiet) });
+      let data = null;
+      try {
+        data = r && r.data !== undefined ? JSON.parse(JSON.stringify(r.data)) : null;
+      } catch (_) {
+        data = null; // например, кольцевые ссылки — без данных, ответ всё равно нужен
+      }
+      return { ok: Boolean(r && r.ok), code: (r && r.code) || null, message: [].concat((r && r.message) || []).map(String), data };
     },
     state: ({ bot }) => entryOf(bot).manager.state,
     'viewer:open': ({ mode, bot }) => openViewer(mode, bot),

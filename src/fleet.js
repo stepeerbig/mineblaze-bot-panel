@@ -249,23 +249,40 @@ class Fleet extends EventEmitter {
     if (line.startsWith('/')) return this._commandServer(picked, line, result, stopped, signal);
     const out = [];
     for (const b of picked) {
-      const w = this.workers[b.worker];
-      if (stopped()) out.push(result(b, false, 'stopped', 'не начато: остановлено'));
-      else if (!this.bots.has(b.bot) || !IN_GAME(b) || !w || !w.client || !w.client.child) out.push(result(b, false, 'offline', 'бот не в сети'));
-      else {
-        const onAbort = () => this.say(b.bot, '#стоп').catch(() => {});
-        if (signal) signal.addEventListener('abort', onAbort, { once: true });
-        try {
-          const r = await w.client.request('command', { bot: b.bot, line }, { timeoutMs: this.timings.turnTimeout });
-          out.push(result(b, Boolean(r && r.ok), r && r.code, r && r.message));
-        } catch (err) {
-          out.push(result(b, false, 'failed', errText(err)));
-        } finally {
-          if (signal) signal.removeEventListener('abort', onAbort);
-        }
-      }
+      const { data, ...r } = await this.commandOne(b.bot, line, { signal }); // данные ИИ не нужны — только ответ
+      out.push(r);
     }
     return out;
+  }
+
+  /**
+   * Команда «#…» одному боту с ответом: { bot, nick, ok, code, message: [строки], data } — data как у команды
+   * (для автопилота заданий). Не в сети — сразу { ok: false, code: 'offline' }. signal сработал — боту «#стоп».
+   */
+  async commandOne(id, text, { signal = null, quiet = false } = {}) {
+    const line = String(text || '').trim();
+    if (!line.startsWith('#')) throw new Error('одному боту с ответом — только команды «#…»');
+    const b = this.get(id);
+    if (!b) return { bot: String(id || '').toLowerCase(), nick: String(id || ''), ok: false, code: 'unknown', message: ['нет такого бота'], data: null };
+    const result = (ok, code, message, data = null) => ({ bot: b.bot, nick: b.nick, ok, code: code || null, message: [].concat(message || []).map(String), data });
+    if (signal && signal.aborted) return result(false, 'stopped', 'не начато: остановлено');
+    const w = this.workers[b.worker];
+    if (!this.bots.has(b.bot) || !IN_GAME(b) || !w || !w.client || !w.client.child) return result(false, 'offline', 'бот не в сети');
+    const onAbort = () => this.say(b.bot, '#стоп').catch(() => {});
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    try {
+      const r = await w.client.request('command', { bot: b.bot, line, quiet: Boolean(quiet) }, { timeoutMs: this.timings.turnTimeout });
+      return result(Boolean(r && r.ok), r && r.code, r && r.message, (r && r.data) || null);
+    } catch (err) {
+      return result(false, 'failed', errText(err));
+    } finally {
+      if (signal) signal.removeEventListener('abort', onAbort);
+    }
+  }
+
+  /** Идёт ли «по очереди» (автопилот заданий в это время не трогает ботов). */
+  get turnRunning() {
+    return Boolean(this._turn);
   }
 
   async _commandServer(picked, line, result, stopped, signal) {
@@ -413,7 +430,10 @@ class Fleet extends EventEmitter {
 
   _sharedConfig() {
     // Пароли всех ботов процессам не нужны (у каждого — свой), ключ и настройки ИИ — тоже.
-    const { accounts, aiKey, aiBaseUrl, aiModel, aiProvider, ollamaUrl, ollamaModel, ollamaGpu, ...rest } = this.config;
+    const {
+      accounts, aiKey, aiBaseUrl, aiModel, aiProvider, ollamaUrl, ollamaModel, ollamaGpu,
+      questAuto, questStorage, questRewards, questMobHomes, questTogether, questPause, ...rest
+    } = this.config;
     // Ники всех ботов панели: охрана каждого считает остальных своими (у одного склада их много).
     rest.fleetNicks = this.order.map((id) => this.bots.get(id).username).join('\n');
     return rest;

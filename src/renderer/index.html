@@ -33,6 +33,42 @@
         </button>
       </div>
 
+      <details id="questGroup" class="group fold" open>
+        <summary class="group-title">Автопилот заданий <span id="questTag" class="tag" hidden></span></summary>
+        <button id="questToggle" class="btn quest-toggle" type="button">Включить автопилот</button>
+        <p id="questStatus" class="ai-status" role="status"></p>
+        <div id="questLevels" class="quest-levels" hidden></div>
+        <div id="questNeeds" class="quest-needs" hidden>
+          <div class="quest-needs-title">Что нужно от тебя</div>
+          <ul id="questNeedsList"></ul>
+          <button id="questCheckNow" class="btn ai-get" type="button" title="Положил на склад, дал денег, поставил дома — проверить всех ботов, не дожидаясь очереди">Сделал — проверить всех сейчас</button>
+        </div>
+        <p class="hint">Боты в сети сами берут задания у Фермера, потом у Алхимика и Оружейника, покупают «Купите…», приносят со склада «Передайте…», сдают, повышают уровень. Чего им не хватает — появится здесь.</p>
+        <details id="questSettings" class="fold sub">
+          <summary>Склад, награды, комнаты мобов <span id="questSetupTag" class="tag warn" hidden>задай склад</span></summary>
+          <div class="row">
+            <label class="field">Дом склада
+              <input id="questStorage" type="text" autocomplete="off" spellcheck="false" placeholder="урожай">
+            </label>
+            <label class="field">Дом наград
+              <input id="questRewards" type="text" autocomplete="off" spellcheck="false" placeholder="награды">
+            </label>
+          </div>
+          <label class="field">Комнаты мобов для «Убейте…» — «кто: дом», по одной в строке
+            <textarea id="questMobHomes" rows="2" spellcheck="false" placeholder="пауки: пауки&#10;ифриты: незер"></textarea>
+          </label>
+          <div class="row">
+            <label class="field">Ботов сразу
+              <input id="questTogether" type="number" min="1" max="5" step="1">
+            </label>
+            <label class="field">Проверять бота раз в, мин
+              <input id="questPause" type="number" min="5" max="240" step="1">
+            </label>
+          </div>
+          <p class="hint">Дома у каждого бота свои: поставь им <b>/sethome</b> у сундука склада и у сундука наград (бот должен стоять там). В складе — то, что просят «Передайте…»; награды боты сложат в склад наград.</p>
+        </details>
+      </details>
+
       <details id="aiGroup" class="group fold" open>
         <summary class="group-title">ИИ-помощник <span id="aiTag" class="tag" hidden></span></summary>
         <label class="field">Задание словами

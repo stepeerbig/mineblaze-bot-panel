@@ -220,6 +220,25 @@ test('флот: команда ботам для ИИ — «#…» по одно
   await fleet.shutdown();
 });
 
+test('флот: команда одному боту — с данными команды (для автопилота заданий), тихо; не в сети — сразу ответ', async () => {
+  const { fleet, managerOf } = makeFleet({ perProcess: 2, gapMs: 1 });
+  fleet.setAccounts(accounts(2));
+  await fleet.start(['Farm01']);
+  assert.ok(await waitFor(() => fleet.summary().online === 1));
+  // Данные переживают передачу между процессами (structuredClone в подделке, JSON в bot-host).
+  managerOf('Farm01').commandReply = (line) => ({ ok: true, message: [`${line}: ок`], data: { npc: 'Фермер', quests: [{ title: 'Грядки', have: 0, need: 224 }], fn: () => 1 } });
+  const r = await fleet.commandOne('farm01', '#квесты у Фермер', { quiet: true });
+  assert.deepEqual(r, { bot: 'farm01', nick: 'Farm01', ok: true, code: null, message: ['#квесты у Фермер: ок'], data: { npc: 'Фермер', quests: [{ title: 'Грядки', have: 0, need: 224 }] } });
+  assert.equal(managerOf('Farm01').runs.at(-1).quiet, true, 'тихо: строки ответа в консоль не пишутся');
+  assert.equal((await fleet.commandOne('Farm02', '#где')).code, 'offline');
+  assert.equal((await fleet.commandOne('Nobody', '#где')).code, 'unknown');
+  await assert.rejects(fleet.commandOne('Farm01', '/warp ah'), /только команды «#…»/);
+  // Для ИИ данные не нужны — в ответе всем их нет.
+  const each = await fleet.commandEach(['Farm01'], '#где');
+  assert.equal('data' in each[0], false);
+  await fleet.shutdown();
+});
+
 test('флот: события ботов — с ником; убранный из списка бот выходит с сервера', async () => {
   const { fleet, events, managerOf } = makeFleet({ perProcess: 3, gapMs: 1 });
   fleet.setAccounts(accounts(2));

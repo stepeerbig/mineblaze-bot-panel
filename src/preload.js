@@ -28,6 +28,11 @@ contextBridge.exposeInMainWorld('api', {
   onAiState: listen('ai:state'), // { running }
   onAiProgress: listen('ai:progress'), // { text } — что ИИ делает сейчас (думает, команда ботам, скачано 40 %)
   onAiDone: listen('ai:done'), // { text, partial, requests, provider, took, error }
+  // Автопилот заданий: on — включить/выключить, settings — его поля из формы. → состояние (см. QuestAutopilot.status)
+  questsToggle: (on, settings) => ipcRenderer.invoke('quests:toggle', { on: Boolean(on), settings: settings || null }),
+  questsStatus: () => ipcRenderer.invoke('quests:status'),
+  questsCheckNow: () => ipcRenderer.invoke('quests:check-now'),
+  onQuestsStatus: listen('quests:status'), // { running, paused, online, current, levels, needs, … }
   onLog: listen('bot:log'),
   onChat: listen('bot:chat'),
   onState: listen('bot:state'), // { bot, nick, state }

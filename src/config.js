@@ -28,6 +28,13 @@ const DEFAULT_CONFIG = Object.freeze({
   aiBaseUrl: 'https://openrouter.ai/api/v1', // интернет-сервис; ключ хранится зашифрованным
   aiKey: '',
   aiModel: 'nvidia/nemotron-3-ultra-550b-a55b:free',
+  // Автопилот заданий NPC (src/quest-autopilot.js): боты сами проходят задания Фермера, Алхимика, Оружейника.
+  questAuto: false, // включён (после перезапуска панели продолжит сам)
+  questStorage: '', // дом склада с предметами для «Передайте…» (/home <имя> у каждого бота)
+  questRewards: '', // дом склада наград
+  questMobHomes: '', // комнаты мобов для «Убейте…»: строки «пауки: пауки» (кто: дом)
+  questTogether: 2, // ботов делают задания одновременно
+  questPause: 15, // минут между проверками одного бота
 });
 
 const MAX_WHITELIST_LENGTH = 5000;
@@ -43,6 +50,22 @@ const AI_LOCAL_RE = /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?(?
 // Ollama — на этом ПК или на другом в домашней сети (ключа у неё нет, так что http по своей сети — можно).
 const OLLAMA_URL_RE = /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\]|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})(?::\d{1,5})?(?:\/\S*)?$/i;
 const AI_PROVIDERS = ['ollama', 'openai'];
+const HOME_RE = /^[\p{L}\p{N}_-]{1,32}$/u; // имя дома: /home <имя>
+
+/**
+ * Комнаты мобов для заданий «Убейте…»: строки «пауки: пауки» (кто — по-русски, : или =, дом). Пустые и
+ * непонятные строки пропускаются. → [{ who, home }]
+ */
+function parseMobHomes(text) {
+  const out = [];
+  for (const raw of String(text || '').replace(/\r\n?/g, '\n').split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const m = /^(.+?)\s*[:=—-]\s*\/?(?:home\s+)?([\p{L}\p{N}_-]{1,32})$/iu.exec(line);
+    if (m) out.push({ who: m[1].trim(), home: m[2] });
+  }
+  return out;
+}
 
 /** Приводит присланные значения к безопасному виду; неверные поля просто отбрасывает. */
 function sanitize(src) {
@@ -106,6 +129,17 @@ function sanitize(src) {
   }
   if (typeof src.ollamaModel === 'string') {
     out.ollamaModel = src.ollamaModel.trim().replace(/\s+/g, '').slice(0, 200) || DEFAULT_CONFIG.ollamaModel;
+  }
+  if (typeof src.questAuto === 'boolean') out.questAuto = src.questAuto;
+  for (const key of ['questStorage', 'questRewards']) {
+    if (typeof src[key] !== 'string') continue;
+    const home = src[key].trim().replace(/^\/?home\s+/i, ''); // «/home урожай» — тоже можно
+    if (!home || HOME_RE.test(home)) out[key] = home;
+  }
+  if (typeof src.questMobHomes === 'string') out.questMobHomes = src.questMobHomes.replace(/\r\n?/g, '\n').slice(0, 2000);
+  for (const [key, min, max] of [['questTogether', 1, 5], ['questPause', 5, 240]]) {
+    const n = src[key] === undefined ? undefined : int(src[key], min, max);
+    if (n !== undefined) out[key] = n;
   }
   return out;
 }
@@ -178,4 +212,4 @@ function parseJoinCommands(text) {
     .map((line) => line.slice(0, MAX_CHAT_LENGTH));
 }
 
-module.exports = { DEFAULT_CONFIG, MAX_CHAT_LENGTH, MAX_ACCOUNTS, sanitize, validate, parseJoinCommands, parseAccounts, accountsOf };
+module.exports = { DEFAULT_CONFIG, MAX_CHAT_LENGTH, MAX_ACCOUNTS, sanitize, validate, parseJoinCommands, parseAccounts, accountsOf, parseMobHomes };

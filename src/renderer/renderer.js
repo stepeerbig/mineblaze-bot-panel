@@ -36,6 +36,20 @@ const el = {
   guardOn: $('guardOn'),
   godOn: $('godOn'),
   whitelist: $('whitelist'),
+  questTag: $('questTag'),
+  questToggle: $('questToggle'),
+  questStatus: $('questStatus'),
+  questLevels: $('questLevels'),
+  questNeeds: $('questNeeds'),
+  questNeedsList: $('questNeedsList'),
+  questCheckNow: $('questCheckNow'),
+  questSettings: $('questSettings'),
+  questSetupTag: $('questSetupTag'),
+  questStorage: $('questStorage'),
+  questRewards: $('questRewards'),
+  questMobHomes: $('questMobHomes'),
+  questTogether: $('questTogether'),
+  questPause: $('questPause'),
   aiTag: $('aiTag'),
   aiTask: $('aiTask'),
   aiRun: $('aiRun'),
@@ -173,13 +187,14 @@ function addConsole({ bot = null, nick = null, source = null, time, level, text 
 
   const { row, ts, tx } = makeRow(time, `lv-${lv}`);
   row.dataset.bot = bot || '';
-  if (source === 'ai') {
+  if (source === 'ai' || source === 'quests') {
     const tag = document.createElement('span');
     tag.className = 'ai-tag';
-    tag.title = 'ИИ-помощник';
-    tag.textContent = 'ИИ';
+    tag.title = source === 'ai' ? 'ИИ-помощник' : 'Автопилот заданий';
+    tag.textContent = source === 'ai' ? 'ИИ' : 'Авто';
     tx.append(tag, ' ');
-  } else if (nick) {
+  }
+  if (nick) {
     const tag = document.createElement('span');
     tag.className = 'who-tag';
     tag.dataset.bot = bot;
@@ -434,6 +449,10 @@ function fillForm(cfg) {
   }
   el.aiProvider.value = cfg.aiProvider === 'openai' ? 'openai' : 'ollama';
   el.ollamaGpu.checked = cfg.ollamaGpu !== false;
+  for (const key of ['questStorage', 'questRewards', 'questMobHomes', 'questTogether', 'questPause']) {
+    if (document.activeElement !== el[key]) el[key].value = cfg[key] === undefined || cfg[key] === null ? '' : cfg[key];
+  }
+  updateQuestSetupTag();
   setAutoReconnectUi(cfg.autoReconnect);
   updateLabels();
   updateBotsTag();
@@ -442,9 +461,71 @@ function fillForm(cfg) {
   updateAiProviderUi();
 }
 
+// ---------- автопилот заданий ----------
+
+let questState = null; // последнее состояние автопилота (QuestAutopilot.status)
+
+const readQuestForm = () => ({
+  questStorage: el.questStorage.value,
+  questRewards: el.questRewards.value,
+  questMobHomes: el.questMobHomes.value,
+  questTogether: el.questTogether.value,
+  questPause: el.questPause.value,
+});
+
+/** Без склада автопилот возьмёт задания и купит «Купите…», а «Передайте…» приносить будет неоткуда. */
+function updateQuestSetupTag() {
+  el.questSetupTag.hidden = Boolean(el.questStorage.value.trim());
+}
+
+const fmtWait = (sec) => (sec >= 90 ? `${Math.round(sec / 60)} мин` : `${Math.max(1, Math.round(sec))} с`);
+
+function renderQuests(s) {
+  if (!s) return;
+  questState = s;
+  el.questToggle.textContent = s.running ? 'Выключить автопилот' : 'Включить автопилот';
+  el.questToggle.classList.toggle('on', s.running);
+  let tag = '';
+  let kind = '';
+  let text;
+  if (!s.running) {
+    text = 'Выключен. Включи — и боты в сети сами пойдут по заданиям NPC.';
+  } else if (s.paused) {
+    tag = 'пауза';
+    kind = 'warn';
+    text = `Пауза: ${s.paused} — продолжу сам.`;
+  } else if (!s.online) {
+    tag = 'ждёт ботов';
+    kind = 'warn';
+    text = 'Включён, но в сети ни одного бота — нажми «Старт всех».';
+  } else {
+    tag = 'работает';
+    kind = 'ok';
+    const now = s.current.map((c) => `${c.nick}${c.npc ? ` — ${c.npc}` : ''}: ${c.what}`);
+    text = `Работает, ботов в сети: ${s.online}.`;
+    if (now.length) text += `\nСейчас: ${now.join('; ')}`;
+    else if (s.nextInSec) text += `\nВсе проверены — следующая проверка через ${fmtWait(s.nextInSec)}.`;
+  }
+  el.questStatus.textContent = text;
+  el.questStatus.className = `ai-status ${kind}`;
+  el.questTag.textContent = tag;
+  el.questTag.className = `tag${kind === 'warn' ? ' warn' : kind === 'ok' ? ' busy' : ''}`;
+  el.questTag.hidden = !tag;
+  // Уровни NPC у ботов — когда автопилот хоть кого-то уже видел.
+  const levels = s.levels || [];
+  el.questLevels.textContent = levels.join('\n');
+  el.questLevels.hidden = !levels.length || levels.every((l) => /^[^:]+: не смотрели — \d+$/.test(l));
+  el.questNeedsList.replaceChildren(...(s.needs || []).map((t) => {
+    const li = document.createElement('li');
+    li.textContent = t;
+    return li;
+  }));
+  el.questNeeds.hidden = !(s.needs && s.needs.length);
+}
+
 // ---------- ИИ-помощник ----------
 
-const AI_LOCAL_RE = /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])/i; // ИИ на своём ПК — без ключа
+const AI_LOCAL_RE =/^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])/i; // ИИ на своём ПК — без ключа
 const AI_STATUS_POLL_MS = 15000; // Ollama ещё не готова — проверять, не установили ли её
 let aiRunning = false;
 let aiModelsLoaded = false; // подсказка моделей интернет-сервиса
@@ -717,6 +798,27 @@ el.whitelist.addEventListener('input', () => {
 });
 el.whitelist.addEventListener('change', saveWhitelist);
 
+el.questToggle.addEventListener('click', async () => {
+  el.questToggle.disabled = true; // выключение ждёт, пока боты бросят начатое
+  try {
+    const on = !(questState && questState.running);
+    if (on && !el.questStorage.value.trim()) el.questSettings.open = true; // где задать склад — сразу видно
+    renderQuests(await bridge.questsToggle(on, readQuestForm()));
+  } finally {
+    el.questToggle.disabled = false;
+  }
+});
+el.questCheckNow.addEventListener('click', async () => renderQuests(await bridge.questsCheckNow()));
+for (const field of [el.questStorage, el.questRewards, el.questMobHomes, el.questTogether, el.questPause]) {
+  field.addEventListener('change', async () => fillForm(await bridge.saveConfig(readQuestForm())));
+}
+el.questStorage.addEventListener('input', updateQuestSetupTag);
+bridge.onQuestsStatus(renderQuests);
+// «Следующая проверка через …» и кто чем занят — освежать, пока автопилот включён.
+setInterval(async () => {
+  if (questState && questState.running && !document.hidden) renderQuests(await bridge.questsStatus());
+}, 20000);
+
 el.aiRun.addEventListener('click', runAi);
 el.aiTask.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
@@ -821,11 +923,12 @@ bridge.onList(({ bots: list, selected: sel }) => {
   if (changed && sel) choose(sel);
 });
 
-bridge.init().then(({ config, bots: list, summary: s, selected: sel, chat, ai }) => {
+bridge.init().then(({ config, bots: list, summary: s, selected: sel, chat, ai, quests }) => {
   fillForm(config);
   renderList(list, sel);
   applySummary(s);
   renderChatHistory(chat);
   setAiRunning(ai && ai.running);
   refreshAiStatus();
+  renderQuests(quests);
 });

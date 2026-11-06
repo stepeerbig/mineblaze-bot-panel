@@ -620,6 +620,8 @@ test('команды: #квесты принести — склад (/home), с�
   ]);
   assert.equal(state.level, 2);
   assert.deepEqual(r.data.levelUps, [{ up: true, level: 2 }]);
+  assert.deepEqual(r.data.took, [19], 'какие задания взял (для автопилота)');
+  assert.deepEqual(r.data.short, [], 'на складе всего хватило');
   assert.equal(bot.clicks.filter((c) => c.slot === 40).length, 1, 'кнопку уровня — один раз');
   assert.deepEqual(bot.sentCommands, ['/home урожай', '/warp ah', '/home награды']);
   assert.deepEqual(invNames(bot).sort(), ['iron_pickaxe', 'sweet_berries', 'wheat'], 'остатки для заданий и кирка — с собой');
@@ -638,6 +640,7 @@ test('команды: #квесты принести — склад (/home), с�
   const lost = await s.run('#квесты принести нет', 60000);
   assert.equal(lost.ok, false);
   assert.equal([].concat(lost.message).at(-1), 'Остановился: после /home нет телепорта не было (сервер: «Дом нет не найден.»)');
+  assert.equal(lost.code, 'no_home', 'автопилот поймёт: боту нужен /sethome');
 
   bot.username = 'NewBot';
   assert.match((await s.run('#квесты принести')).message, /откуда брать\? Например: #квесты принести урожай награды/);
@@ -989,6 +992,23 @@ test('команды: #бей — только нужные мобы в дося
   assert.equal(forQuest.ok, true, [].concat(forQuest.message).join('\n'));
   assert.deepEqual(forQuest.message, ['Убил: паук ×2 — всего 2', 'Готово: для заданий хватит (засчитывается само)']);
   assert.match((await s.run('#бей')).message, /кого бить\?/, 'для заданий больше не нужно');
+
+  // «дом пауки» — сначала /home пауки (комната со спавнером), потом бой там; дома нет — код no_home.
+  const sent = [];
+  s.bot.sendCommand = (cmd) => {
+    sent.push(cmd);
+    if (cmd === '/home пауки') teleport(s.bot, { x: 0.5, y: 64, z: 0.5 });
+    else s.bot.emit('message', { json: { text: '| Дом не найден.' }, toString: () => '| Дом не найден.' }, 'system');
+    return true;
+  };
+  for (const m of [mob(321, 'spider', 1.5, -0.5)]) s.bot.entities[m.id] = m;
+  const room = await s.run('#бей пауков 1 дом пауки', 60000);
+  assert.equal(room.ok, true, [].concat(room.message).join('\n'));
+  assert.deepEqual(sent, ['/home пауки']);
+  assert.deepEqual(room.data.total, 1);
+  const noRoom = await s.run('#бей пауков 1 дом подвал', 60000);
+  assert.equal(noRoom.code, 'no_home');
+  assert.match((await s.run('#бей пауков дом')).message, /какой дом\? Например: #бей пауков 20 дом пауки/);
 });
 
 test('команды: сундук на чужой территории — сервер не даёт открыть, бот так и пишет', async () => {

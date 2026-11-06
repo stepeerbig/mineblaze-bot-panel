@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 const { Fleet } = require('./fleet');
 const { AiAgent, formatDuration } = require('./ai');
+const { QuestAutopilot } = require('./quest-autopilot');
 const { DEFAULT_CONFIG, sanitize, validate, accountsOf } = require('./config');
 const { maskSecrets } = require('./chat-utils');
 
@@ -29,6 +30,7 @@ let logsDir = '';
 let win = null;
 let fleet = null; // все боты (src/fleet.js)
 let ai = null; // ИИ-помощник (src/ai.js)
+let autopilot = null; // автопилот заданий NPC (src/quest-autopilot.js)
 let selectedBot = null; // чей чат в панели и кого показывает экран бота
 let appliedAccounts = null; // список ботов, который уже отдан флоту
 let viewerWin = null; // окно «Экран бота»
@@ -77,21 +79,24 @@ function loadConfig() {
   if (!String(config.accounts || '').trim() && config.username) config.accounts = config.username;
 }
 
+/** Записать файл через временный: если программа упадёт посреди записи, старый файл не пострадает. */
+function writeFileSafe(file, text) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, text, 'utf8');
+  try {
+    fs.renameSync(tmp, file);
+  } catch (_) {
+    fs.writeFileSync(file, text, 'utf8');
+    fs.rmSync(tmp, { force: true });
+  }
+}
+
 function saveConfig() {
   const data = { ...config };
   for (const key of SECRET_FIELDS) data[key] = encodeSecret(config[key]);
-  const json = JSON.stringify(data, null, 2);
   try {
-    fs.mkdirSync(path.dirname(configFile), { recursive: true });
-    // Через временный файл: если программа упадёт посреди записи, старые настройки не пострадают.
-    const tmp = `${configFile}.tmp`;
-    fs.writeFileSync(tmp, json, 'utf8');
-    try {
-      fs.renameSync(tmp, configFile);
-    } catch (_) {
-      fs.writeFileSync(configFile, json, 'utf8');
-      fs.rmSync(tmp, { force: true });
-    }
+    writeFileSafe(configFile, JSON.stringify(data, null, 2));
   } catch (err) {
     uiLog('error', `Не удалось сохранить настройки: ${err.message}`);
   }
@@ -197,6 +202,13 @@ function aiLog(level, text) {
   appendLog('events', entry.time, `[ИИ] ${level.toUpperCase().padEnd(5)} ${entry.text}`);
 }
 
+/** Строка автопилота заданий: в консоль (с меткой «Авто», у бота — как его строки) и в лог. */
+function questLog({ level, text, bot, nick }) {
+  const entry = { bot: bot || null, nick: nick || null, source: 'quests', time: Date.now(), level, text: hideSecrets(text) };
+  send('bot:log', entry);
+  appendLog('events', entry.time, `[Авто] ${level.toUpperCase().padEnd(5)} ${tagOf(entry.nick)}${entry.text}`);
+}
+
 function selectBot(id) {
   const b = fleet && fleet.get(id);
   if (b) selectedBot = b.bot;
@@ -214,6 +226,7 @@ function registerIpc() {
       selected: selectedBot,
       chat: chatHistory.get(selectedBot) || [],
       ai: { running: Boolean(ai && ai.busy) },
+      quests: autopilot ? autopilot.status() : null,
     };
   });
 
@@ -259,6 +272,7 @@ function registerIpc() {
   ipcMain.handle('bot:say', async (_e, { text, mode = 'one' } = {}) => {
     if (typeof text !== 'string' || !text.trim()) return false;
     if (mode === 'all' || mode === 'turn') {
+      if (mode === 'turn' && autopilot) autopilot.interrupt('идёт «по очереди»'); // ботам — одно дело за раз
       const r = mode === 'turn' ? fleet.runInTurn(text) : fleet.broadcast(text);
       if (r.refused) {
         uiLog('warn', `Не отправлено: ${r.refused}`);
@@ -305,6 +319,7 @@ function registerIpc() {
     } catch (err) {
       return { ok: false, error: errText(err) };
     }
+    if (autopilot) autopilot.interrupt('ИИ выполняет задание'); // ботам — одно дело за раз
     const where = config.aiProvider === 'openai' ? `модель ${config.aiModel}` : `модель ${config.ollamaModel} на этом ПК`;
     aiLog('info', `Задание: ${text} (${where})`);
     return { ok: true };
@@ -320,6 +335,21 @@ function registerIpc() {
   });
 
   ipcMain.handle('ai:get-ollama', () => shell.openExternal('https://ollama.com/download').then(() => true, () => false));
+
+  // Автопилот заданий: включить/выключить (settings — его поля из формы), состояние, «проверить всех сейчас».
+  ipcMain.handle('quests:toggle', async (_e, { on, settings = null } = {}) => {
+    if (settings) Object.assign(config, sanitize(settings));
+    config.questAuto = Boolean(on);
+    saveConfig();
+    if (on) autopilot.start();
+    else await autopilot.stop();
+    return autopilot.status();
+  });
+  ipcMain.handle('quests:status', () => autopilot.status());
+  ipcMain.handle('quests:check-now', () => {
+    autopilot.checkNow();
+    return autopilot.status();
+  });
 
   ipcMain.handle('ai:stop', () => {
     const stopped = ai.stop();
@@ -661,6 +691,38 @@ function createAi() {
   return agent;
 }
 
+// ---------- автопилот заданий NPC ----------
+
+function createAutopilot() {
+  const file = path.join(app.getPath('userData'), 'quests-state.json'); // кто у какого NPC на каком уровне
+  const ap = new QuestAutopilot({
+    getConfig: () => config,
+    env: {
+      listBots: () => fleet.list(),
+      runCommand: (bot, line, { signal, quiet } = {}) => fleet.commandOne(bot, line, { signal, quiet }),
+      // Ботам — одно дело за раз: пока работает ИИ или идёт «по очереди», автопилот их не трогает.
+      busy: () => (ai && ai.busy ? 'ИИ выполняет задание' : fleet && fleet.turnRunning ? 'идёт «по очереди»' : ''),
+      autoReconnect: () => Boolean(config.autoReconnect),
+    },
+    store: {
+      load: () => JSON.parse(fs.readFileSync(file, 'utf8')),
+      save: (state) => writeFileSafe(file, JSON.stringify(state)),
+    },
+  });
+  ap.on('log', questLog);
+  let pending = null; // в панель — не чаще раза в 0,3 с
+  ap.on('status', () => {
+    if (pending) return;
+    pending = setTimeout(() => {
+      pending = null;
+      send('quests:status', ap.status());
+    }, 300);
+  });
+  // Бот вошёл или вышел — автопилот посмотрит, кому пора, и обновит сводку.
+  fleet.on('summary', () => ap.refresh());
+  return ap;
+}
+
 function reportFatal(err) {
   uiLog('error', `Необработанная ошибка: ${errText(err)}`);
 }
@@ -685,8 +747,10 @@ function startApp() {
 
     fleet = createFleet();
     ai = createAi();
+    autopilot = createAutopilot();
     syncFleet(); // процессы ботов запускаются, когда нужны (по «Старт» или для экрана бота)
     selectBot(null);
+    if (config.questAuto) autopilot.start(); // был включён — продолжает (ждёт ботов в сети)
 
     // Странице экрана бота не нужны камера, уведомления и прочие разрешения.
     session.fromPartition(VIEWER_PARTITION).setPermissionRequestHandler((_wc, permission, callback) => {
@@ -705,6 +769,7 @@ function startApp() {
     if (quitting) return;
     quitting = true;
     if (ai) ai.stop();
+    if (autopilot) autopilot.stop().catch(() => {});
     Promise.resolve(fleet && fleet.shutdown())
       .catch(() => {})
       .finally(() => {
@@ -739,6 +804,7 @@ function runSelftest() {
     Object.assign(config, { accounts: nicks.join('\n'), username: nicks[0], startInterval: interval });
     fleet = createFleet();
     ai = createAi();
+    autopilot = createAutopilot(); // не включается: самопроверке хватит панели и сводки
     syncFleet();
     selectBot(null);
     try {
@@ -793,10 +859,13 @@ async function checkUi(expected) {
     mode.dispatchEvent(new Event('change'));
     out.placeholder = document.getElementById('chatInput').placeholder;
     out.ai = Boolean(document.getElementById('aiRun') && document.getElementById('aiProvider').value === 'ollama' && document.getElementById('ollamaModel').value);
+    for (let i = 0; i < 20 && !document.getElementById('questStatus').textContent; i += 1) await sleep(50);
+    out.quests = document.getElementById('questStatus').textContent;
     return out;
   })()`, true);
   const wantSelected = fleet.order.length > 1 ? fleet.get(fleet.order[1]).nick : fleet.order.length ? fleet.get(fleet.order[0]).nick : null;
-  return { ok: errors.length === 0 && result.bots === expected && result.selected === wantSelected && result.ai, ...result, errors };
+  const ok = errors.length === 0 && result.bots === expected && result.selected === wantSelected && result.ai && /^Выключен/.test(result.quests);
+  return { ok, ...result, errors };
 }
 
 /** Память и процессор процессов ботов (Electron считает их сам): сколько уходит на бота. */

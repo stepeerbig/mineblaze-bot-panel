@@ -708,14 +708,17 @@ class BotManager extends EventEmitter {
   }
 
   /**
-   * Команда боту («#…») с ожиданием результата: { ok, code, message } — например, для «всем по очереди»:
-   * следующий бот начинает, когда этот закончил. Строки ответа — в консоль, как обычно.
+   * Команда боту («#…») с ожиданием результата: { ok, code, message, data } — например, для «всем по очереди»:
+   * следующий бот начинает, когда этот закончил. Строки ответа — в консоль, как обычно; quiet — только ошибки
+   * (автопилот заданий то и дело смотрит задания — 70 ботов залили бы консоль списками).
    */
-  async command(line) {
+  async command(line, { quiet = false } = {}) {
     const shown = `› ${line}`;
-    this.emit('chat', { time: Date.now(), text: shown, motd: shown, position: 'self' });
+    if (!quiet) this.emit('chat', { time: Date.now(), text: shown, motd: shown, position: 'self' });
     try {
-      return await runCommand(this.getBot(), line, (level, text) => this.log(level, text));
+      return await runCommand(this.getBot(), line, (level, text) => {
+        if (!quiet || level === 'error') this.log(level, text);
+      });
     } catch (err) {
       this.log('error', `${line}: ${describeError(err)}`);
       return { ok: false, code: 'failed', message: describeError(err) };

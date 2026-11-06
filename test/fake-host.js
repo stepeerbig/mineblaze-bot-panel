@@ -81,12 +81,16 @@ class FakeManager extends EventEmitter {
     return true;
   }
 
-  /** Команда «#…» с ожиданием: идёт commandMs (по умолчанию 30 мс), runs — когда шла. */
-  async command(line) {
+  /**
+   * Команда «#…» с ожиданием: идёт commandMs (по умолчанию 30 мс), runs — когда шла (quiet — тихо ли).
+   * commandReply(line) → свой ответ ({ ok, code, message, data }).
+   */
+  async command(line, { quiet = false } = {}) {
     const started = Date.now();
     this.calls.push(`command:${line}`);
     await new Promise((r) => setTimeout(r, this.commandMs || 30));
-    (this.runs = this.runs || []).push({ line, started, ended: Date.now() });
+    (this.runs = this.runs || []).push({ line, started, ended: Date.now(), quiet });
+    if (this.commandReply) return this.commandReply(line);
     return { ok: !this.failCommands, message: [`${line}: готово`] };
   }
 

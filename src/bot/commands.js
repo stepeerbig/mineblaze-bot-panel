@@ -855,7 +855,7 @@ async function cmdQuests({ bot, args, words }) {
       lines.push(...r.lines);
       const up = await levelUpAfterGiving(bot, npc, [r.quest], lines); // купили последнее — новый уровень
       const ok = r.ok && (!up || up.up);
-      return { ok, code: ok ? undefined : 'not_bought', message: lines, data: { npc, spent: r.spent, bought: r.bought, left: r.left, levelUp: up } };
+      return { ok, code: ok ? undefined : 'not_bought', message: lines, data: { npc, spent: r.spent, bought: r.bought, left: r.left, noMoney: r.noMoney, levelUp: up } };
     }
     return showQuests(bot, npc);
   } catch (err) {
@@ -1112,7 +1112,8 @@ async function buyForQuests(bot, npc) {
   }
   const remaining = done ? 0 : Math.max(0, Math.ceil(after ? after.need - after.have : left));
   // Похоже, кончились деньги — подсказать, сколько дать: столько не хватает до задания.
-  const money = /денег|средств|баланс|монет/i.test(note) ? ` — дай боту денег: /pay ${bot.username || '<ник бота>'} ${remaining}` : '';
+  const noMoney = !done && /денег|средств|баланс|монет/i.test(note);
+  const money = noMoney ? ` — дай боту денег: /pay ${bot.username || '<ник бота>'} ${remaining}` : '';
   if (!done && note) lines.push(`${list.length ? 'Докупить' : `Купить для ${quote(quest)}`} не вышло: ${note}${money}`);
   return {
     lines,
@@ -1120,6 +1121,7 @@ async function buyForQuests(bot, npc) {
     spent,
     bought: list,
     left: remaining,
+    noMoney,
     quest: { slot: quest.slot, title: quest.title, done },
   };
 }
@@ -1155,7 +1157,12 @@ async function teleportBy(bot, cmd) {
   }
   if (!moved) {
     const said = serverSaid(chat.lines);
-    throw new CommandError(`после ${cmd} телепорта не было${said ? ` (сервер: «${said}»)` : ''}`);
+    const err = new CommandError(`после ${cmd} телепорта не было${said ? ` (сервер: «${said}»)` : ''}`);
+    // Для автопилота заданий: бой не пускает (подождать) или у бота нет такого дома (поставить /sethome).
+    if (/pvp/i.test(said)) err.code = 'pvp';
+    else if (/^\/home\s/i.test(cmd)) err.code = 'no_home';
+    else err.code = 'no_teleport';
+    throw err;
   }
   for (let i = 0; i < 30 && !bot.blockAt(bot.entity.position.offset(0, -1, 0)); i += 1) await bot.actions.wait(100);
   await bot.actions.wait(800 + Math.floor(Math.random() * 400));
@@ -1235,7 +1242,7 @@ async function takeFromStorage(bot, needs) {
  */
 async function bringQuests(bot, npc, storageHome, rewardsHome) {
   const lines = [];
-  const data = { npc, storage: storageHome, rewards: rewardsHome, needs: [], taken: [], gave: [], stored: [], levelUps: [] };
+  const data = { npc, storage: storageHome, rewards: rewardsHome, took: [], needs: [], taken: [], gave: [], stored: [], levelUps: [], short: [], unknown: [], full: false };
   // Готово; кнопку уровня нажали, а сервер не подтвердил — это стоит проверить, поэтому не «всё хорошо».
   const finish = () => {
     const unconfirmed = data.levelUps.some((u) => !u.up);
@@ -1251,17 +1258,19 @@ async function bringQuests(bot, npc, storageHome, rewardsHome) {
       if (up) data.levelUps.push({ up: up.up, level: up.level });
       const took = await takeQuests(bot, npc);
       if (took.data.took.length) lines.push([].concat(took.message)[0]);
+      data.took = [...took.data.took];
       // «Купите у NPC товаров на N» — пока бот у NPC, за свои деньги. Купили последнее — сразу новый уровень.
       const bought = await buyForQuests(bot, npc);
       if (bought) {
         lines.push(...bought.lines);
-        data.bought = { spent: bought.spent, items: bought.bought, left: bought.left };
+        data.bought = { spent: bought.spent, items: bought.bought, left: bought.left, noMoney: bought.noMoney };
         if (bought.quest.done) {
           const again = await levelUpBeforeTaking(bot, npc, lines);
           if (again) {
             data.levelUps.push({ up: again.up, level: again.level });
             const more = await takeQuests(bot, npc);
             if (more.data.took.length) lines.push([].concat(more.message)[0]);
+            data.took.push(...more.data.took);
           }
         }
       }
@@ -1273,6 +1282,7 @@ async function bringQuests(bot, npc, storageHome, rewardsHome) {
     // «Передайте …» с незнакомыми словами: что приносить, бот не знает — сказать, а не молча пропустить.
     const unknown = quests.filter((q) => q.kind === 'deliver' && q.taken && !q.done && !q.items.length);
     if (unknown.length) lines.push(`Не знаю, какие это предметы — пропускаю: ${unknown.map((q) => `${quote(q)} («${q.goal}»)`).join('; ')}`);
+    data.unknown = unknown.map((q) => ({ title: q.title, goal: q.goal }));
     if (!todo.length) {
       lines.push('Приносить нечего: заданий «Передайте…» нет или все выполнены');
       return finish();
@@ -1303,6 +1313,9 @@ async function bringQuests(bot, npc, storageHome, rewardsHome) {
       let line = `Склад (/home ${storageHome}): ${taken.size ? `взял ${countsText(taken)}` : 'подходящего нет'}`;
       if (short.length) line += `; не хватило: ${short.map((n) => `${quote(n.q)} — ${n.want - n.got}`).join(', ')}`;
       if (r.full) line += '; инвентарь полон';
+      // Чего не хватило на складе (для автопилота: «положи на склад …»).
+      data.short = short.map((n) => ({ title: n.q.title, goal: n.q.goal, items: n.q.items, missing: n.want - n.got }));
+      data.full = Boolean(r.full);
       lines.push(line);
     }
     // 4. Сдать; выполнили всё — новый уровень.
@@ -1765,8 +1778,19 @@ async function fight(bot, goals, { idleMs = FIGHT_IDLE_MS, maxMs = FIGHT_MAX_MS 
   return { kills, note };
 }
 
-/** «#бей пауков 20», «#бей ифритов», «#бей» — для заданий «Убейте…», которые бот видел у NPC. */
-async function cmdFight({ bot, args }) {
+/**
+ * «#бей пауков 20», «#бей ифритов», «#бей» — для заданий «Убейте…», которые бот видел у NPC.
+ * «… дом пауки» — сначала /home пауки (комната со спавнером), бой — там.
+ */
+async function cmdFight({ bot, args: allArgs, words = [] }) {
+  let args = allArgs;
+  let home = null;
+  const at = words.indexOf('дом');
+  if (at >= 0) {
+    home = allArgs[at + 1] || null;
+    if (!home || !HOME_NAME_RE.test(home)) throw new CommandError('какой дом? Например: #бей пауков 20 дом пауки');
+    args = allArgs.filter((_, i) => i !== at && i !== at + 1);
+  }
   const num = args.find((a) => /^\d+$/.test(a));
   const text = args.filter((a) => a !== num).join(' ');
   let goals;
@@ -1780,6 +1804,7 @@ async function cmdFight({ bot, args }) {
       throw new CommandError('кого бить? Например: #бей пауков 20. Без слов — для заданий «Убейте…», но таких бот не видел: сначала #квесты у NPC');
     }
   }
+  if (home) await teleportBy(bot, `/home ${home}`);
   // Оружие: лучший меч, нет — лучший топор, нет и его — чем есть.
   for (const word of ['меч', 'топор']) {
     let item = null;
@@ -1972,9 +1997,10 @@ const COMMANDS = [
   {
     name: 'бей',
     aliases: ['убей', 'бить', 'attack', 'fight'],
-    usage: ['#бей пауков 20', '#бей ифритов', '#бей'],
+    usage: ['#бей пауков 20', '#бей ифритов', '#бей', '#бей пауков 20 дом пауки'],
     about: 'бить мобов рядом, не сходя с места (в досягаемости, не сквозь стену; игроков и мобов с именем не трогает): ' +
-      'N штук или пока подходят; без слов — сколько нужно для заданий «Убейте…» (бот запоминает их у NPC)',
+      'N штук или пока подходят; без слов — сколько нужно для заданий «Убейте…» (бот запоминает их у NPC); ' +
+      '«дом пауки» — сначала /home пауки (комната со спавнером)',
     run: cmdFight,
   },
   {
