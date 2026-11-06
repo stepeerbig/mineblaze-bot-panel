@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { Fleet } = require('./fleet');
-const { AiAgent } = require('./ai');
+const { AiAgent, formatDuration } = require('./ai');
 const { DEFAULT_CONFIG, sanitize, validate, accountsOf } = require('./config');
 const { maskSecrets } = require('./chat-utils');
 
@@ -305,9 +305,21 @@ function registerIpc() {
     } catch (err) {
       return { ok: false, error: errText(err) };
     }
-    aiLog('info', `Задание: ${text} (модель ${config.aiModel})`);
+    const where = config.aiProvider === 'openai' ? `модель ${config.aiModel}` : `модель ${config.ollamaModel} на этом ПК`;
+    aiLog('info', `Задание: ${text} (${where})`);
     return { ok: true };
   });
+
+  // Готов ли ИИ (для подсказки на панели): Ollama запущена? модель скачана? у интернет-сервиса — есть ли ключ.
+  ipcMain.handle('ai:status', async () => {
+    try {
+      return { ok: true, ...(await ai.status()) };
+    } catch (err) {
+      return { ok: false, error: hideSecrets(errText(err)) };
+    }
+  });
+
+  ipcMain.handle('ai:get-ollama', () => shell.openExternal('https://ollama.com/download').then(() => true, () => false));
 
   ipcMain.handle('ai:stop', () => {
     const stopped = ai.stop();
@@ -573,6 +585,37 @@ function createFleet() {
 
 // ---------- ИИ-помощник ----------
 
+/**
+ * Чем запустить Ollama (значок у часов): её программа или ярлыки, которые ставит установщик.
+ * Пусто — Ollama не установлена.
+ */
+function ollamaLaunchers() {
+  if (process.platform !== 'win32') return [];
+  const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+  const roaming = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  const programs = path.join(roaming, 'Microsoft', 'Windows', 'Start Menu', 'Programs');
+  return [
+    path.join(local, 'Programs', 'Ollama', 'ollama app.exe'),
+    path.join(programs, 'Ollama.lnk'),
+    path.join(programs, 'Ollama', 'Ollama.lnk'),
+    path.join(programs, 'Startup', 'Ollama.lnk'),
+  ].filter((p) => {
+    try {
+      return fs.existsSync(p);
+    } catch (_) {
+      return false;
+    }
+  });
+}
+
+/** Ollama не запущена — запустить её, как из меню «Пуск». true — нашли и запустили. */
+async function startOllama() {
+  for (const target of ollamaLaunchers()) {
+    if ((await shell.openPath(target)) === '') return true;
+  }
+  return false;
+}
+
 function createAi() {
   const agent = new AiAgent({
     getConfig: () => config,
@@ -589,13 +632,21 @@ function createAi() {
         return fleet.start(ids);
       },
       catalog: () => require('./bot/commands').catalog(), // список команд ботов — тот же, что #помощь
+      startOllama,
+      ollamaInstalled: () => ollamaLaunchers().length > 0,
     },
   });
-  agent.on('action', ({ text }) => aiLog('info', text));
+  agent.on('action', ({ text }) => {
+    aiLog('info', text);
+    send('ai:progress', { text: hideSecrets(text) });
+  });
+  agent.on('progress', ({ text }) => send('ai:progress', { text: hideSecrets(text) }));
   agent.on('thought', ({ text }) => aiLog('info', `«${text}»`));
-  agent.on('done', ({ text, partial, requests }) => {
-    aiLog(partial ? 'warn' : 'ok', `Итог (запросов к ИИ: ${requests}): ${text}`);
-    send('ai:done', { text: hideSecrets(text), partial, requests });
+  agent.on('done', ({ text, partial, requests, provider, ms }) => {
+    const took = formatDuration(ms);
+    const how = provider === 'ollama' ? `ходов ИИ: ${requests}, ${took}` : `запросов к ИИ: ${requests}`;
+    aiLog(partial ? 'warn' : 'ok', `Итог (${how}): ${text}`);
+    send('ai:done', { text: hideSecrets(text), partial, requests, provider, took });
   });
   agent.on('error', ({ text }) => {
     aiLog('error', `Не получилось: ${text}`);
@@ -736,7 +787,7 @@ async function checkUi(expected) {
     mode.value = 'turn';
     mode.dispatchEvent(new Event('change'));
     out.placeholder = document.getElementById('chatInput').placeholder;
-    out.ai = Boolean(document.getElementById('aiRun') && document.getElementById('aiKey') && document.getElementById('aiModel').value);
+    out.ai = Boolean(document.getElementById('aiRun') && document.getElementById('aiProvider').value === 'ollama' && document.getElementById('ollamaModel').value);
     return out;
   })()`, true);
   const wantSelected = fleet.order.length > 1 ? fleet.get(fleet.order[1]).nick : fleet.order.length ? fleet.get(fleet.order[0]).nick : null;

@@ -22,8 +22,12 @@ contextBridge.exposeInMainWorld('api', {
   aiRun: (task, settings) => ipcRenderer.invoke('ai:run', { task: String(task || ''), settings: settings || null }),
   aiStop: () => ipcRenderer.invoke('ai:stop'),
   aiModels: (settings) => ipcRenderer.invoke('ai:models', settings || null), // → { ok, models: [название] }
+  // Готов ли ИИ: Ollama — { running, installed, version, hasModel, models }; интернет-сервис — { keyMissing }.
+  aiStatus: () => ipcRenderer.invoke('ai:status'),
+  aiGetOllama: () => ipcRenderer.invoke('ai:get-ollama'), // страница скачивания Ollama — в браузере
   onAiState: listen('ai:state'), // { running }
-  onAiDone: listen('ai:done'), // { text, partial, requests, error }
+  onAiProgress: listen('ai:progress'), // { text } — что ИИ делает сейчас (думает, команда ботам, скачано 40 %)
+  onAiDone: listen('ai:done'), // { text, partial, requests, provider, took, error }
   onLog: listen('bot:log'),
   onChat: listen('bot:chat'),
   onState: listen('bot:state'), // { bot, nick, state }

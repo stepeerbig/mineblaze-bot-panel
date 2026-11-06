@@ -304,6 +304,29 @@ summary:focus-visible {
 .fold.sub > summary { color: var(--dust); font: 12.5px var(--ui); }
 .fold.sub > summary:hover { color: var(--chalk); }
 
+/* Поля одного сервиса ИИ (Ollama или интернет-сервис) и состояние Ollama */
+.ai-fields > * + * { margin-top: 10px; }
+.ai-fields[hidden] { display: none; }
+
+.ai-status {
+  margin: 0;
+  padding: 6px 9px;
+  border-left: 2px solid var(--cobble);
+  border-radius: 4px;
+  background: var(--deepslate);
+  color: var(--dust);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.ai-status:empty { display: none; }
+.ai-status.ok { border-left-color: var(--emerald); color: var(--chalk); }
+.ai-status.warn { border-left-color: var(--gold); color: var(--chalk); }
+
+.btn.ai-get { width: 100%; height: 34px; background: var(--cobble); color: var(--chalk); font-size: 13px; }
+.btn.ai-get:hover:not(:disabled) { background: #424750; }
+.btn[hidden] { display: none; }
+
 /* Метка «ИИ» у строк консоли */
 .ai-tag {
   padding: 0 5px;

@@ -42,7 +42,15 @@ const el = {
   aiStop: $('aiStop'),
   aiResult: $('aiResult'),
   aiSettings: $('aiSettings'),
-  aiKeyTag: $('aiKeyTag'),
+  aiSetupTag: $('aiSetupTag'),
+  aiProvider: $('aiProvider'),
+  ollamaFields: $('ollamaFields'),
+  ollamaStatus: $('ollamaStatus'),
+  getOllama: $('getOllama'),
+  ollamaModel: $('ollamaModel'),
+  ollamaModels: $('ollamaModels'),
+  ollamaUrl: $('ollamaUrl'),
+  openaiFields: $('openaiFields'),
   aiKey: $('aiKey'),
   showAiKey: $('showAiKey'),
   aiModel: $('aiModel'),
@@ -420,30 +428,111 @@ function fillForm(cfg) {
   el.guardOn.checked = cfg.guard !== false;
   el.godOn.checked = cfg.godMode !== false;
   if (document.activeElement !== el.whitelist) el.whitelist.value = cfg.whitelist || '';
-  for (const key of ['aiKey', 'aiModel', 'aiBaseUrl']) {
+  for (const key of ['aiKey', 'aiModel', 'aiBaseUrl', 'ollamaModel', 'ollamaUrl']) {
     if (document.activeElement !== el[key]) el[key].value = cfg[key] || '';
   }
+  el.aiProvider.value = cfg.aiProvider === 'openai' ? 'openai' : 'ollama';
   setAutoReconnectUi(cfg.autoReconnect);
   updateLabels();
   updateBotsTag();
   updateAutologinTag();
   updateGuardTag();
-  updateAiKeyTag();
+  updateAiProviderUi();
 }
 
 // ---------- ИИ-помощник ----------
 
-const AI_LOCAL_RE = /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])/i; // ИИ на своём ПК — без ключа
+const AI_LOCAL_RE = /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])/i; // ИИ на своём ПК — без ключа
+const AI_STATUS_POLL_MS = 15000; // Ollama ещё не готова — проверять, не установили ли её
 let aiRunning = false;
-let aiModelsLoaded = false;
+let aiModelsLoaded = false; // подсказка моделей интернет-сервиса
+let aiStatus = null; // последний ответ ai:status
+let aiStatusBusy = false;
 
-const readAiForm = () => ({ aiKey: el.aiKey.value, aiModel: el.aiModel.value, aiBaseUrl: el.aiBaseUrl.value });
+const readAiForm = () => ({
+  aiProvider: el.aiProvider.value,
+  ollamaModel: el.ollamaModel.value,
+  ollamaUrl: el.ollamaUrl.value,
+  aiKey: el.aiKey.value,
+  aiModel: el.aiModel.value,
+  aiBaseUrl: el.aiBaseUrl.value,
+});
 
-function updateAiKeyTag() {
-  const missing = !el.aiKey.value.trim() && !AI_LOCAL_RE.test(el.aiBaseUrl.value.trim());
-  el.aiKeyTag.hidden = !missing;
-  if (missing) el.aiSettings.open = true; // где вписать ключ — сразу видно
+const usesOllama = () => el.aiProvider.value !== 'openai';
+
+/** Поля выбранного сервиса; метка у «Модель и сервис»: чего не хватает. */
+function updateAiProviderUi() {
+  el.ollamaFields.hidden = !usesOllama();
+  el.openaiFields.hidden = usesOllama();
+  updateAiSetupTag();
 }
+
+function updateAiSetupTag() {
+  let tag = '';
+  if (!usesOllama()) {
+    if (!el.aiKey.value.trim() && !AI_LOCAL_RE.test(el.aiBaseUrl.value.trim())) tag = 'нужен ключ';
+  } else if (aiStatus && aiStatus.ok && aiStatus.provider === 'ollama' && !aiStatus.running && aiStatus.local && !aiStatus.installed) {
+    tag = 'нужна Ollama';
+  }
+  el.aiSetupTag.textContent = tag;
+  el.aiSetupTag.hidden = !tag;
+  if (tag) el.aiSettings.open = true; // чего не хватает — сразу видно
+}
+
+function fillDatalist(list, names) {
+  list.replaceChildren(...names.map((id) => {
+    const o = document.createElement('option');
+    o.value = id;
+    return o;
+  }));
+}
+
+/** Состояние Ollama — строкой над полями (и кнопка «Скачать Ollama», если её нет). */
+function showOllamaStatus(s) {
+  let text = '';
+  let kind = '';
+  let install = false;
+  if (s && s.ok && s.provider === 'ollama') {
+    if (s.running && s.hasModel) {
+      text = `Ollama ${s.version} работает, модель ${s.model} скачана — всё готово.`;
+      kind = 'ok';
+    } else if (s.running) {
+      text = `Ollama ${s.version} работает. Модели ${s.model} ещё нет — панель скачает её сама при первом задании (один раз).`;
+      kind = 'warn';
+    } else if (!s.local) {
+      text = `Ollama по адресу ${s.url} не отвечает — проверь, что она запущена на том ПК.`;
+      kind = 'warn';
+    } else if (s.installed) {
+      text = 'Ollama установлена, но не запущена — панель запустит её сама при задании.';
+      kind = 'warn';
+    } else {
+      text = 'Ollama не установлена. Нажми «Скачать Ollama», установи её (как обычную программу) и возвращайся — модель панель скачает сама.';
+      kind = 'warn';
+      install = true;
+    }
+    if (Array.isArray(s.models)) fillDatalist(el.ollamaModels, [...new Set([...s.models, 'qwen3:4b-instruct'])]);
+  }
+  el.ollamaStatus.textContent = text;
+  el.ollamaStatus.className = `ai-status ${kind}`;
+  el.getOllama.hidden = !install;
+}
+
+/** Спросить у панели, готов ли ИИ (Ollama запущена? модель скачана?). */
+async function refreshAiStatus() {
+  if (aiStatusBusy) return;
+  aiStatusBusy = true;
+  try {
+    aiStatus = await bridge.aiStatus();
+  } catch (_) {
+    aiStatus = null;
+  } finally {
+    aiStatusBusy = false;
+  }
+  showOllamaStatus(aiStatus);
+  updateAiSetupTag();
+}
+
+const aiReady = () => Boolean(aiStatus && aiStatus.ok && (aiStatus.provider !== 'ollama' || (aiStatus.running && aiStatus.hasModel)));
 
 function showAiResult(text, kind) {
   el.aiResult.textContent = text;
@@ -476,11 +565,11 @@ async function runAi() {
   } else {
     el.aiRun.disabled = aiRunning;
     showAiResult(`Не начато: ${(r && r.error) || 'неизвестная ошибка'}`, 'error');
-    updateAiKeyTag();
+    updateAiSetupTag();
   }
 }
 
-/** Подсказка в поле «Модель»: бесплатные модели сервиса, которые умеют вызывать инструменты. */
+/** Подсказка в поле «Модель» интернет-сервиса: бесплатные модели, которые умеют вызывать инструменты. */
 async function loadAiModels() {
   if (aiModelsLoaded) return;
   aiModelsLoaded = true;
@@ -489,11 +578,7 @@ async function loadAiModels() {
     aiModelsLoaded = false; // попробуем в следующий раз
     return;
   }
-  el.aiModels.replaceChildren(...r.models.map((id) => {
-    const o = document.createElement('option');
-    o.value = id;
-    return o;
-  }));
+  fillDatalist(el.aiModels, r.models);
 }
 
 function readForm() {
@@ -640,18 +725,31 @@ el.aiStop.addEventListener('click', async () => {
   if (!(await bridge.aiStop())) setAiRunning(false);
 });
 
-// Ключ, модель и адрес сервиса сохраняются сразу (ключ — зашифрованным).
-for (const field of [el.aiKey, el.aiModel, el.aiBaseUrl]) {
+// Сервис, модель, адрес и ключ сохраняются сразу (ключ — зашифрованным).
+for (const field of [el.aiProvider, el.ollamaModel, el.ollamaUrl, el.aiKey, el.aiModel, el.aiBaseUrl]) {
   field.addEventListener('change', async () => {
     const before = `${el.aiBaseUrl.value}\n${el.aiKey.value}`;
     const cfg = await bridge.saveConfig(readAiForm());
     fillForm(cfg);
     if (`${el.aiBaseUrl.value}\n${el.aiKey.value}` !== before) aiModelsLoaded = false; // другой сервис — другие модели
+    if (field === el.aiProvider || field === el.ollamaModel || field === el.ollamaUrl) refreshAiStatus();
   });
 }
-el.aiKey.addEventListener('input', updateAiKeyTag);
-el.aiBaseUrl.addEventListener('input', updateAiKeyTag);
+el.aiKey.addEventListener('input', updateAiSetupTag);
+el.aiBaseUrl.addEventListener('input', updateAiSetupTag);
 el.aiModel.addEventListener('focus', loadAiModels);
+el.ollamaModel.addEventListener('focus', refreshAiStatus); // свежий список скачанных моделей
+el.aiSettings.addEventListener('toggle', () => {
+  if (el.aiSettings.open) refreshAiStatus();
+});
+el.getOllama.addEventListener('click', () => bridge.aiGetOllama());
+// Вернулся в панель (например, после установки Ollama) — проверить ещё раз; пока не готово — раз в 15 с.
+window.addEventListener('focus', () => {
+  if (usesOllama() && !aiRunning && !aiReady()) refreshAiStatus();
+});
+setInterval(() => {
+  if (usesOllama() && !aiRunning && !aiReady() && !document.hidden) refreshAiStatus();
+}, AI_STATUS_POLL_MS);
 
 el.showAiKey.addEventListener('click', () => {
   const show = el.aiKey.type === 'password';
@@ -662,9 +760,16 @@ el.showAiKey.addEventListener('click', () => {
   el.showAiKey.setAttribute('aria-label', label);
 });
 
-bridge.onAiState(({ running }) => setAiRunning(running));
-bridge.onAiDone(({ text, partial, error, requests }) => {
-  const tail = Number.isFinite(requests) ? `\n\nЗапросов к ИИ: ${requests}` : '';
+bridge.onAiState(({ running }) => {
+  setAiRunning(running);
+  if (!running) refreshAiStatus(); // модель могла скачаться, Ollama — запуститься
+});
+bridge.onAiProgress(({ text }) => {
+  if (aiRunning && text) showAiResult(`${text}\n\nШаги — в консоли с меткой «ИИ»`, 'busy');
+});
+bridge.onAiDone(({ text, partial, error, requests, provider, took }) => {
+  let tail = '';
+  if (Number.isFinite(requests)) tail = provider === 'ollama' ? `\n\nХодов ИИ: ${requests}${took ? ` · ${took}` : ''}` : `\n\nЗапросов к ИИ: ${requests}`;
   showAiResult(error ? `Не получилось: ${text}` : `${text}${tail}`, error ? 'error' : partial ? 'warn' : 'ok');
 });
 
@@ -718,4 +823,5 @@ bridge.init().then(({ config, bots: list, summary: s, selected: sel, chat, ai })
   applySummary(s);
   renderChatHistory(chat);
   setAiRunning(ai && ai.running);
+  refreshAiStatus();
 });

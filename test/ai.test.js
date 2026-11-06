@@ -1,13 +1,14 @@
 'use strict';
 
 // ИИ-помощник (src/ai.js): ход задания, отказы, ошибки сервиса, стоп. Сервис ИИ — подделка fetch с готовыми
-// ответами (как у OpenRouter: OpenAI-совместимый chat/completions с tool_calls), боты — подделка env.
+// ответами: интернет-сервис (как у OpenRouter: OpenAI-совместимый chat/completions с tool_calls) и Ollama на этом
+// ПК (родной API: /api/chat, /api/show, /api/pull…), боты — подделка env.
 
 const test = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
 
-const { AiAgent, systemPrompt, formatResults, plainText, MAX_STEPS, FORBIDDEN_RE } = require(path.join(__dirname, '..', 'src', 'ai.js'));
+const { AiAgent, systemPrompt, formatResults, plainText, fitHistory, MAX_STEPS, FORBIDDEN_RE, OLLAMA_CTX } = require(path.join(__dirname, '..', 'src', 'ai.js'));
 const { catalog } = require(path.join(__dirname, '..', 'src', 'bot', 'commands.js'));
 const { sanitize, DEFAULT_CONFIG } = require(path.join(__dirname, '..', 'src', 'config.js'));
 
@@ -49,7 +50,7 @@ function makeAgent(replies, { cfg = {}, env } = {}) {
   const fake = fakeFetch(replies);
   const e = env || makeEnv();
   const agent = new AiAgent({
-    getConfig: () => ({ aiBaseUrl: 'https://openrouter.ai/api/v1', aiKey: KEY, aiModel: 'nvidia/nemotron-3-ultra-550b-a55b:free', ...cfg }),
+    getConfig: () => ({ aiProvider: 'openai', aiBaseUrl: 'https://openrouter.ai/api/v1', aiKey: KEY, aiModel: 'nvidia/nemotron-3-ultra-550b-a55b:free', ...cfg }),
     env: e.env,
     fetch: fake.fetch,
     timings: { retryWaitMs: 5 },
@@ -66,7 +67,8 @@ test('ИИ: задание — список ботов, команда всем,
     say('Готово: Farm01 и Farm02 взяли задания, Farm03 не в сети.'),
   ]);
   const result = await agent.run('возьми задания у Фермера всеми ботами');
-  assert.deepEqual(result, { text: 'Готово: Farm01 и Farm02 взяли задания, Farm03 не в сети.', requests: 3, partial: false });
+  assert.deepEqual({ ...result, ms: undefined }, { text: 'Готово: Farm01 и Farm02 взяли задания, Farm03 не в сети.', requests: 3, partial: false, provider: 'openai', ms: undefined });
+  assert.ok(Number.isFinite(result.ms));
 
   assert.equal(calls.length, 3);
   assert.equal(calls[0].url, 'https://openrouter.ai/api/v1/chat/completions');
@@ -180,7 +182,8 @@ test('ИИ: «Стоп» — запрос к сервису обрывается
   const pending = agent.run('долгое задание');
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(agent.stop(), true);
-  assert.deepEqual(await pending, { text: 'Остановлено', requests: 0, partial: true });
+  const stopped = await pending;
+  assert.deepEqual([stopped.text, stopped.requests, stopped.partial], ['Остановлено', 0, true]);
   assert.ok(!events.some(([n]) => n === 'error'), 'стоп — не ошибка');
   assert.equal(agent.stop(), false, 'уже не работает');
 
@@ -257,4 +260,242 @@ test('настройки ИИ: адрес — только https (http — ли�
   assert.equal(sanitize({ aiKey: ' sk-or-v1-abc\n' }).aiKey, 'sk-or-v1-abc');
   assert.equal(sanitize({ aiModel: '  ' }).aiModel, DEFAULT_CONFIG.aiModel);
   assert.equal(sanitize({ aiModel: ' openrouter/free ' }).aiModel, 'openrouter/free');
+
+  // Ollama: по умолчанию ИИ — на этом ПК; адрес — этот ПК или другой в домашней сети (ключа у Ollama нет).
+  assert.equal(DEFAULT_CONFIG.aiProvider, 'ollama');
+  assert.equal(sanitize({ aiProvider: 'openai' }).aiProvider, 'openai');
+  assert.equal(sanitize({ aiProvider: 'cloud' }).aiProvider, undefined);
+  assert.equal(sanitize({ ollamaUrl: ' http://192.168.1.5:11434/ ' }).ollamaUrl, 'http://192.168.1.5:11434');
+  assert.equal(sanitize({ ollamaUrl: 'http://localhost:11434' }).ollamaUrl, 'http://localhost:11434');
+  assert.equal(sanitize({ ollamaUrl: 'http://example.com:11434' }).ollamaUrl, undefined, 'чужой адрес по http — нет');
+  assert.equal(sanitize({ ollamaUrl: '' }).ollamaUrl, DEFAULT_CONFIG.ollamaUrl);
+  assert.equal(sanitize({ ollamaModel: '  ' }).ollamaModel, DEFAULT_CONFIG.ollamaModel);
+  assert.equal(sanitize({ ollamaModel: ' qwen3:8b ' }).ollamaModel, 'qwen3:8b');
+});
+
+// ---------- Ollama на этом ПК (родной API) ----------
+
+const ocall = (name, args = {}) => ({ function: { name, arguments: args } });
+const osay = (content, calls) => ({ model: 'qwen3:4b-instruct', message: { role: 'assistant', content, ...(calls ? { tool_calls: calls } : {}) }, done: true, done_reason: 'stop' });
+
+/** Ollama-подделка по адресам: /api/version, /api/tags, /api/show, /api/pull (NDJSON), /api/chat (ответы по очереди). */
+function fakeOllama({ running = true, models = { 'qwen3:4b-instruct': ['completion', 'tools'] }, chats = [], pull = null } = {}) {
+  const state = { running, models: { ...models } };
+  const calls = [];
+  const fetch = async (url, opts = {}) => {
+    const u = new URL(url);
+    const body = opts.body ? JSON.parse(opts.body) : null;
+    calls.push({ path: u.pathname, url, headers: opts.headers || {}, body, signal: opts.signal });
+    if (!state.running) throw new TypeError('fetch failed'); // порт закрыт, как у net.fetch: ERR_CONNECTION_REFUSED
+    switch (u.pathname) {
+      case '/api/version': return json({ version: '0.40.14' });
+      case '/api/tags': return json({ models: Object.keys(state.models).map((name) => ({ name, model: name, size: 2.5e9 })) });
+      case '/api/show': {
+        const caps = state.models[body.model];
+        return caps ? json({ capabilities: caps, details: { parameter_size: '4.0B' } }) : json({ error: `model '${body.model}' not found` }, 404);
+      }
+      case '/api/pull': return pull({ body, signal: opts.signal, state });
+      case '/api/chat': {
+        const next = chats.shift();
+        if (!next) throw new Error('лишний запрос к ИИ');
+        return typeof next === 'function' ? next({ body, signal: opts.signal }) : json(next);
+      }
+      default: return json({ error: 'not found' }, 404);
+    }
+  };
+  return { fetch, calls, state };
+}
+
+/** Тело ответа /api/pull — строки NDJSON; hang — не заканчивать, пока не оборвут (signal). */
+function ndjson(lines, { signal, hang = false } = {}) {
+  const enc = new TextEncoder();
+  return new Response(new ReadableStream({
+    start(controller) {
+      for (const l of lines) controller.enqueue(enc.encode(`${JSON.stringify(l)}\n`));
+      if (!hang) controller.close();
+      else if (signal) signal.addEventListener('abort', () => controller.error(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+    },
+  }), { status: 200, headers: { 'content-type': 'application/x-ndjson' } });
+}
+
+function makeLocal(fake, { cfg = {}, env, timings = {} } = {}) {
+  const e = env || makeEnv();
+  const agent = new AiAgent({
+    getConfig: () => ({ aiProvider: 'ollama', ollamaUrl: 'http://127.0.0.1:11434', ollamaModel: 'qwen3:4b-instruct', ...cfg }),
+    env: e.env,
+    fetch: fake.fetch,
+    timings: { retryWaitMs: 5, startWaitMs: 300, pollMs: 5, stallMs: 60, ...timings },
+  });
+  const events = [];
+  for (const name of ['action', 'thought', 'progress', 'done', 'error', 'state']) agent.on(name, (p) => events.push([name, p]));
+  return { agent, events, commands: e.commands, env: e.env };
+}
+
+const errorOf = (events) => (events.find(([n]) => n === 'error') || [null, {}])[1].text;
+
+test('Ollama: родной API — окно контекста, инструменты, ответ инструмента по имени, без ключа', async () => {
+  const fake = fakeOllama({
+    chats: [
+      osay('', [ocall('list_bots')]),
+      osay('Беру задания.', [ocall('run_command', { bots: 'all', command: '#квесты взять' })]),
+      osay('Готово: Farm01 и Farm02 взяли задания.'),
+    ],
+  });
+  const { agent, events, commands } = makeLocal(fake);
+  const result = await agent.run('возьми задания у Фермера всеми ботами');
+  assert.deepEqual([result.text, result.provider, result.requests, result.partial], ['Готово: Farm01 и Farm02 взяли задания.', 'ollama', 3, false]);
+
+  assert.deepEqual(fake.calls.map((c) => c.path), ['/api/version', '/api/show', '/api/chat', '/api/chat', '/api/chat']);
+  const chat = fake.calls.filter((c) => c.path === '/api/chat');
+  assert.equal(chat[0].url, 'http://127.0.0.1:11434/api/chat');
+  assert.equal(chat[0].headers.Authorization, undefined, 'ключ Ollama не нужен');
+  assert.equal(chat[0].body.model, 'qwen3:4b-instruct');
+  assert.equal(chat[0].body.stream, false);
+  assert.equal(chat[0].body.options.num_ctx, OLLAMA_CTX, 'окно контекста больше 4096 по умолчанию');
+  assert.ok(chat[0].body.keep_alive);
+  assert.equal('think' in chat[0].body, false, 'модель не умеет думать вслух — think не шлём');
+  assert.deepEqual(chat[0].body.tools.map((t) => t.function.name), ['list_bots', 'run_command', 'start_bots', 'wait']);
+  assert.match(chat[0].body.messages[0].content, /#квесты принести урожай награды/);
+
+  const hist = chat[2].body.messages;
+  assert.deepEqual(hist[hist.length - 2].tool_calls, [{ type: 'function', function: { name: 'run_command', arguments: { bots: 'all', command: '#квесты взять' } } }]);
+  assert.deepEqual(hist[hist.length - 1], { role: 'tool', tool_name: 'run_command', content: 'Farm01: да — #квесты взять: готово у Farm01\nFarm02: да — #квесты взять: готово у Farm02' });
+  assert.deepEqual(chat[1].body.messages[chat[1].body.messages.length - 1].tool_name, 'list_bots');
+  assert.deepEqual(commands.map((c) => [c.ids, c.line]), [[null, '#квесты взять']]);
+  assert.ok(events.some(([n, p]) => n === 'progress' && /^ИИ думает… Первый ответ на процессоре/.test(p.text)));
+  assert.ok(events.some(([n, p]) => n === 'progress' && p.text === 'ИИ думает… (ход 2)'));
+});
+
+test('Ollama: модель, которая думает вслух, — без размышлений (think: false); команда в кавычках — без кавычек', async () => {
+  const fake = fakeOllama({
+    models: { 'qwen3:4b': ['completion', 'tools', 'thinking'] },
+    chats: [osay('', [ocall('run_command', { bots: 'Farm01', command: '"#где"' })]), osay('<think>хм</think>Farm01 на спавне.')],
+  });
+  const { agent, commands } = makeLocal(fake, { cfg: { ollamaModel: 'qwen3:4b' } });
+  assert.equal((await agent.run('где Farm01?')).text, 'Farm01 на спавне.');
+  assert.equal(fake.calls.find((c) => c.path === '/api/chat').body.think, false);
+  assert.deepEqual(commands.map((c) => c.line), ['#где']);
+});
+
+test('Ollama не запущена — панель запускает её; модели нет — скачивает (ход в процентах), потом задание', async () => {
+  const fake = fakeOllama({
+    running: false,
+    models: {},
+    chats: [osay('Готово.')],
+    pull: ({ body, state }) => {
+      state.models[body.model] = ['completion', 'tools'];
+      const layer = (completed) => ({ status: 'pulling 85e4a5b7b8ef', digest: 'sha256:85e4', total: 2500000000, completed });
+      return ndjson([
+        { status: 'pulling manifest' }, layer(0), layer(700000000), layer(1300000000), layer(2500000000),
+        { status: 'pulling eade0a07cac7', digest: 'sha256:eade', total: 1200, completed: 1200 },
+        { status: 'verifying sha256 digest' }, { status: 'writing manifest' }, { status: 'success' },
+      ]);
+    },
+  });
+  const env = makeEnv();
+  let launched = 0;
+  env.env.startOllama = async () => {
+    launched += 1;
+    setTimeout(() => {
+      fake.state.running = true; // программа запускается не сразу
+    }, 20);
+    return true;
+  };
+  const { agent, events } = makeLocal(fake, { env });
+  const result = await agent.run('сколько ботов в сети?');
+  assert.equal(result.text, 'Готово.');
+  assert.equal(launched, 1);
+  assert.deepEqual(fake.calls.find((c) => c.path === '/api/pull').body, { model: 'qwen3:4b-instruct', stream: true });
+  const actions = events.filter(([n]) => n === 'action').map(([, p]) => p.text);
+  assert.ok(actions.includes('Ollama не была запущена — запустил'), actions.join('\n'));
+  assert.ok(actions.some((t) => /^модели qwen3:4b-instruct ещё нет — скачиваю/.test(t)));
+  assert.ok(actions.includes('модель qwen3:4b-instruct: скачано 25 % (0,7 из 2,5 ГБ)'), actions.join('\n'));
+  assert.ok(actions.includes('модель qwen3:4b-instruct: скачано 50 % (1,3 из 2,5 ГБ)'));
+  assert.ok(actions.some((t) => /^модель qwen3:4b-instruct скачана за \d+ с$/.test(t)));
+  const progress = events.filter(([n]) => n === 'progress').map(([, p]) => p.text);
+  assert.ok(progress.includes('Запускаю Ollama…'));
+  assert.ok(progress.includes('Скачиваю модель qwen3:4b-instruct: 100 % (2,5 из 2,5 ГБ)'), progress.join('\n'));
+});
+
+test('Ollama: не установлена, на другом ПК не отвечает, модель без инструментов, нет памяти — понятные причины', async () => {
+  const none = makeEnv();
+  none.env.startOllama = async () => false;
+  const missing = makeLocal(fakeOllama({ running: false }), { env: none });
+  assert.equal(await missing.agent.run('привет'), null);
+  assert.match(errorOf(missing.events), /^Ollama не установлена — скачай её с ollama\.com/);
+  assert.equal(missing.agent.busy, false);
+
+  const remoteEnv = makeEnv();
+  remoteEnv.env.startOllama = async () => assert.fail('чужой ПК панель не запускает');
+  const remote = makeLocal(fakeOllama({ running: false }), { env: remoteEnv, cfg: { ollamaUrl: 'http://192.168.1.5:11434' } });
+  assert.equal(await remote.agent.run('привет'), null);
+  assert.match(errorOf(remote.events), /не отвечает по адресу http:\/\/192\.168\.1\.5:11434/);
+
+  const noTools = makeLocal(fakeOllama({ models: { 'gemma3:4b': ['completion', 'vision'] } }), { cfg: { ollamaModel: 'gemma3:4b' } });
+  assert.equal(await noTools.agent.run('привет'), null);
+  assert.match(errorOf(noTools.events), /модель gemma3:4b не умеет вызывать команды \(tools\)/);
+
+  const memory = makeLocal(fakeOllama({ chats: [() => json({ error: 'model requires more system memory (5.1 GiB) than is available (3.2 GiB)' }, 500)] }));
+  assert.equal(await memory.agent.run('привет'), null);
+  assert.match(errorOf(memory.events), /^не хватает памяти для модели qwen3:4b-instruct/);
+});
+
+test('Ollama: скачивание — нет такой модели, «Стоп» посреди, застряло без данных', async () => {
+  const typo = makeLocal(fakeOllama({
+    models: {},
+    pull: () => ndjson([{ status: 'pulling manifest' }, { error: 'pull model manifest: file does not exist' }]),
+  }), { cfg: { ollamaModel: 'qwen3:4b-instrukt' } });
+  assert.equal(await typo.agent.run('привет'), null);
+  assert.match(errorOf(typo.events), /^в Ollama нет модели «qwen3:4b-instrukt»/);
+
+  const half = (signal) => ndjson([{ status: 'pulling 85e4', digest: 'sha256:85e4', total: 2500000000, completed: 100000000 }], { signal, hang: true });
+  const stopped = makeLocal(fakeOllama({ models: {}, pull: ({ signal }) => half(signal) }), { timings: { stallMs: 60 * 1000 } });
+  const running = stopped.agent.run('привет');
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(stopped.agent.stop(), true);
+  assert.equal((await running).text, 'Остановлено');
+  assert.ok(!stopped.events.some(([n]) => n === 'error'));
+
+  const stuck = makeLocal(fakeOllama({ models: {}, pull: ({ signal }) => half(signal) }), { timings: { stallMs: 40 } });
+  assert.equal(await stuck.agent.run('привет'), null);
+  assert.match(errorOf(stuck.events), /^скачивание модели qwen3:4b-instruct застряло/);
+});
+
+test('Ollama: состояние для панели и список моделей; «qwen3» — это «qwen3:latest»', async () => {
+  const off = makeLocal(fakeOllama({ running: false }));
+  off.env.ollamaInstalled = () => true;
+  assert.deepEqual(await off.agent.status(), {
+    provider: 'ollama', model: 'qwen3:4b-instruct', url: 'http://127.0.0.1:11434', local: true, running: false, installed: true,
+  });
+
+  const on = makeLocal(fakeOllama({ models: { 'qwen3:latest': ['completion', 'tools'] } }), { cfg: { ollamaModel: 'qwen3' } });
+  const s = await on.agent.status();
+  assert.deepEqual([s.running, s.version, s.hasModel, s.models], [true, '0.40.14', true, ['qwen3:latest']]);
+  assert.deepEqual(await on.agent.listModels(), ['qwen3:latest', 'qwen3:4b-instruct'], 'скачанные и рекомендуемая');
+
+  const fresh = makeLocal(fakeOllama({ models: {} }));
+  assert.equal((await fresh.agent.status()).hasModel, false);
+
+  const online = makeAgent([], { cfg: { aiKey: '' } });
+  assert.equal((await online.agent.status()).keyMissing, true, 'интернет-сервис без ключа');
+});
+
+test('Ollama: длинная история — старые ответы ботов сокращаются, подсказка, задание и два последних ответа целы', () => {
+  const big = 'x'.repeat(5000);
+  const msgs = [
+    { role: 'system', content: 'S'.repeat(6000) },
+    { role: 'user', content: 'задание' },
+    { role: 'assistant', content: '', tool_calls: [{ type: 'function', function: { name: 'list_bots', arguments: {} } }] },
+    { role: 'tool', tool_name: 'list_bots', content: big },
+    { role: 'tool', tool_name: 'run_command', content: big },
+    { role: 'tool', tool_name: 'run_command', content: big },
+    { role: 'tool', tool_name: 'run_command', content: big },
+  ];
+  const total = fitHistory(msgs, 18000);
+  assert.ok(total <= 18000, String(total));
+  assert.match(msgs[3].content, /старый ответ сокращён/);
+  assert.match(msgs[4].content, /старый ответ сокращён/);
+  assert.deepEqual([msgs[5].content, msgs[6].content], [big, big]);
+  assert.deepEqual([msgs[0].content.length, msgs[1].content], [6000, 'задание']);
+  assert.equal(fitHistory(msgs, 100000), total, 'влезает — не трогаем');
 });

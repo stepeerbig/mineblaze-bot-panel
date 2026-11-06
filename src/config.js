@@ -19,8 +19,12 @@ const DEFAULT_CONFIG = Object.freeze({
   startInterval: 5, // секунд между входами ботов
   viewDistance: 4, // дальность прорисовки, которую бот сообщает серверу: меньше чанков — меньше памяти на бота
   botsPerProcess: 10, // ботов в одном процессе: больше — тики начнут опаздывать, меньше — больше памяти на процессы
-  // ИИ-помощник (src/ai.js): любой сервис с OpenAI-совместимым API. Ключ хранится зашифрованным.
-  aiBaseUrl: 'https://openrouter.ai/api/v1',
+  // ИИ-помощник (src/ai.js). Где работает модель: 'ollama' — Ollama на этом ПК (бесплатно, без ключа и лимитов),
+  // 'openai' — интернет-сервис с OpenAI-совместимым API и ключом (OpenRouter и др.).
+  aiProvider: 'ollama',
+  ollamaUrl: 'http://127.0.0.1:11434',
+  ollamaModel: 'qwen3:4b-instruct',
+  aiBaseUrl: 'https://openrouter.ai/api/v1', // интернет-сервис; ключ хранится зашифрованным
   aiKey: '',
   aiModel: 'nvidia/nemotron-3-ultra-550b-a55b:free',
 });
@@ -35,6 +39,9 @@ const MAX_JOIN_COMMANDS = 10;
 const MAX_CHAT_LENGTH = 256;
 const NICK_RE = /^[A-Za-z0-9_]{3,16}$/;
 const AI_LOCAL_RE = /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?(?:\/\S*)?$/i; // сервис ИИ на своём ПК
+// Ollama — на этом ПК или на другом в домашней сети (ключа у неё нет, так что http по своей сети — можно).
+const OLLAMA_URL_RE = /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\]|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})(?::\d{1,5})?(?:\/\S*)?$/i;
+const AI_PROVIDERS = ['ollama', 'openai'];
 
 /** Приводит присланные значения к безопасному виду; неверные поля просто отбрасывает. */
 function sanitize(src) {
@@ -89,6 +96,15 @@ function sanitize(src) {
   }
   if (typeof src.aiKey === 'string') out.aiKey = src.aiKey.replace(/\s+/g, '').slice(0, 300);
   if (typeof src.aiModel === 'string') out.aiModel = src.aiModel.trim().replace(/\s+/g, '').slice(0, 200) || DEFAULT_CONFIG.aiModel;
+  if (AI_PROVIDERS.includes(src.aiProvider)) out.aiProvider = src.aiProvider;
+  if (typeof src.ollamaUrl === 'string') {
+    const url = src.ollamaUrl.trim().replace(/\/+$/, '');
+    if (!url) out.ollamaUrl = DEFAULT_CONFIG.ollamaUrl;
+    else if (url.length <= 300 && (/^https:\/\/[^\s/]+(?:\/\S*)?$/i.test(url) || OLLAMA_URL_RE.test(url))) out.ollamaUrl = url;
+  }
+  if (typeof src.ollamaModel === 'string') {
+    out.ollamaModel = src.ollamaModel.trim().replace(/\s+/g, '').slice(0, 200) || DEFAULT_CONFIG.ollamaModel;
+  }
   return out;
 }
 

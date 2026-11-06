@@ -45,23 +45,43 @@
         <div id="aiResult" class="ai-result" role="status" hidden></div>
         <p class="hint">ИИ сам отдаёт ботам команды <b>#…</b> и <b>/…</b>, читает ответы и пишет итог. Каждый шаг — в консоли с меткой <b>ИИ</b>.</p>
         <details id="aiSettings" class="fold sub">
-          <summary>Ключ, модель и сервис <span id="aiKeyTag" class="tag warn" hidden>нужен ключ</span></summary>
-          <label class="field">Ключ API (openrouter.ai → Keys)
-            <span class="secret">
-              <input id="aiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-or-v1-…">
-              <button id="showAiKey" class="eye" type="button" aria-pressed="false" aria-label="Показать ключ" title="Показать ключ">
-                <svg viewBox="0 0 12 12" aria-hidden="true"><path fill-rule="evenodd" d="M6 2.5C3.2 2.5 1.1 4.4.3 6c.8 1.6 2.9 3.5 5.7 3.5s4.9-1.9 5.7-3.5C10.9 4.4 8.8 2.5 6 2.5zm0 1.2a2.3 2.3 0 1 1 0 4.6 2.3 2.3 0 0 1 0-4.6zm0 1.1a1.2 1.2 0 1 0 0 2.4 1.2 1.2 0 0 0 0-2.4z"/></svg>
-              </button>
-            </span>
+          <summary>Модель и сервис <span id="aiSetupTag" class="tag warn" hidden></span></summary>
+          <label class="field">Где работает ИИ
+            <select id="aiProvider">
+              <option value="ollama">Этот ПК — Ollama (бесплатно)</option>
+              <option value="openai">Интернет-сервис с ключом</option>
+            </select>
           </label>
-          <label class="field">Модель
-            <input id="aiModel" type="text" list="aiModels" autocomplete="off" spellcheck="false">
-          </label>
-          <datalist id="aiModels"></datalist>
-          <label class="field">Адрес сервиса
-            <input id="aiBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="https://openrouter.ai/api/v1">
-          </label>
-          <p class="hint">Бесплатно: OpenRouter, модели с <b>:free</b> — до 50 запросов к ИИ в день (одно задание — обычно 3–6). Ключ хранится зашифрованным, ботам и в логи не попадает.</p>
+          <div id="ollamaFields" class="ai-fields">
+            <p id="ollamaStatus" class="ai-status" role="status"></p>
+            <button id="getOllama" class="btn ai-get" type="button" hidden>Скачать Ollama с ollama.com</button>
+            <label class="field">Модель
+              <input id="ollamaModel" type="text" list="ollamaModels" autocomplete="off" spellcheck="false" placeholder="qwen3:4b-instruct">
+            </label>
+            <datalist id="ollamaModels"></datalist>
+            <label class="field">Адрес Ollama
+              <input id="ollamaUrl" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1:11434">
+            </label>
+            <p class="hint">Модель работает на этом ПК: без ключа и лимитов, задания никуда не уходят. Нужна программа <b>Ollama</b> (установить один раз), модель панель скачает сама — <b>≈2,5 ГБ</b>. Пока ИИ работает, модель занимает ≈4,5 ГБ памяти; через 10 мин без заданий память освобождается. На процессоре ответ — от десятков секунд до пары минут.</p>
+          </div>
+          <div id="openaiFields" class="ai-fields" hidden>
+            <label class="field">Ключ API (например, openrouter.ai → Keys)
+              <span class="secret">
+                <input id="aiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-or-v1-…">
+                <button id="showAiKey" class="eye" type="button" aria-pressed="false" aria-label="Показать ключ" title="Показать ключ">
+                  <svg viewBox="0 0 12 12" aria-hidden="true"><path fill-rule="evenodd" d="M6 2.5C3.2 2.5 1.1 4.4.3 6c.8 1.6 2.9 3.5 5.7 3.5s4.9-1.9 5.7-3.5C10.9 4.4 8.8 2.5 6 2.5zm0 1.2a2.3 2.3 0 1 1 0 4.6 2.3 2.3 0 0 1 0-4.6zm0 1.1a1.2 1.2 0 1 0 0 2.4 1.2 1.2 0 0 0 0-2.4z"/></svg>
+                </button>
+              </span>
+            </label>
+            <label class="field">Модель
+              <input id="aiModel" type="text" list="aiModels" autocomplete="off" spellcheck="false">
+            </label>
+            <datalist id="aiModels"></datalist>
+            <label class="field">Адрес сервиса
+              <input id="aiBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="https://openrouter.ai/api/v1">
+            </label>
+            <p class="hint">Любой сервис с OpenAI-совместимым API. OpenRouter: модели с <b>:free</b> — бесплатно, до 50 запросов к ИИ в день (одно задание — обычно 3–6). Ключ хранится зашифрованным, ботам и в логи не попадает.</p>
+          </div>
         </details>
       </details>
 
