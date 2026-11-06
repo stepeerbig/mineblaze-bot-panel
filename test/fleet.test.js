@@ -157,7 +157,8 @@ test('флот: «всем по очереди» — команда боту п�
   const stopped = events.find(([n]) => n === 'turn')[1];
   assert.equal(stopped.cancelled, true);
   assert.equal(managers().filter((m) => (m.runs || []).some((r) => r.line === '#квесты купить')).length, 1, 'начал только первый');
-  assert.ok(managerOf('Farm04').calls.includes('say:#стоп'), '#стоп ушёл и самим ботам');
+  // До ботов другого процесса «#стоп» идёт своим сообщением — может прийти чуть позже конца очереди.
+  assert.ok(await waitFor(() => managerOf('Farm04').calls.includes('say:#стоп')), '#стоп ушёл и самим ботам');
   assert.deepEqual(fleet.runInTurn('#где'), { targets: 4 }, 'после остановки можно новую очередь');
   await fleet.shutdown();
 });

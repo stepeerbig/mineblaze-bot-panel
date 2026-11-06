@@ -13,7 +13,7 @@
 
 const { Vec3 } = require('vec3');
 const { RaycastIterator } = require('prismarine-world').iterators;
-const { findPath, LIQUID_RE, UNBREAKABLE_RE } = require('./pathfinder');
+const { findPath, fastReader, edgeKey, LIQUID_RE, UNBREAKABLE_RE } = require('./pathfinder');
 
 const BLOCK_REACH = 4.4; // у игрока 4,5 блока — оставляем запас
 const ENTITY_REACH = 2.9; // у игрока 3 блока
@@ -24,7 +24,7 @@ const DESTROY_DELAY_TICKS = 6;
 const CONFIRM_TICKS = 20; // столько ждём, что сервер подтвердит сломанный или поставленный блок
 const LOOK_TIMEOUT_TICKS = 60;
 const STUCK_TICKS = 60; // столько тиков без продвижения — бот застрял
-const FIRST_SEARCH_NODES = 3000; // путь с копанием: точный поиск — до стольких клеток, дальше — жадный
+const FIRST_SEARCH_NODES = 2000; // путь с копанием к точке: точный поиск — до стольких клеток, дальше — жадный
 const SETBACK_CALM_TICKS = 6; // после отката сервером — столько тиков без клавиш
 const ATTACK_COOLDOWN_TICKS = 12; // пауза между ударами (меч восстанавливается за 12,5 тика)
 const CHAT_INTERVAL_MS = 1500;
@@ -406,6 +406,12 @@ function inject(bot, { random, now }) {
   }
 
   /**
+   * Плывёт ли бот: вода глубже 0,4 блока (там игра на «прыжок» даёт гребок вверх — держать его, чтобы всплыть).
+   * В мелкой воде — идти и прыгать на ступеньку, как по суше: прыжок там обычный.
+   */
+  const swimming = () => (bot.entity.waterDepth === undefined ? Boolean(bot.entity.isInWater) : bot.entity.waterDepth > 0.4);
+
+  /**
    * Дойти до точки по прямой (без поиска пути): поворачивает на ходу, перешагивает на блок выше прыжком.
    * @param {Vec3}    target
    * @param {object}  [opts]
@@ -460,8 +466,8 @@ function inject(bot, { random, now }) {
         bot.setControlState('forward', forward && dist > range * 0.6);
         bot.setControlState('sprint', Boolean(sprint) && forward && facing < 0.26 && dist > 3 && (bot.food === undefined || bot.food > 6));
 
-        // Ступенька в один блок — прыжок; в воде — всплываем.
-        let jump = Boolean(bot.entity.isInWater);
+        // Ступенька в один блок — прыжок; в глубокой воде — всплываем.
+        let jump = swimming();
         if (jumpTicks > 0) jumpTicks -= 1;
         if (!jump && forward && bot.entity.onGround && bot.entity.isCollidedHorizontally && jumpTicks === 0) {
           const ahead = pos.offset(-Math.sin(yaw) * 0.7, 0, -Math.cos(yaw) * 0.7);
@@ -498,7 +504,10 @@ function inject(bot, { random, now }) {
     let lastLookYaw = null;
     let jumpTicks = 0;
     let arrivedTicks = 0;
+    let climbing = false; // прыгнул на ступеньку и ещё не встал
     const limitTicks = Math.ceil((5000 + points.length * 700) / 50);
+    // Где застрял — откуда и куда шёл: навигация обойдёт этот шаг (findPath opts.avoid).
+    const stuckAt = (err, target) => Object.assign(err, { from: bot.entity.position.floored(), to: points[i] && new Vec3(points[i].x, points[i].y, points[i].z), target });
     // Сервер поставил бота в точку (откат, телепорт) — и взгляд тоже: навести его на цель заново. После отката —
     // несколько тиков без клавиш: тот же шаг сразу же античит часто откатывает снова, каждый тик (петля откатов).
     let calmTicks = 0;
@@ -545,12 +554,13 @@ function inject(bot, { random, now }) {
         best = left;
         bestTick = tick;
       } else if (tick - bestTick > STUCK_TICKS) {
-        throw new ActionError(`не могу пройти к ${fmt(target)}: застрял`, 'stuck');
+        throw stuckAt(new ActionError(`не могу пройти к ${fmt(target)}: застрял`, 'stuck'), target);
       }
-      if (tick > limitTicks) throw new ActionError(`не успел дойти до ${fmt(target)}`, 'timeout');
+      if (tick > limitTicks) throw stuckAt(new ActionError(`не успел дойти до ${fmt(target)}`, 'timeout'), target);
       if (calmTicks > 0) {
         calmTicks -= 1;
         releaseControls();
+        climbing = false;
         bestTick = tick; // пауза после отката — не «застрял»
         return undefined;
       }
@@ -562,22 +572,26 @@ function inject(bot, { random, now }) {
       }
       const facing = dist > 0.05 ? Math.abs(angleDiff(yaw, bot.serverView.yaw)) : 0;
       const forward = facing < 0.7; // сильно сбоку — сначала развернуться
-      bot.setControlState('forward', forward && dist > (last ? range * 0.6 : 0.05));
-      bot.setControlState('sprint', Boolean(sprint) && forward && facing < 0.26 && points.length - i > 3 && (bot.food === undefined || bot.food > 6));
-      // Ступенька — прыжок: точка выше, бот на земле у неё (или упёрся); в воде — всплываем. Под потолком (над
-      // головой блок) не прыгаем: прыжок обрежется, бот упадёт на край ступеньки — такое античит откатывает.
-      let jump = Boolean(bot.entity.isInWater) && target.y >= pos.y - 0.2;
+      // Ступенька в блок — как игрок: дойти вплотную (упереться), прыгнуть прямо вверх и, только когда ноги выше её
+      // края, шагнуть на неё. Прыжок с разбега цепляет край в воздухе, а посадка на край — такое античит откатывает.
+      // Под потолком не прыгаем: место над головой — во всех столбцах под коробкой бота (0,6 блока).
+      let jump = swimming() && target.y >= pos.y - 0.2;
       if (jumpTicks > 0) jumpTicks -= 1;
       const higher = target.y > pos.y + 0.6;
-      // Место над головой — во всех столбцах, которые задевает коробка бота (0,6 блока): задела соседний столбец с
-      // потолком хоть на сотую — прыжок обрежется о него.
       const y2 = Math.floor(pos.y + 0.01) + 2;
       const headroom = [pos.x - 0.3, pos.x + 0.2999].every((hx) => [pos.z - 0.3, pos.z + 0.2999]
         .every((hz) => !solidAt(new Vec3(Math.floor(hx), y2, Math.floor(hz)))));
-      if (!jump && higher && forward && headroom && bot.entity.onGround && jumpTicks === 0 && (bot.entity.isCollidedHorizontally || dist < 1.3)) {
+      if (climbing && bot.entity.onGround && jumpTicks <= 8) climbing = false; // встал (на ступеньку или обратно)
+      let startJump = false;
+      if (!jump && higher && forward && headroom && bot.entity.onGround && jumpTicks === 0 && bot.entity.isCollidedHorizontally) {
         jump = true;
+        startJump = true;
+        climbing = true;
         jumpTicks = 10;
       }
+      const rising = climbing && !bot.entity.onGround && pos.y < target.y - 0.02;
+      bot.setControlState('forward', forward && !startJump && !rising && dist > (last ? range * 0.6 : 0.05));
+      bot.setControlState('sprint', Boolean(sprint) && forward && !climbing && facing < 0.26 && points.length - i > 3 && (bot.food === undefined || bot.food > 6));
       bot.setControlState('jump', jump);
       return undefined;
       }, signal);
@@ -602,6 +616,7 @@ function inject(bot, { random, now }) {
       let stuck = 0;
       let lastLeft = Infinity;
       let noProgress = 0;
+      const avoid = new Set(); // шаги, на которых застревал: путь заново — в обход них
       for (let attempt = 0; attempt < 30; attempt += 1) {
         const pos = bot.entity.position;
         const left = Math.hypot(goal.x - pos.x, goal.z - pos.z);
@@ -609,13 +624,18 @@ function inject(bot, { random, now }) {
           releaseControls();
           return { arrived: true, position: pos.clone() };
         }
-        const res = await findPath(blockAt, pos, goal, { range: Math.max(0, range - 0.25), vertical, signal, ...(maxDistance ? { maxDistance } : {}) });
+        const res = await findPath(blockAt, pos, goal, {
+          range: Math.max(0, range - 0.25), vertical, signal, avoid, fast: fastReader(bot.world, bot.registry), ...(maxDistance ? { maxDistance } : {}),
+        });
         if (!res.path.length) throw new ActionError(`не нашёл пути до ${fmt(goal)}: ${res.reason}`, 'no_path');
         try {
           // Последняя клетка пути уже у цели (не дальше range) — до неё вплотную.
           await followPath(res.path, { range: 0.45, sprint }, signal);
         } catch (err) {
-          if (err && (err.code === 'stuck' || err.code === 'timeout') && (stuck += 1) <= 3) continue; // мир поменялся — путь заново
+          if (err && (err.code === 'stuck' || err.code === 'timeout') && (stuck += 1) <= 4) {
+            if (err.from && err.to) avoid.add(edgeKey(err.from, err.to)); // этот шаг не выходит — другой дорогой
+            continue;
+          }
           throw err;
         }
         // Шли до края видимого мира (или цель сдвинулась): дальше — снова, но если ближе к цели не становится — сдаёмся.
@@ -939,13 +959,20 @@ function inject(bot, { random, now }) {
       }
       // Куда встанем — там опора (а не открывшаяся пещера).
       if (step.move !== 'pillar' && !solidAt(step.offset(0, -1, 0)) && !isLiquid(blockAt(step))) return false;
-      if (step.move === 'pillar') {
-        await pillarStep(item, signal);
-      } else if (step.move === 'drop') {
-        await waitLanded(step.y, signal);
-      } else {
-        await followPath([step], { range: step.move === 'down' ? 0.15 : 0.25 }, signal);
-        await waitLanded(step.y, signal);
+      const from = bot.entity.position.floored();
+      try {
+        if (step.move === 'pillar') {
+          await pillarStep(item, signal);
+        } else if (step.move === 'drop') {
+          await waitLanded(step.y, signal);
+        } else {
+          await followPath([step], { range: step.move === 'down' ? 0.15 : 0.25 }, signal);
+          await waitLanded(step.y, signal);
+        }
+      } catch (err) {
+        // Шаг не вышел (застрял, не допрыгнул) — digTo найдёт путь в обход именно этого шага.
+        if (err && err.code !== 'aborted' && err.code !== 'stopped' && err.code !== 'replaced' && !err.to) Object.assign(err, { from, to: new Vec3(step.x, step.y, step.z) });
+        throw err;
       }
       const p = bot.entity.position;
       if (Math.floor(p.x) !== step.x || Math.floor(p.z) !== step.z || Math.abs(p.y - step.y) > 0.6) return false;
@@ -965,23 +992,39 @@ function inject(bot, { random, now }) {
    * @param {Function} [opts.onDig]     (блок до слома, позиция) — после каждого сломанного
    * Мир оказался не таким (вода, гравий, пещера) — путь заново; пути нет — ошибка с кодом no_path.
    */
-  function digTo(target, { reach = false, range = 0.5, vertical = 0, tool = null, item = null, onDig = null, maxDistance = 48, maxNodes = 12000 } = {}) {
+  function digTo(target, { reach = false, range = 0.5, vertical = 0, tool = null, item = null, onDig = null, maxDistance = 48, maxNodes = 8000 } = {}) {
     const goal = reach ? new Vec3(Math.floor(target.x), Math.floor(target.y), Math.floor(target.z)) : new Vec3(target.x, target.y, target.z);
     return run('копать путь', async (signal) => {
       let replans = 0;
       let lastLeft = Infinity;
       let noProgress = 0;
+      const avoid = new Set(); // шаги, которые не вышли (застрял, не допрыгнул): путь заново — в обход них
       for (;;) {
         const search = (weight, nodes) => findPath(blockAt, bot.entity.position, goal, {
           dig: true, place: Boolean(item) && countItem(item) > 0, reach, range, vertical, maxDistance, maxNodes: nodes, weight, signal,
+          avoid, fast: fastReader(bot.world, bot.registry),
         });
-        // Сначала — точный поиск (лучший путь: столбом там, где столбом дешевле) с небольшим запасом клеток; далеко
-        // сквозь камень он перебирал бы десятки тысяч — тогда жадный (вес 4): путь чуть хуже, зато сразу.
-        let res = await search(1.5, Math.min(FIRST_SEARCH_NODES, maxNodes));
-        if (!res.complete && res.nodes >= Math.min(FIRST_SEARCH_NODES, maxNodes)) res = await search(4, maxNodes);
+        // К руде — сразу жадный поиск (вес 4): путь почти лучший и находится за миллисекунды. К точке (обратно на
+        // свою высоту) — сначала точный (столбом там, где столбом дешевле), не хватило клеток — жадный.
+        let res;
+        if (reach) {
+          res = await search(4, maxNodes);
+        } else {
+          res = await search(1.5, Math.min(FIRST_SEARCH_NODES, maxNodes));
+          if (!res.complete && res.nodes >= Math.min(FIRST_SEARCH_NODES, maxNodes)) res = await search(4, maxNodes);
+        }
         if (res.complete && !res.path.length) return { arrived: true, position: bot.entity.position.clone() };
         if (!res.path.length) throw new ActionError(`не прокопаться к ${fmt(goal)}: ${res.reason}`, 'no_path');
-        const ok = await walkDigPath(res.path, { tool, item, onDig }, signal);
+        let ok;
+        try {
+          ok = await walkDigPath(res.path, { tool, item, onDig }, signal);
+        } catch (err) {
+          // Шаг не вышел — тот же шаг больше не предлагать (бот выберет другой: обход, столб, ступеньку).
+          const retry = err && err.from && err.to && ['stuck', 'timeout', 'failed'].includes(err.code) && (replans += 1) <= 8;
+          if (!retry) throw err;
+          avoid.add(edgeKey(err.from, err.to));
+          continue;
+        }
         if (ok && res.complete) return { arrived: true, position: bot.entity.position.clone() };
         if (!ok && (replans += 1) > 8) throw new ActionError(`не прокопаться к ${fmt(goal)}: мир всё время не такой, как видно`, 'no_path');
         if (ok) {
@@ -1037,7 +1080,10 @@ function inject(bot, { random, now }) {
       const there = blockAtOrThrow(pos);
       if (!isAir(there) && there.boundingBox === 'block') throw new ActionError(`клетка ${fmt(pos)} занята: ${there.name}`);
       const p = bot.entity.position;
-      if (p.x + 0.3 > pos.x && p.x - 0.3 < pos.x + 1 && p.z + 0.3 > pos.z && p.z - 0.3 < pos.z + 1 && p.y + 1.8 > pos.y && p.y < pos.y + 1) {
+      // Коробка бота — как её считает сервер (0,6F × 1,8F): вплотную к грани она уже чуть заходит в клетку.
+      const hw = Math.fround(0.6) / 2;
+      const h = Math.fround(1.8);
+      if (p.x + hw > pos.x && p.x - hw < pos.x + 1 && p.z + hw > pos.z && p.z - hw < pos.z + 1 && p.y + h > pos.y && p.y < pos.y + 1) {
         throw new ActionError('нельзя поставить блок туда, где стоит бот');
       }
       if (item) await equipItem(item, signal);

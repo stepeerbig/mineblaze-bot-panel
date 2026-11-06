@@ -18,11 +18,14 @@
 //     по настоящему взгляду в этом тике, а не по целевому (иначе на поворотах сервер видит расхождение).
 //  6. Телепорт от сервера (в том числе откат античитом) — по правилам 1.21.2+: относительные координаты, поворот
 //     и скорость из пакета. Угол в пакетах непрерывный — без скачков на 360°.
+//  7. Сам тик движения — src/bot/player-physics.js: prismarine-physics с водой, лавой, прыжком и гашением скорости
+//     по правилам игры 1.21 (для 1.8–1.12 — prismarine-physics как есть).
 
 const assert = require('assert');
 const { performance } = require('perf_hooks');
 const { Vec3 } = require('vec3');
 const { Physics, PlayerState } = require('prismarine-physics');
+const { createSimulator } = require('./player-physics');
 const math = require('mineflayer/lib/math');
 const conv = require('mineflayer/lib/conversions');
 const { createDoneTask, createTask } = require('mineflayer/lib/promise_utils');
@@ -144,7 +147,8 @@ function createPhysicsPlugin({ tickEnd = true, clock = defaultClock, random = Ma
 
 function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
   const world = { getBlock: (pos) => bot.blockAt(pos, false) };
-  const physics = Physics(bot.registry, world);
+  const simulator = createSimulator(bot.registry);
+  const physics = simulator.modernFluids ? simulator : Physics(bot.registry, world);
 
   const positionUpdateSentEveryTick = bot.supportFeature('positionUpdateSentEveryTick'); // 1.8–1.11
   const hasConfigurationState = bot.supportFeature('hasConfigurationState'); // 1.20.2+
@@ -158,160 +162,9 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
   bot.jumpTicks = 0; // пауза автопрыжка
   bot.physicsEnabled = physicsEnabled ?? true;
 
-  // ---------- вода: снос течением, как в игре 1.21 ----------
-  // prismarine-physics сносит по логике 1.12 и всегда в полную силу (0,014), а у соседа-блока с водой под ним
-  // проверка перевёрнута: у края подземного озера (камень нависает над водой) бота тянуло к камню, а игра (и
-  // античит на сервере) считает, что он стоит, — откат каждый тик. Снос prismarine считаем так же, как он, и
-  // вычитаем, а прибавляем игровой (Entity.updateFluidHeightAndDoFluidPushing и FlowingFluid.getFlow).
-  const idOf = (name) => (bot.registry.blocksByName[name] ? bot.registry.blocksByName[name].id : undefined);
-  const waterIds = new Set(['water', 'flowing_water'].map(idOf).filter((v) => v !== undefined));
-  const waterLike = new Set(['seagrass', 'tall_seagrass', 'kelp', 'kelp_plant', 'bubble_column'].map(idOf).filter((v) => v !== undefined));
-  const lavaIds = new Set(['lava', 'flowing_lava'].map(idOf).filter((v) => v !== undefined));
-  const blockXYZ = (x, y, z) => world.getBlock(new Vec3(x, y, z));
-  const H_DIRS = [[0, 1], [-1, 0], [0, -1], [1, 0]];
-  const isWaterBlock = (b) => Boolean(b) && (waterIds.has(b.type) || waterLike.has(b.type) || b.isWaterlogged === true);
-  const solidBox = (b) => Boolean(b) && b.boundingBox === 'block';
-
-  // Как prismarine-physics (getRenderedDepth, getFlow, getWaterInBB) — чтобы вычесть ровно его снос.
-  const pmDepth = (b) => {
-    if (!b) return -1;
-    if (waterLike.has(b.type) || b.isWaterlogged) return 0;
-    if (!waterIds.has(b.type)) return -1;
-    return b.metadata >= 8 ? 0 : b.metadata;
-  };
-  function pmFlow(b) {
-    const cur = pmDepth(b);
-    const flow = new Vec3(0, 0, 0);
-    for (const [dx, dz] of H_DIRS) {
-      const adj = world.getBlock(b.position.offset(dx, 0, dz));
-      const adjLevel = pmDepth(adj);
-      if (adjLevel < 0) {
-        if (adj && adj.boundingBox !== 'empty') {
-          const below = pmDepth(world.getBlock(b.position.offset(dx, -1, dz)));
-          if (below >= 0) {
-            const f = below - (cur - 8);
-            flow.x += dx * f;
-            flow.z += dz * f;
-          }
-        }
-      } else {
-        const f = adjLevel - cur;
-        flow.x += dx * f;
-        flow.z += dz * f;
-      }
-    }
-    if (b.metadata >= 8) {
-      for (const [dx, dz] of H_DIRS) {
-        const adj = world.getBlock(b.position.offset(dx, 0, dz));
-        const up = world.getBlock(b.position.offset(dx, 1, dz));
-        if ((adj && adj.boundingBox !== 'empty') || (up && up.boundingBox !== 'empty')) flow.normalize().translate(0, -6, 0);
-      }
-    }
-    return flow.normalize();
-  }
-  function pmWaterPush(pos) {
-    const minX = pos.x - 0.3 + 0.001;
-    const maxX = pos.x + 0.3 - 0.001;
-    const minY = pos.y + 0.401;
-    const maxY = pos.y + 1.8 - 0.401;
-    const minZ = pos.z - 0.3 + 0.001;
-    const maxZ = pos.z + 0.3 - 0.001;
-    const acc = new Vec3(0, 0, 0);
-    for (let y = Math.floor(minY); y <= Math.floor(maxY); y += 1) {
-      for (let z = Math.floor(minZ); z <= Math.floor(maxZ); z += 1) {
-        for (let x = Math.floor(minX); x <= Math.floor(maxX); x += 1) {
-          const b = blockXYZ(x, y, z);
-          if (!isWaterBlock(b)) continue;
-          if (Math.ceil(maxY) >= y + 1 - (pmDepth(b) + 1) / 9) acc.add(pmFlow(b));
-        }
-      }
-    }
-    const len = acc.norm();
-    return len > 0 ? acc.scaled(0.014 / len) : null;
-  }
-
-  // Как в игре: состояние воды в блоке — { amount: 1…8, falling } или null.
-  const fluidOf = (b) => {
-    if (!b) return null;
-    if (waterIds.has(b.type)) return b.metadata >= 8 ? { amount: 8, falling: true } : { amount: 8 - b.metadata, falling: false };
-    if (waterLike.has(b.type) || b.isWaterlogged) return { amount: 8, falling: false };
-    return null;
-  };
-  const unit = (v) => {
-    const n = v.norm();
-    return n < 1e-5 ? new Vec3(0, 0, 0) : v.scaled(1 / n);
-  };
-  function vanillaFlow(x, y, z, fs) {
-    const own = fs.amount / 9;
-    let dX = 0;
-    let dZ = 0;
-    for (const [sx, sz] of H_DIRS) {
-      const nb = blockXYZ(x + sx, y, z + sz);
-      if (nb && lavaIds.has(nb.type)) continue; // другая жидкость на течение воды не влияет
-      const f2 = fluidOf(nb);
-      let f = f2 ? f2.amount / 9 : 0;
-      let g = 0;
-      if (f === 0) {
-        if (!solidBox(nb)) {
-          const f3 = fluidOf(blockXYZ(x + sx, y - 1, z + sz));
-          if (f3 && (f = f3.amount / 9) > 0) g = own - (f - 0.8888889);
-        }
-      } else if (f > 0) {
-        g = own - f;
-      }
-      if (g === 0) continue;
-      dX += sx * g;
-      dZ += sz * g;
-    }
-    let v = new Vec3(dX, 0, dZ);
-    if (fs.falling) {
-      for (const [sx, sz] of H_DIRS) {
-        if (solidBox(blockXYZ(x + sx, y, z + sz)) || solidBox(blockXYZ(x + sx, y + 1, z + sz))) {
-          v = unit(v).offset(0, -6, 0);
-          break;
-        }
-      }
-    }
-    return unit(v);
-  }
-  function vanillaWaterPush(pos, vel, height) {
-    const minX = pos.x - 0.3 + 0.001;
-    const maxX = pos.x + 0.3 - 0.001;
-    const minY = pos.y + 0.001;
-    const maxY = pos.y + height - 0.001;
-    const minZ = pos.z - 0.3 + 0.001;
-    const maxZ = pos.z + 0.3 - 0.001;
-    let e = 0;
-    let sum = new Vec3(0, 0, 0);
-    let count = 0;
-    for (let x = Math.floor(minX); x < Math.ceil(maxX); x += 1) {
-      for (let y = Math.floor(minY); y < Math.ceil(maxY); y += 1) {
-        for (let z = Math.floor(minZ); z < Math.ceil(maxZ); z += 1) {
-          const fs = fluidOf(blockXYZ(x, y, z));
-          if (!fs) continue;
-          const top = y + (fluidOf(blockXYZ(x, y + 1, z)) ? 1 : fs.amount / 9);
-          if (!(top >= minY)) continue;
-          e = Math.max(top - minY, e);
-          let flow = vanillaFlow(x, y, z, fs);
-          if (e < 0.4) flow = flow.scaled(e);
-          sum = sum.plus(flow);
-          count += 1;
-        }
-      }
-    }
-    if (sum.norm() <= 0) return null;
-    let push = sum.scaled(1 / count).scaled(0.014); // у игрока — среднее, без растяжения до полной силы
-    if (Math.abs(vel.x) < 0.003 && Math.abs(vel.z) < 0.003 && push.norm() < 0.0045000000000000005) push = unit(push).scaled(0.0045000000000000005);
-    return push;
-  }
-  /** Поправка скорости перед шагом prismarine-physics: игровой снос минус тот, что prismarine добавит сам. */
-  function waterPushFix(pos, vel, sneak) {
-    const vanilla = vanillaWaterPush(pos, vel, sneak ? 1.5 : 1.8);
-    const pm = pmWaterPush(pos);
-    if (!vanilla && !pm) return null;
-    return (vanilla || new Vec3(0, 0, 0)).minus(pm || new Vec3(0, 0, 0));
-  }
   bot.physics = physics;
+  /** Ад: лава там сносит сильнее (dimensionType.ultraWarm). */
+  const ultraWarm = () => /nether/.test(String((bot.game && bot.game.dimension) || ''));
 
   const controlState = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false };
   let shouldUsePhysics = false; // движение считаем только после первой позиции от сервера
@@ -398,6 +251,7 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
       // Клавиши этого тика: по ним считается движение, они же уходят на сервер. Что поменяют обработчики
       // physicsTick, сработает в следующем тике — так же, как у обычного клиента.
       const controls = { ...controlState };
+      let sprinting = controls.sprint; // бежит ли (по правилам игры) — это и узнает сервер
       let hover = false;
       if (flying && !(bot.game && bot.game.gameMode === 'spectator')) {
         const wantsMove = controls.forward || controls.back || controls.left || controls.right || controls.jump || controls.sneak;
@@ -422,15 +276,21 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
           const state = new PlayerState(bot, controls);
           state.yaw = conv.fromNotchianYaw(current.yaw); // движение — по настоящему взгляду, а не по целевому
           state.pitch = conv.fromNotchianPitch(current.pitch);
-          const fix = waterPushFix(state.pos, state.vel, controls.sneak);
-          if (fix) state.vel.add(fix);
+          state.ultraWarm = ultraWarm();
           physics.simulatePlayer(state, world).apply(bot);
+          if (typeof state.sprinting === 'boolean') sprinting = state.sprinting; // в воде с головой над водой — не бежит
+          if (physics.fluidContact) {
+            // Глубина воды там, где бот теперь стоит (по ней игра посчитает следующий тик): мелко (до 0,4) — идти и
+            // прыгать, как по суше; глубже — всплывать (src/bot/actions.js).
+            const now = physics.fluidContact(world, bot.entity.position, bot.entity.velocity, controls.sneak);
+            bot.entity.waterDepth = now.touching ? now.depth : 0;
+          }
         }
         bot.emit('physicsTick');
         bot.emit('physicTick'); // устаревшее имя, оставлено для старых плагинов
       }
       sendInputs(controls);
-      updatePosition(controls);
+      updatePosition(sprinting);
     } finally {
       // Тик закончился — даже если внутри что-то упало: пропуск tick_end античит заметит сразу.
       if (sendTickEnd && client.state === 'play') client.write('tick_end', {});
@@ -527,8 +387,7 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
     sentInputs = inputs;
   }
 
-  function sendSprintIfNeeded(controls) {
-    const sprinting = controls.sprint;
+  function sendSprintIfNeeded(sprinting) {
     if (sprinting === sentSprinting) return;
     bot._client.write('entity_action', { entityId: bot.entity.id, actionId: sprinting ? SPRINT_START : SPRINT_STOP, jumpBoost: 0 });
     sentSprinting = sprinting;
@@ -565,7 +424,7 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
     return deadTicks >= DEAD_TICKS;
   }
 
-  function updatePosition(controls) {
+  function updatePosition(sprinting) {
     if (isEntityRemoved()) return;
     const pos = bot.entity.position;
     if (!Number.isFinite(pos.x)) return;
@@ -574,7 +433,7 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
     const onGround = Boolean(bot.entity.onGround);
     const horizontalCollision = Boolean(bot.entity.isCollidedHorizontally);
 
-    sendSprintIfNeeded(controls); // обычный клиент сообщает о беге в начале отправки движения
+    sendSprintIfNeeded(Boolean(sprinting)); // обычный клиент сообщает о беге в начале отправки движения
     positionReminder += 1;
     const dx = pos.x - lastSent.x;
     const dy = pos.y - lastSent.y;

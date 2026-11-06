@@ -1148,7 +1148,7 @@ const lastHomes = new Map(); // ник бота → { storage, rewards }: «#к�
  * Написать серверу команду телепорта (/home склад, /warp ah) и дождаться самого телепорта (пакет позиции
  * или смена мира). Потом постоять, пока вокруг догрузятся чанки с сундуками и NPC.
  */
-async function teleportBy(bot, cmd) {
+async function teleportBy(bot, cmd, { waitMs = TELEPORT_WAIT_MS } = {}) {
   if (typeof bot.sendCommand !== 'function') throw new CommandError('бот не может писать команды серверу');
   let moved = false;
   const onMove = () => {
@@ -1159,7 +1159,7 @@ async function teleportBy(bot, cmd) {
   const chat = watchChat(bot);
   try {
     if (!bot.sendCommand(cmd)) throw new CommandError(`не удалось отправить ${cmd}: бот не в сети`);
-    for (let t = 0; t < TELEPORT_WAIT_MS && !moved; t += 100) await bot.actions.wait(100);
+    for (let t = 0; t < waitMs && !moved; t += 100) await bot.actions.wait(100);
   } finally {
     bot.removeListener('forcedMove', onMove);
     bot.removeListener('respawn', onMove);
@@ -2219,11 +2219,17 @@ const ORE_WORDS = [
 ];
 const PICK_TIERS = { wooden_pickaxe: 0, golden_pickaxe: 0, stone_pickaxe: 1, iron_pickaxe: 2, diamond_pickaxe: 3, netherite_pickaxe: 4 };
 const TIER_NAMES = ['деревянная', 'каменная', 'железная', 'алмазная'];
-const MINE_SCAN = 32; // руду ищем в этом радиусе — в загруженном мире видна и та, что в толще камня
+const MINE_SCAN_CHUNKS = 2; // руду ищем в 5×5 чанках вокруг, во всю высоту мира (видна и та, что в толще камня)
 const MINE_REACH = 40; // к руде прокапываемся не дальше (по горизонтали)
-const MINE_MAX_HOPS = 12; // рядом руды нет — столько раз копать дальше (вглубь или вбок) и искать снова
+const MINE_RESCAN_MOVE = 6; // ушёл от места поиска дальше — искать заново (ближние руды — уже другие)
+const MINE_MAX_HOPS = 16; // рядом руды нет — столько раз копать дальше (вглубь или вбок) и искать снова
 const MINE_HOP_DOWN = 8;
-const MINE_HOP_SIDE = 12;
+const MINE_HOP_SIDE = 8; // ход вбок короче: анти-X-ray открывает руду только у ходов — чаще оглядываться
+const RTP_CMD = '/rtp';
+const RTP_WAIT_MS = 20000; // /rtp ищет место — дольше обычного телепорта
+// 26 соседей блока: жила — руда рядом с только что выкопанной.
+const AROUND = [];
+for (let dx = -1; dx <= 1; dx += 1) for (let dy = -1; dy <= 1; dy += 1) for (let dz = -1; dz <= 1; dz += 1) if (dx || dy || dz) AROUND.push(new Vec3(dx, dy, dz));
 const MINE_FLOOR_Y = -58; // ниже — бедрок
 const MINE_MAX_MS = 15 * 60 * 1000;
 const LIQUID_RE = /^(?:lava|water|flowing_lava|flowing_water)$/;
@@ -2289,7 +2295,8 @@ async function climbBack(bot, start, opts) {
 }
 
 /**
- * Добыть руду: найти её в загруженном мире (до MINE_SCAN блоков — и спрятанную в толще камня) и прокопаться прямо
+ * Добыть руду: найти её в загруженном мире (5×5 чанков вокруг, вся высота — и спрятанную в толще камня, если сервер
+ * её прислал) и прокопаться прямо
  * к ближайшей: вперёд, ступеньками, под себя; выкопать, потом следующую (жила — рядом). Руды рядом нет — вглубь к
  * лучшей высоте (по MINE_HOP_DOWN блоков), на ней — вбок, и снова искать. В конце — обратно на свою высоту: по
  * выкопанному, а где нужно — «столбом». Вода и лава рядом, гравий над головой, бедрок — в обход; полный
@@ -2316,10 +2323,14 @@ async function mine(bot, ore, want, pick) {
     fails.set(text, (fails.get(text) || 0) + 1);
     if (err && err.code === 'rejected') rejected += 1;
   };
+  let lastOre = null; // последняя выкопанная руда: рядом с ней — жила
   const onDig = (block, pos) => {
     dug += 1;
     if (pos) dugAt.add(posKey(pos));
-    if (block && ids.has(block.name)) mined += 1; // руда на пути — тоже добыча
+    if (block && ids.has(block.name)) {
+      mined += 1; // руда на пути — тоже добыча
+      if (pos) lastOre = pos.clone();
+    }
   };
   // Анти-X-ray (Paper, update-radius 2) открывает настоящее не кубом, а «крестом»: до 2 шагов по осям от сломанного.
   const nearDug = (pos) => {
@@ -2338,6 +2349,39 @@ async function mine(bot, ore, want, pick) {
     return picks.length ? picks[0].name : null;
   };
   const opts = () => ({ tool: toolNow(), item: pillarItem(bot), onDig });
+  // Где руда: поиск по чанкам вокруг (кусками — бот не замирает и тики не опаздывают), очередь от ближних; искать
+  // заново — когда очередь кончилась или бот ушёл от места поиска. Сначала — жила: соседи только что выкопанной
+  // руды (их видно и при анти-X-ray — сервер открывает всё рядом со сломанным).
+  const oreEntries = ore.blocks.map((name) => ({ name, label: name, color: '#ffffffff', on: true, same: false }));
+  const isOre = (p) => {
+    const b = bot.blockAt(p);
+    return Boolean(b && ids.has(b.name));
+  };
+  let queue = [];
+  let scannedAt = null;
+  async function rescan() {
+    const r = await scanXray(bot, { blocks: oreEntries, lava: false, radius: MINE_SCAN_CHUNKS }, { limit: 256 });
+    const here = bot.entity.position;
+    const all = [];
+    for (const g of r.groups) for (let i = 0; i < g.positions.length; i += 3) all.push(new Vec3(g.positions[i], g.positions[i + 1], g.positions[i + 2]));
+    const dist = (p) => Math.hypot(p.x + 0.5 - here.x, p.y + 0.5 - here.y, p.z + 0.5 - here.z);
+    all.sort((a, b) => dist(a) - dist(b));
+    queue = all;
+    scannedAt = here.clone();
+  }
+  async function nextTarget() {
+    if (lastOre) {
+      const vein = AROUND.map((d) => lastOre.plus(d)).find((p) => isOre(p) && usable(p));
+      if (vein) return vein;
+      lastOre = null;
+    }
+    if (!scannedAt || !queue.length || bot.entity.position.distanceTo(scannedAt) > MINE_RESCAN_MOVE) await rescan();
+    while (queue.length) {
+      const p = queue.shift();
+      if (isOre(p) && usable(p)) return p;
+    }
+    return null;
+  }
   const yaw = bot.entity.yaw;
   let dir = Math.abs(Math.sin(yaw)) > Math.abs(Math.cos(yaw)) ? new Vec3(-Math.sign(Math.sin(yaw)), 0, 0) : new Vec3(0, 0, -Math.sign(Math.cos(yaw)));
   while (mined < want) {
@@ -2357,18 +2401,18 @@ async function mine(bot, ore, want, pick) {
       note = 'кирка сломалась — дай боту новую';
       break;
     }
-    const target = scanBlocks(bot, MINE_SCAN, (b) => ids.has(b.name)).find((x) => usable(x.pos));
+    const target = await nextTarget();
     if (target) {
-      const key = posKey(target.pos);
+      const key = posKey(target);
       skip.add(key);
       try {
-        await bot.actions.digTo(target.pos, { reach: true, maxDistance: MINE_REACH, ...opts() });
-        const b = bot.blockAt(target.pos);
+        await bot.actions.digTo(target, { reach: true, maxDistance: MINE_REACH, ...opts() });
+        const b = bot.blockAt(target);
         if (b && ids.has(b.name)) {
           const tool = toolNow();
           if (tool) await bot.actions.equip(tool);
-          await bot.actions.dig(target.pos);
-          onDig(b, target.pos);
+          await bot.actions.dig(target);
+          onDig(b, target);
         } else if (!dugAt.has(key)) {
           // Дошёл — а руды нет, и ломал её не он: сервер показывал ненастоящую (анти-X-ray), подошёл — открыл камень.
           vanished += 1;
@@ -2428,9 +2472,24 @@ async function mine(bot, ore, want, pick) {
   };
 }
 
-/** «#добудь железо», «#добудь алмазы 5», «#добудь уголь 64 дом шахта» — руда: где её искать, кирка, добыча. */
+/** Лучшая подходящая для руды кирка в инвентаре (имя) или null. */
+function pickFor(bot, ore) {
+  const picks = inventoryItems(bot).filter((it) => PICK_TIERS[it.name] !== undefined && PICK_TIERS[it.name] >= ore.tier)
+    .sort((a, b) => PICK_TIERS[b.name] - PICK_TIERS[a.name]);
+  return picks.length ? picks[0].name : null;
+}
+
+const noPickaxe = (text) => Object.assign(new CommandError(text), { code: 'no_pickaxe' });
+
+/**
+ * «#добудь лазурит [N] [дом X] [здесь]». Кирка — своя; нет подходящей — с общего дома (дом X или «Дом склада» из
+ * настроек: /home, сундуки рядом). Копать — после /rtp (случайное место: там можно ломать); «здесь» — на месте.
+ */
 async function cmdMine({ bot, args: allArgs, words = [] }) {
-  const { home, args } = homeArg(allArgs, words, '#добудь редстоун 64 дом шахта');
+  const { home, args: rest } = homeArg(allArgs, words, '#добудь лазурит 20 дом база');
+  const hereAt = rest.findIndex((a) => /^(?:здесь|тут|here)$/.test(norm(a)));
+  const here = hereAt >= 0;
+  const args = rest.filter((_, i) => i !== hereAt);
   const num = args.find((a) => /^\d+$/.test(a));
   const want = num ? Math.max(1, Math.min(512, parseInt(num, 10))) : 32;
   const text = args.filter((a) => a !== num).join(' ');
@@ -2439,21 +2498,44 @@ async function cmdMine({ bot, args: allArgs, words = [] }) {
     throw new CommandError(`какую руду? Например: #добудь железо 20. Знаю: ${Object.values(ORES).map((o) => o.name).join(', ')}`);
   }
   const ore = ORES[key];
-  const picks = inventoryItems(bot).filter((it) => PICK_TIERS[it.name] !== undefined).sort((a, b) => PICK_TIERS[b.name] - PICK_TIERS[a.name]);
-  if (!picks.length || PICK_TIERS[picks[0].name] < ore.tier) {
-    throw new CommandError(`для «${ore.name}» нужна кирка не хуже: ${TIER_NAMES[ore.tier]}${picks.length ? ` (есть ${picks[0].name})` : ' (кирки нет)'}`);
+  const dim = () => (bot.game && bot.game.dimension ? String(bot.game.dimension) : '');
+  if (ore.nether && dim() && !/nether/.test(dim())) throw new CommandError(`«${ore.name}» — только в Незере (${ore.where}); бот сейчас не там`);
+  const lines = [];
+  // 1. Кирка: своя или с общего дома.
+  let pick = pickFor(bot, ore);
+  if (!pick) {
+    const base = home || String((bot.panelConfig && bot.panelConfig.questStorage) || '').trim();
+    if (!base) {
+      throw noPickaxe(`нет кирки для «${ore.name}» (нужна не хуже: ${TIER_NAMES[ore.tier]}) — дай боту кирку или укажи общий дом, где в сундуке лежат кирки: «Дом склада» в настройках автопилота или #добудь ${text} дом база`);
+    }
+    await teleportBy(bot, `/home ${base}`);
+    const test = (it) => PICK_TIERS[it.name] !== undefined && PICK_TIERS[it.name] >= ore.tier;
+    let why = '';
+    try {
+      await takeFromStorage(bot, [{ test, want: 1, got: 0 }]);
+    } catch (err) {
+      if (isFatal(err)) throw err;
+      why = `: ${err.message}`;
+    }
+    pick = pickFor(bot, ore);
+    if (!pick) throw noPickaxe(`на общем доме «${base}» нет кирки не хуже: ${TIER_NAMES[ore.tier]}${why || ' (в сундуках рядом)'} — положи туда кирки`);
+    lines.push(`Кирка: ${pick} — взял на общем доме «${base}»`);
   }
-  if (home) await teleportBy(bot, `/home ${home}`);
-  const dim = bot.game && bot.game.dimension ? String(bot.game.dimension) : '';
-  if (ore.nether && dim && !/nether/.test(dim)) throw new CommandError(`«${ore.name}» — только в Незере (${ore.where}); бот сейчас не там`);
-  await bot.actions.equip(picks[0].name);
-  const r = await mine(bot, ore, want, picks[0].name);
-  const lines = [r.mined
+  // 2. Где копать: случайное место (/rtp) — там можно ломать; или прямо здесь.
+  if (!here) {
+    await teleportBy(bot, RTP_CMD, { waitMs: RTP_WAIT_MS });
+    const p = bot.entity.position;
+    lines.push(`${RTP_CMD}: копаю у ${Math.floor(p.x)} ${Math.floor(p.y)} ${Math.floor(p.z)}`);
+  }
+  await bot.actions.equip(pick);
+  const r = await mine(bot, ore, want, pick);
+  lines.push(r.mined
     ? `Добыл: ${ore.name} — блоков руды ${r.mined} (выпадает ${ore.item})`
-    : r.denied ? `Не добыл «${ore.name}»: ${MINE_DENIED}` : `Руды «${ore.name}» не нашёл`];
+    : r.denied ? `Не добыл «${ore.name}»: ${MINE_DENIED}` : `Руды «${ore.name}» не нашёл`);
   if (r.denied) {
-    // Копать не дают: где копать — решает пользователь; говорим, куда отвести бота.
-    lines.push(`Отведи бота туда, где копать можно: #добудь ${text} дом шахта (сначала /sethome шахта в своей шахте или на своей территории) или /rtp`);
+    lines.push(here
+      ? `Здесь копать нельзя — без «здесь» бот сам уйдёт на случайное место: #добудь ${text}`
+      : `${RTP_CMD} привёл туда, где копать нельзя, — повтори: #добудь ${text} (будет другое место)`);
   }
   if (r.dug > r.mined) lines.push(`Прокопал к руде блоков: ${r.dug - r.mined}`);
   if (!r.back.ok) lines.push(`На свою высоту (Y ${r.startY}) не вернулся: ${r.back.why}. Бот на Y ${r.y}`);
@@ -2726,12 +2808,12 @@ const COMMANDS = [
   {
     name: 'добудь',
     aliases: ['добыть', 'шахта', 'mine'],
-    usage: ['#добудь железо', '#добудь алмазы 5', '#добудь уголь 64'],
+    usage: ['#добудь железо', '#добудь алмазы 5', '#добудь уголь 64 дом база', '#добудь лазурит здесь'],
     about: 'добыть руду (уголь, медь, железо, лазурит, золото, редстоун, алмазы, изумруды; в Незере — кварц, золото, древние обломки): ' +
-      'находит её в мире рядом (до 32 блоков, и в толще камня) и прокапывается прямо к ней — вперёд, вниз под себя, ступеньками; ' +
-      'рядом нет — копает вглубь к лучшей высоте (железо Y≈16, алмазы и редстоун Y≈−58…), там вбок, и ищет снова; потом возвращается ' +
-      'на свою высоту — где нужно, «столбом» (блок под себя); руду и блоки у воды и лавы, под гравием не трогает; нужна подходящая кирка; ' +
-      'не нашёл — скажет, где искать',
+      'нет подходящей кирки — берёт её в сундуке на общем доме («дом X» или «Дом склада» из настроек), потом /rtp и копает там ' +
+      '(«здесь» — на месте); находит руду в чанках вокруг и прокапывается прямо к ней — вперёд, под себя, ступеньками, сначала жила; ' +
+      'рядом нет — вглубь к лучшей высоте (железо Y≈16, алмазы и редстоун Y≈−58…), там ходами вбок; потом обратно на свою высоту ' +
+      '(где нужно — «столбом»); у воды, лавы, под гравием не копает; где копать нельзя — скажет сразу; не нашёл — скажет, где искать',
     run: cmdMine,
   },
   {

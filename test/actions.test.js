@@ -297,6 +297,39 @@ test('ходьба: ступенька в блок — прыжок; стена 
   assert.match(stuck.error.message, /застрял/);
 });
 
+test('навигация: из ямы в 1 блок — как игрок: вплотную, прыжок вверх, шаг на край, когда ноги выше; в воздухе края не цепляет', async () => {
+  const { clock, world, bot } = setup();
+  // Бот в яме: пол на 62, стены ямы — камень на 63 вокруг, выйти — на поверхность (ноги на 64) к северу.
+  world.set(new Vec3(0, 63, 0), 'air');
+  teleport(bot, { x: 0.5, y: 63, z: 0.5 });
+  clock.advance(300);
+  take(bot);
+  const res = await runFor(clock, bot.actions.goTo(new Vec3(0.5, 64, -3.5), { range: 0.6, vertical: 0 }));
+  assert.ifError(res.error);
+  assert.ok(Math.abs(bot.entity.position.y - 64) < 1e-6 && bot.entity.position.z < -2.8, `выбрался: ${bot.entity.position}`);
+  const moves = take(bot).filter((p) => /^(position|position_look)$/.test(p.name));
+  const airHits = moves.filter((p) => p.params.flags && !p.params.onGround && p.params.flags.hasHorizontalCollision);
+  assert.equal(airHits.length, 0, `в воздухе упирался в край ${airHits.length} раз`);
+  assert.ok(moves.some((p) => p.params.y > 64.1), 'прыгал');
+});
+
+test('навигация: из мелкой растёкшейся воды на ступеньку — обычным прыжком, как игрок (гребками оттуда не выбраться)', async () => {
+  const { clock, world, bot } = setup();
+  // Та же яма, но в ней мелкая вода (2/9 блока, как натекает в пещере): игра здесь даёт обычный прыжок со дна.
+  world.set(new Vec3(0, 63, 0), 'water#6');
+  teleport(bot, { x: 0.5, y: 63, z: 0.5 });
+  clock.advance(300);
+  take(bot);
+  const res = await runFor(clock, bot.actions.goTo(new Vec3(0.5, 64, -3.5), { range: 0.6, vertical: 0 }));
+  assert.ifError(res.error);
+  assert.ok(Math.abs(bot.entity.position.y - 64) < 1e-6 && bot.entity.position.z < -2.8, `выбрался: ${bot.entity.position}`);
+  const moves = take(bot).filter((p) => /^(position|position_look)$/.test(p.name));
+  const first = moves.find((p) => p.params.y > 63.0001);
+  assert.ok(first && first.params.y - 63 > 0.4, `первый тик прыжка — обычный прыжок, а не гребок: ${first && (first.params.y - 63).toFixed(4)}`);
+  const airHits = moves.filter((p) => p.params.flags && !p.params.onGround && p.params.flags.hasHorizontalCollision);
+  assert.equal(airHits.length, 0, `в воздухе упирался в край ${airHits.length} раз`);
+});
+
 test('очередь: новое действие прерывает текущее; «стоп» отпускает клавиши; переход между серверами прерывает', async () => {
   const { clock, bot } = setup();
   const walk = bot.actions.walkTo(new Vec3(0.5, 64, 40.5));

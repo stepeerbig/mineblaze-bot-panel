@@ -42,47 +42,92 @@ const SIDES = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -
 const DEFAULTS = Object.freeze({ maxNodes: 20000, maxDistance: 96, maxFall: 3, sliceMs: 4, range: 0.5, vertical: 1, weight: 1 });
 
 const key = (x, y, z) => `${x},${y},${z}`;
+const NO_DIG = Object.freeze([]);
 
 /** Цена сломать блок (в шагах ходьбы): по твёрдости — камень ≈ 3, глубинный сланец и руда ≈ 5,5. */
 const digCostByHardness = (block) => (typeof block.hardness === 'number' && block.hardness <= MAX_HARDNESS ? 1 + block.hardness * 1.5 : null);
 
+const UNLOADED = Object.freeze({ loaded: false, solid: true, top: 1, low: false, danger: false, water: false, liquid: false, tall: false, falls: false, breakable: false });
+
+/** Сведения о блоке для пути (зависят только от состояния блока). */
+function blockInfo(block) {
+  const shapes = Array.isArray(block.shapes) ? block.shapes : [];
+  const top = shapes.length ? Math.max(...shapes.map((s) => s[4])) : 0;
+  const name = block.name || '';
+  const waterlogged = Boolean(block.getProperties && safeProps(block).waterlogged === true);
+  return {
+    loaded: true,
+    solid: shapes.length > 0,
+    top,
+    low: shapes.length > 0 && top <= LOW,
+    danger: DANGER_RE.test(name),
+    water: WATER_RE.test(name) || (waterlogged && shapes.length === 0),
+    liquid: LIQUID_RE.test(name) || waterlogged, // сломаешь рядом — потечёт
+    tall: top > 1.01, // забор, стена, ворота: занимает и клетку выше
+    falls: FALLING_RE.test(name),
+    breakable: typeof block.hardness === 'number' && block.hardness >= 0 && block.diggable !== false && !UNBREAKABLE_RE.test(name),
+    name,
+    block,
+  };
+}
+
+// Сведения по номеру состояния — один раз на реестр (версию игры): блоков тысячи, состояний в мире — десятки.
+const infoByRegistry = new WeakMap();
+
+/**
+ * Быстрое чтение клеток прямо из чанков (мир mineflayer: world.getColumn): номер состояния — из палитры колонки,
+ * сведения — из кэша по номеру. Без нового объекта блока на каждую клетку: поиск с копанием читает их десятки
+ * тысяч — так он в разы быстрее. → (x, y, z) → сведения или UNLOADED; null — этот мир так читать нельзя.
+ */
+function fastReader(world, registry) {
+  if (!world || typeof world.getColumn !== 'function' || !registry) return null;
+  let byState = infoByRegistry.get(registry);
+  if (!byState) {
+    byState = { Block: require('prismarine-block')(registry), map: new Map() };
+    infoByRegistry.set(registry, byState);
+  }
+  const p = { x: 0, y: 0, z: 0 };
+  return (x, y, z) => {
+    let column = null;
+    try {
+      column = world.getColumn(x >> 4, z >> 4);
+    } catch (_) {
+      column = null;
+    }
+    if (!column || typeof column.getBlockStateId !== 'function') return UNLOADED;
+    p.x = x & 15;
+    p.y = y;
+    p.z = z & 15;
+    const id = column.getBlockStateId(p);
+    let info = byState.map.get(id);
+    if (!info) {
+      info = blockInfo(byState.Block.fromStateId(id, 0));
+      byState.map.set(id, info);
+    }
+    return info;
+  };
+}
+
 /**
  * Сведения о клетке для пути: { loaded, solid: есть форма, top, low, danger, water, liquid, tall, falls, breakable }
- * (с кэшем на один поиск).
+ * (с кэшем на один поиск). fast — быстрое чтение из чанков (fastReader), иначе — getBlock.
  */
-function cellReader(getBlock) {
+function cellReader(getBlock, fast = null, keyOf = key) {
   const cache = new Map();
   return (x, y, z) => {
-    const k = key(x, y, z);
+    const k = keyOf(x, y, z);
     let c = cache.get(k);
     if (c) return c;
-    let block = null;
-    try {
-      block = getBlock(new Vec3(x, y, z));
-    } catch (_) {
-      block = null;
-    }
-    if (!block) {
-      c = { loaded: false, solid: true, top: 1, low: false, danger: false, water: false, liquid: false, tall: false, falls: false, breakable: false };
+    if (fast) {
+      c = fast(x, y, z);
     } else {
-      const shapes = Array.isArray(block.shapes) ? block.shapes : [];
-      const top = shapes.length ? Math.max(...shapes.map((s) => s[4])) : 0;
-      const name = block.name || '';
-      const waterlogged = Boolean(block.getProperties && safeProps(block).waterlogged === true);
-      c = {
-        loaded: true,
-        solid: shapes.length > 0,
-        top,
-        low: shapes.length > 0 && top <= LOW,
-        danger: DANGER_RE.test(name),
-        water: WATER_RE.test(name) || (waterlogged && shapes.length === 0),
-        liquid: LIQUID_RE.test(name) || waterlogged, // сломаешь рядом — потечёт
-        tall: top > 1.01, // забор, стена, ворота: занимает и клетку выше
-        falls: FALLING_RE.test(name),
-        breakable: typeof block.hardness === 'number' && block.hardness >= 0 && block.diggable !== false && !UNBREAKABLE_RE.test(name),
-        name,
-        block,
-      };
+      let block = null;
+      try {
+        block = getBlock(new Vec3(x, y, z));
+      } catch (_) {
+        block = null;
+      }
+      c = block ? blockInfo(block) : UNLOADED;
     }
     cache.set(k, c);
     return c;
@@ -172,30 +217,31 @@ function makeWorld(cell, maxFall, { dig = null, place = false } = {}) {
     return b.loaded && b.solid && !b.danger && !b.liquid && b.top >= FLOOR && b.top <= 1.01;
   };
   // Цена сломать клетку или null: не ломается, опасна, рядом вода или лава, сверху песок или гравий (кроме тех,
-  // что ломаем этим же ходом — set).
-  const breakCost = (x, y, z, set) => {
+  // что ломаем этим же ходом — cells).
+  const inMove = (cells, x, y, z) => cells.some((c) => c[0] === x && c[1] === y && c[2] === z);
+  const breakCost = (x, y, z, cells) => {
     const c = cell(x, y, z);
     if (!c.loaded || c.danger || c.liquid || !c.breakable) return null;
     for (const [ax, ay, az] of SIDES) if (cell(x + ax, y + ay, z + az).liquid) return null;
-    if (cell(x, y + 1, z).falls && !set.has(key(x, y + 1, z))) return null;
+    if (cell(x, y + 1, z).falls && !inMove(cells, x, y + 1, z)) return null;
     if (c.digCost === undefined) c.digCost = c.block ? dig(c.block) : null;
     return typeof c.digCost === 'number' && Number.isFinite(c.digCost) ? c.digCost : null;
   };
-  // Освободить клетки хода (сверху вниз): { cost, dig: [Vec3] } или null — нельзя.
+  // Освободить клетки хода (сверху вниз): { cost, dig: [[x, y, z]] } или null — нельзя.
   const clear = (cells) => {
-    const set = new Set(cells.map(([x, y, z]) => key(x, y, z)));
     let cost = 0;
-    const out = [];
-    for (const [x, y, z] of cells) {
+    let out = null;
+    for (const cellXYZ of cells) {
+      const [x, y, z] = cellXYZ;
       const c = cell(x, y, z);
       if (!c.loaded || c.danger || c.liquid) return null;
       if (!c.solid) continue; // уже пусто (воздух, трава)
-      const k = breakCost(x, y, z, set);
+      const k = breakCost(x, y, z, cells);
       if (k === null) return null;
       cost += k;
-      out.push(new Vec3(x, y, z));
+      (out || (out = [])).push(cellXYZ);
     }
-    return { cost, dig: out };
+    return { cost, dig: out || NO_DIG };
   };
   // Ходы с копанием и «столбом» (только по прямой: по диагонали копать неудобно и не видно граней).
   const digMoves = (n, out) => {
@@ -219,10 +265,10 @@ function makeWorld(cell, maxFall, { dig = null, place = false } = {}) {
       // Столбом: прыжок и блок под себя — над головой нужно место (сломать, если можно копать). Опора — настоящий
       // блок или поставленный прошлым ходом «столба» (в мире его ещё нет).
       const here = cell(X, Y, Z);
-      const r = dig ? clear([[X, Y + 2, Z]]) : free(X, Y + 2, Z) ? { cost: 0, dig: [] } : null;
+      const r = dig ? clear([[X, Y + 2, Z]]) : free(X, Y + 2, Z) ? { cost: 0, dig: NO_DIG } : null;
       const standing = n.move === 'pillar' || floorOk(X, Y - 1, Z);
       if (r && standing && here.loaded && !here.solid && !here.water && !here.liquid) {
-        out.push({ x: X, y: Y + 1, z: Z, cost: COST.pillar + r.cost, dig: r.dig, place: new Vec3(X, Y, Z), move: 'pillar' });
+        out.push({ x: X, y: Y + 1, z: Z, cost: COST.pillar + r.cost, dig: r.dig, place: [X, Y, Z], move: 'pillar' });
       }
     }
   };
@@ -317,10 +363,13 @@ function reachGoal(o, cell) {
  */
 async function findPath(getBlock, start, goal, opts = {}) {
   const o = { ...DEFAULTS, ...opts };
-  const cell = cellReader(getBlock);
+  const s = { x: Math.floor(start.x), y: Math.floor(start.y + 0.01), z: Math.floor(start.z) };
+  // Числовой ключ клетки (от старта, ±512 по каждой оси): строки на каждую клетку — главная трата времени поиска.
+  const nkey = (x, y, z) => ((x - s.x + 512) * 1024 + (y - s.y + 512)) * 1024 + (z - s.z + 512);
+  const cell = cellReader(getBlock, o.fast || null, nkey);
+  const avoid = o.avoid && o.avoid.size ? o.avoid : null; // шаги «откуда>куда», на которых бот уже застревал
   const dig = o.dig === true ? digCostByHardness : typeof o.dig === 'function' ? o.dig : null;
   const world = makeWorld(cell, o.maxFall, { dig, place: Boolean(o.place) });
-  const s = { x: Math.floor(start.x), y: Math.floor(start.y + 0.01), z: Math.floor(start.z) };
   const goalY = Math.floor(goal.y + 0.01);
   const hDist = (n) => Math.hypot(n.x + 0.5 - goal.x, n.z + 0.5 - goal.z);
   const target = o.reach ? reachGoal(goal, cell) : null;
@@ -333,7 +382,7 @@ async function findPath(getBlock, start, goal, opts = {}) {
   const startNode = { ...s, g: 0, f: hw(s), parent: null };
   const open = new Heap();
   open.push(startNode);
-  const best = new Map([[key(s.x, s.y, s.z), startNode]]);
+  const best = new Map([[nkey(s.x, s.y, s.z), startNode]]);
   const closed = new Set();
   let closest = startNode;
   let nodes = 0;
@@ -343,7 +392,7 @@ async function findPath(getBlock, start, goal, opts = {}) {
   while (open.size) {
     if (o.signal && o.signal.aborted) throw Object.assign(new Error('поиск пути прерван'), { code: 'aborted' });
     const n = open.pop();
-    const k = key(n.x, n.y, n.z);
+    const k = nkey(n.x, n.y, n.z);
     if (closed.has(k)) continue;
     closed.add(k);
     nodes += 1;
@@ -355,8 +404,9 @@ async function findPath(getBlock, start, goal, opts = {}) {
     if (nodes >= o.maxNodes) break;
     for (const m of world.neighbors(n)) {
       if (Math.hypot(m.x - s.x, m.z - s.z) > o.maxDistance) continue;
-      const mk = key(m.x, m.y, m.z);
+      const mk = nkey(m.x, m.y, m.z);
       if (closed.has(mk)) continue;
+      if (avoid && avoid.has(`${key(n.x, n.y, n.z)}>${key(m.x, m.y, m.z)}`)) continue;
       const g = n.g + m.cost;
       const prev = best.get(mk);
       if (prev && prev.g <= g) continue;
@@ -375,8 +425,8 @@ async function findPath(getBlock, start, goal, opts = {}) {
   for (let n = end; n && n.parent; n = n.parent) {
     const p = new Vec3(n.x, n.y, n.z);
     if (n.move) p.move = n.move;
-    if (n.dig && n.dig.length) p.dig = n.dig;
-    if (n.place) p.place = n.place;
+    if (n.dig && n.dig.length) p.dig = n.dig.map(([x, y, z]) => new Vec3(x, y, z));
+    if (n.place) p.place = new Vec3(n.place[0], n.place[1], n.place[2]);
     path.push(p);
   }
   path.reverse();
@@ -388,4 +438,7 @@ async function findPath(getBlock, start, goal, opts = {}) {
   return { path, complete: Boolean(found), nodes, reason };
 }
 
-module.exports = { findPath, makeWorld, cellReader, reachGoal, digCostByHardness, DANGER_RE, LIQUID_RE, FALLING_RE, UNBREAKABLE_RE, COST };
+/** Ключ шага для opts.avoid: «x,y,z>x,y,z». */
+const edgeKey = (from, to) => `${key(Math.floor(from.x), Math.floor(from.y + 0.01), Math.floor(from.z))}>${key(to.x, to.y, to.z)}`;
+
+module.exports = { findPath, makeWorld, cellReader, fastReader, reachGoal, edgeKey, digCostByHardness, DANGER_RE, LIQUID_RE, FALLING_RE, UNBREAKABLE_RE, COST };

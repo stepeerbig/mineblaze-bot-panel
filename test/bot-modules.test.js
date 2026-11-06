@@ -369,6 +369,94 @@ test('физика: у края подземного озера (камень н
   // (Настоящее течение по-прежнему сносит — тест «вода сносит бота по течению» выше.)
 });
 
+test('физика: в мелкой растёкшейся воде (до 0,4 блока) прыжок со дна обычный, глубже — гребок, как в игре 1.21', () => {
+  const jumpFrom = (water) => {
+    const clock = fakeClock();
+    const bot = physicsBot({ clock });
+    bot.world.set(new Vec3(0, 64, 0), water);
+    bot.emit('login');
+    teleport(bot);
+    clock.advance(500);
+    assert.equal(bot.entity.isInWater, true, `${water}: в воде`);
+    const depth = bot.entity.waterDepth;
+    bot.setControlState('jump', true);
+    clock.advance(50);
+    return { depth, rise: bot.entity.position.y - 64 };
+  };
+  // Уровень 6 — вода высотой 2/9 блока (так растекается по полу пещеры). prismarine здесь «грёб» по 0,04 за тик
+  // и медленно всплывал, а игра (и античит) уже считали бота над водой — откат за откатом.
+  const shallow = jumpFrom('water#6');
+  assert.ok(Math.abs(shallow.depth - 2 / 9) < 1e-6, `глубина (1.21.11: от низа тела): ${shallow.depth}`);
+  assert.ok(Math.abs(shallow.rise - 0.42) < 1e-6, `обычный прыжок: ${shallow.rise.toFixed(4)}`);
+  const deep = jumpFrom('water'); // исток — 8/9 блока
+  assert.ok(Math.abs(deep.rise - 0.035) < 1e-4, `гребок: ${deep.rise.toFixed(4)}`);
+});
+
+test('физика: у поверхности озера бот в воде, как в игре (старая prismarine считала его над водой — он падал)', () => {
+  const clock = fakeClock();
+  const bot = physicsBot({ clock });
+  bot.world.set(new Vec3(0, 64, 0), 'water');
+  bot.world.set(new Vec3(0, 63, 0), 'water');
+  bot.emit('login');
+  teleport(bot, { y: 64.7 }); // ноги на 0,7 блока выше дна клетки, вода в ней — до 0,89
+  clock.advance(100); // два тика
+  assert.equal(bot.entity.isInWater, true);
+  assert.ok(bot.entity.position.y > 64.69, `в воде опускается медленно: y = ${bot.entity.position.y.toFixed(4)}`);
+});
+
+test('физика: упёршись в стену, коробка бота (как её строит сервер: ±0,3F) не заходит в блок — иначе Paper откатывает', () => {
+  const half = Math.fround(0.6) / 2; // 0,30000001192092896 — половина ширины игрока у игры и сервера
+  // Строгое пересечение, как у Paper (AABB.intersects без допуска): коснуться — можно, зайти хоть на 1e-15 — нет.
+  const intersects = (x, z, bx, bz) => x - half < bx + 1 && x + half > bx && z - half < bz + 1 && z + half > bz;
+  const cases = [];
+  for (const base of [0, 24, 1000]) {
+    cases.push({ yaw: 90, start: [base + 0.5, 0.5], wall: [base - 2, 0] }); // на запад, стена — блок x = base−2
+    cases.push({ yaw: -90, start: [base + 0.5, 0.5], wall: [base + 2, 0] }); // на восток
+    cases.push({ yaw: 180, start: [0.5, -base + 0.5], wall: [0, -base - 2] }); // на север
+    cases.push({ yaw: 0, start: [0.5, base + 0.5], wall: [0, base + 2] }); // на юг
+  }
+  for (const c of cases) {
+    const clock = fakeClock();
+    const bot = physicsBot({ clock });
+    for (const y of [64, 65]) bot.world.set(new Vec3(c.wall[0], y, c.wall[1]), 'stone');
+    bot.emit('login');
+    teleport(bot, { x: c.start[0], z: c.start[1], yaw: c.yaw });
+    clock.advance(200);
+    take(bot);
+    bot.setControlState('forward', true);
+    clock.advance(1500);
+    const sent = take(bot).filter((p) => /^position/.test(p.name));
+    const p = bot.entity.position;
+    const where = `yaw ${c.yaw}, стена ${c.wall}`;
+    assert.ok(bot.entity.isCollidedHorizontally, `${where}: упёрся`);
+    assert.ok(sent.length > 0 && sent.every((s) => !intersects(s.params.x, s.params.z, c.wall[0], c.wall[1])), `${where}: в пакетах коробка не в блоке`);
+    assert.ok(!intersects(p.x, p.z, c.wall[0], c.wall[1]), `${where}: ${p.x}, ${p.z}`);
+    // И стоит вплотную (не дальше доли миллионной), как игрок у стены.
+    const gap = c.yaw === 90 ? p.x - half - (c.wall[0] + 1) : c.yaw === -90 ? c.wall[0] - (p.x + half) : c.yaw === 180 ? p.z - half - (c.wall[1] + 1) : c.wall[1] - (p.z + half);
+    assert.ok(gap >= 0 && gap < 1e-9, `${where}: зазор ${gap}`);
+  }
+});
+
+test('физика: малая скорость гасится по длине по горизонтали (как у игрока 1.21.5+), а не по каждой оси', () => {
+  const step = (vx, vz) => {
+    const clock = fakeClock();
+    const bot = physicsBot({ clock });
+    bot.emit('login');
+    teleport(bot);
+    clock.advance(500);
+    const p0 = bot.entity.position.clone();
+    bot.entity.velocity.x = vx;
+    bot.entity.velocity.z = vz;
+    clock.advance(50);
+    return bot.entity.position.minus(p0);
+  };
+  const kept = step(0.0025, 0.0025); // по каждой оси меньше 0,003, по длине — больше: игра не гасит
+  assert.ok(Math.abs(kept.x - 0.0025) < 1e-9 && Math.abs(kept.z - 0.0025) < 1e-9, `сдвинулся: ${kept}`);
+  const zeroed = step(0.002, 0.0015); // по длине 0,0025 — гасится
+  assert.equal(zeroed.x, 0);
+  assert.equal(zeroed.z, 0);
+});
+
 test('физика: игроки, с которыми бот пересёкся, расталкивают его (как в игре); правила столкновений команд — тоже', () => {
   const run = ({ dx, teams = null, gamemode = 0 }) => {
     const clock = fakeClock();

@@ -1138,7 +1138,7 @@ test('команды: #добудь — руда в толще камня: пр�
   const s = setup({ inventory: [['iron_pickaxe', 1], ['cobblestone', 32]] });
   const ore = new Vec3(6, 58, 0); // со всех сторон камень — не видна, но в загруженном мире известна
   s.world.set(ore, 'iron_ore');
-  const r = await s.run('#добудь железо 1', 600000);
+  const r = await s.run('#добудь железо 1 здесь', 600000);
   const text = [].concat(r.message).join('\n');
   assert.equal(r.ok, true, text);
   assert.equal(r.data.mined, 1);
@@ -1160,7 +1160,7 @@ test('команды: #добудь — руду у воды не трогает
   s.world.set(new Vec3(3, 62, 0), 'iron_ore');
   s.world.set(new Vec3(4, 62, 0), 'water'); // рядом с этой рудой — вода
   s.world.set(new Vec3(-4, 62, 2), 'iron_ore');
-  const r = await s.run('#добудь железо 1', 600000);
+  const r = await s.run('#добудь железо 1 здесь', 600000);
   assert.equal(r.ok, true, [].concat(r.message).join('\n'));
   assert.notEqual(s.world.get(new Vec3(-4, 62, 2)), 'iron_ore');
   assert.equal(s.world.get(new Vec3(3, 62, 0)), 'iron_ore', 'руду у воды не тронул');
@@ -1169,7 +1169,7 @@ test('команды: #добудь — руду у воды не трогает
   // Уголь (лучше всего — выше) дальше, чем видно (45 блоков на юг, куда смотрит бот): идёт/копает вбок и находит.
   const far = setup({ inventory: [['wooden_pickaxe', 1]] });
   far.world.set(new Vec3(0, 62, 45), 'coal_ore');
-  const c = await far.run('#добудь уголь 1', 600000);
+  const c = await far.run('#добудь уголь 1 здесь', 600000);
   const text = [].concat(c.message).join('\n');
   assert.equal(c.ok, true, text);
   assert.equal(far.world.get(new Vec3(0, 62, 45)), 'air');
@@ -1178,14 +1178,16 @@ test('команды: #добудь — руду у воды не трогает
   // Руды нет вовсе — честно: не нашёл, где искать.
   const none = setup({ inventory: [['stone_pickaxe', 1]] });
   for (let x = -40; x <= 40; x += 1) for (let z = -40; z <= 40; z += 1) none.world.set(new Vec3(x, 62, z), 'bedrock');
-  const n = await none.run('#добудь железо 1', 600000);
+  const n = await none.run('#добудь железо 1 здесь', 600000);
   assert.equal(n.ok, false);
   assert.equal(n.code, 'not_found');
   assert.match([].concat(n.message).join('\n'), /Руды «железо» не нашёл/);
   assert.match([].concat(n.message).join('\n'), /Где искать: Y −64…72, больше всего — Y ≈ 16/);
 
   const weak = setup({ inventory: [['wooden_pickaxe', 1]] });
-  assert.match((await weak.run('#добудь алмазы')).message, /нужна кирка не хуже: железная \(есть wooden_pickaxe\)/);
+  const noPick = await weak.run('#добудь алмазы');
+  assert.equal(noPick.code, 'no_pickaxe');
+  assert.match(noPick.message, /нет кирки для «алмазы» \(нужна не хуже: железная\) — дай боту кирку или укажи общий дом/);
   assert.match((await weak.run('#добудь пирожки')).message, /какую руду\? .*Знаю: уголь, медь, железо/);
 });
 
@@ -1287,12 +1289,12 @@ test('команды: #рентген — что из списка есть в �
 test('команды: #добудь там, где копать не дают (спавн, приват) — сразу стоп и куда отвести бота, а не «не нашёл»', async () => {
   const s = setup({ inventory: [['iron_pickaxe', 1], ['cobblestone', 16]], server: { denyDig: true } });
   for (let i = 0; i < 10; i += 1) s.world.set(new Vec3(3 + i, 60, i % 3), 'lapis_ore');
-  const r = await s.run('#добудь лазурит', 600000);
+  const r = await s.run('#добудь лазурит здесь', 600000);
   const text = [].concat(r.message).join('\n');
   assert.equal(r.ok, false);
   assert.equal(r.code, 'protected');
   assert.match(text, /^Не добыл «лазурит»: сервер не даёт ломать блоки здесь \(спавн, варп, чужой приват или лобби\)/);
-  assert.match(text, /Отведи бота туда, где копать можно: #добудь лазурит дом шахта .* или \/rtp/);
+  assert.match(text, /Здесь копать нельзя — без «здесь» бот сам уйдёт на случайное место: #добудь лазурит$/m);
   assert.doesNotMatch(text, /вода, лава|Где искать/);
   // Два отказа — и стоп: к остальным рудам не ходил.
   const digs = s.bot._client.sent.filter((p) => p.name === 'block_dig' && p.params.status === 2);
@@ -1309,11 +1311,60 @@ test('команды: #добудь при анти-X-ray — ненастоящ
   // Настоящая — у пещеры (рядом воздух) и дальше подделок.
   s.world.set(new Vec3(0, 55, 9), 'iron_ore');
   for (let z = 6; z <= 8; z += 1) for (const y of [55, 56]) s.world.set(new Vec3(0, y, z), 'air');
-  const r = await s.run('#добудь железо 1', 900000);
+  const r = await s.run('#добудь железо 1 здесь', 900000);
   const text = [].concat(r.message).join('\n');
   assert.equal(r.ok, true, text);
   assert.equal(r.data.mined, 1);
   assert.notEqual(s.world.get(new Vec3(0, 55, 9)), 'iron_ore', 'настоящую выкопал');
   assert.equal(r.data.antiXray, true);
   assert.match(text, /Похоже, на сервере анти-X-ray: 2 раз дошёл до руды — а там камень/);
+});
+
+test('команды: #добудь без кирки — /home на общий дом, кирка из сундука, потом /rtp и добыча там', async () => {
+  const s = setup({ inventory: [['cobblestone', 16]], storage: { '2,64,-2': { items: [[0, 'stone_pickaxe', 1], [1, 'iron_pickaxe', 1]] } } });
+  s.world.set(new Vec3(2, 64, -2), 'chest');
+  s.bot.panelConfig = { questStorage: 'база' };
+  // /rtp — на случайное место (здесь — x 100), там в камне железо.
+  s.world.set(new Vec3(104, 58, 3), 'iron_ore');
+  const sent = [];
+  s.bot.sendCommand = (cmd) => {
+    sent.push(cmd);
+    setImmediate(() => {
+      if (cmd === '/home база') teleport(s.bot, { x: 0.5, y: 64, z: 0.5 });
+      if (cmd === '/rtp') teleport(s.bot, { x: 100.5, y: 64, z: 0.5 });
+    });
+    return true;
+  };
+  const r = await s.run('#добудь железо 1', 900000);
+  const text = [].concat(r.message).join('\n');
+  assert.equal(r.ok, true, text);
+  assert.deepEqual(sent, ['/home база', '/rtp']);
+  assert.match(text, /^Кирка: (?:iron|stone)_pickaxe — взял на общем доме «база»$/m);
+  assert.match(text, /^\/rtp: копаю у 100 64 0$/m);
+  assert.equal(r.data.mined, 1);
+  assert.notEqual(s.world.get(new Vec3(104, 58, 3)), 'iron_ore');
+
+  // Кирка уже есть — дом не нужен: сразу /rtp.
+  const t = setup({ inventory: [['iron_pickaxe', 1]] });
+  t.world.set(new Vec3(103, 60, 0), 'iron_ore');
+  const tSent = [];
+  t.bot.sendCommand = (cmd) => {
+    tSent.push(cmd);
+    setImmediate(() => teleport(t.bot, { x: 100.5, y: 64, z: 0.5 }));
+    return true;
+  };
+  const q = await t.run('#добудь железо 1', 900000);
+  assert.equal(q.ok, true, [].concat(q.message).join('\n'));
+  assert.deepEqual(tSent, ['/rtp']);
+
+  // Кирки нет ни у бота, ни в сундуках дома — понятно, что положить.
+  const u = setup({ inventory: [['cobblestone', 4]], storage: { '2,64,-2': { items: [[0, 'wheat', 5]] } } });
+  u.world.set(new Vec3(2, 64, -2), 'chest');
+  u.bot.sendCommand = (cmd) => {
+    setImmediate(() => teleport(u.bot, { x: 0.5, y: 64, z: 0.5 }));
+    return Boolean(cmd);
+  };
+  const none = await u.run('#добудь железо дом база');
+  assert.equal(none.code, 'no_pickaxe');
+  assert.match(none.message, /на общем доме «база» нет кирки не хуже: каменная .*положи туда кирки/);
 });

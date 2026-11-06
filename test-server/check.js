@@ -231,31 +231,38 @@ async function runScenario(manager, cmd) {
   helper.start();
   try {
     if (!(await helperOnline)) console.log(`  [сценарий] второй игрок ${HELPER_NAME} не зашёл`);
+    // Площадка — в мировых координатах от того места, где бот стоит сейчас. С «~» у каждой команды была своя точка:
+    // пока консоль строила, бота сносило водой, и помост вставал в стороне (стенд, 7 ноября). Вокруг — каменная
+    // коробка (fill … hollow: снаружи камень, внутри воздух), чтобы вода и пещера снаружи не затекали внутрь.
+    const o = bot.entity.position.floored();
+    const xyz = (dx, dy, dz) => `${o.x + dx} ${o.y + dy} ${o.z + dz}`;
+    const mid = (dx, dy, dz) => `${o.x + dx + 0.5} ${o.y + dy} ${o.z + dz + 0.5}`; // сущность — в середину клетки
     for (const c of [
       'difficulty peaceful',
       'time set day',
-      `execute at ${BOT_NAME} run fill ~-6 ~-1 ~-6 ~6 ~-1 ~6 minecraft:stone`,
-      `execute at ${BOT_NAME} run fill ~-6 ~ ~-6 ~6 ~4 ~6 minecraft:air`,
-      `execute at ${BOT_NAME} run setblock ~-3 ~ ~ minecraft:stone`,
-      `execute at ${BOT_NAME} run setblock ~2 ~ ~-2 minecraft:chest`,
-      `execute at ${BOT_NAME} run item replace block ~2 ~ ~-2 container.0 with minecraft:diamond 3`,
+      'kill @e[type=minecraft:villager,name=Farmer]', // остались от прошлых проверок
+      'kill @e[type=minecraft:chest_minecart,name=Market]',
+      'kill @e[type=minecraft:item]',
+      `fill ${xyz(-7, -1, -7)} ${xyz(7, 5, 7)} minecraft:stone hollow`,
+      `tp ${BOT_NAME} ${mid(0, 0, 0)}`,
+      `setblock ${xyz(-3, 0, 0)} minecraft:stone`,
+      `setblock ${xyz(2, 0, -2)} minecraft:chest`,
+      `item replace block ${xyz(2, 0, -2)} container.0 with minecraft:diamond 3`,
       `give ${BOT_NAME} minecraft:iron_pickaxe`,
       `give ${BOT_NAME} minecraft:dirt 16`,
-      `execute at ${BOT_NAME} run tp ${HELPER_NAME} ~4 ~ ~4`,
+      `tp ${HELPER_NAME} ${mid(4, 0, 4)}`,
       // NPC с меню — житель-торговец (как Фермер на спавне MineBlaze, только меню — обычная торговля).
-      `execute at ${BOT_NAME} run summon villager ~2 ~ ~2 {NoAI:1b,Invulnerable:1b,PersistenceRequired:1b,CustomName:"Farmer",` +
+      `summon villager ${mid(2, 0, 2)} {NoAI:1b,Invulnerable:1b,PersistenceRequired:1b,CustomName:"Farmer",` +
         'VillagerData:{profession:"minecraft:farmer",level:2,type:"minecraft:plains"},' +
         'Offers:{Recipes:[{buy:{id:"minecraft:emerald",count:1},sell:{id:"minecraft:bread",count:6},maxUses:99}]}}',
       // Меню-сундук у сущности — как меню NPC на MineBlaze: вагонетка с сундуком.
-      `execute at ${BOT_NAME} run summon chest_minecart ~-2 ~ ~2 {CustomName:"Market",` +
+      `summon chest_minecart ${mid(-2, 0, 2)} {CustomName:"Market",` +
         'Items:[{Slot:0b,id:"minecraft:diamond",count:3},{Slot:4b,id:"minecraft:emerald",count:5}]}',
       // Навигация (поиск пути): стена поперёк площадки с проходом у края и помост на блок выше.
-      `execute at ${BOT_NAME} run fill ~4 ~ ~-6 ~4 ~2 ~3 minecraft:stone`,
-      `execute at ${BOT_NAME} run fill ~-5 ~ ~-5 ~-4 ~ ~-4 minecraft:stone`,
+      `fill ${xyz(4, 0, -6)} ${xyz(4, 2, 3)} minecraft:stone`,
+      `fill ${xyz(-5, 0, -5)} ${xyz(-4, 0, -4)} minecraft:stone`,
     ]) cmd(c);
     await wait(3000);
-    const o = bot.entity.position.floored();
-    const xyz = (dx, dy, dz) => `${o.x + dx} ${o.y + dy} ${o.z + dz}`;
     let failed = 0;
     for (const line of [
       '#где',
@@ -376,14 +383,14 @@ async function runMineCheck(manager, cmd) {
     cmd(`gamemode adventure ${BOT_NAME}`);
     await wait(1000);
     const t0 = Date.now();
-    const d = await runCommand(bot, '#добудь железо 2');
-    console.log(`  [добыча] копать нельзя: #добудь железо 2 → ${d.code} (${((Date.now() - t0) / 1000).toFixed(1)} с): ${[].concat(d.message).join(' | ')}`);
+    const d = await runCommand(bot, '#добудь железо 2 здесь');
+    console.log(`  [добыча] копать нельзя: #добудь железо 2 здесь → ${d.code} (${((Date.now() - t0) / 1000).toFixed(1)} с): ${[].concat(d.message).join(' | ')}`);
     cmd(`gamemode survival ${BOT_NAME}`);
     return d.code === 'protected' ? 0 : 1;
   }
   const started = Date.now();
-  const r = await runCommand(bot, '#добудь железо 2');
-  console.log(`  [добыча] #добудь железо 2 → ${r.ok ? 'да' : 'НЕТ'} (${((Date.now() - started) / 1000).toFixed(1)} с): ${[].concat(r.message).join(' | ')}`);
+  const r = await runCommand(bot, '#добудь железо 2 здесь');
+  console.log(`  [добыча] #добудь железо 2 здесь → ${r.ok ? 'да' : 'НЕТ'} (${((Date.now() - started) / 1000).toFixed(1)} с): ${[].concat(r.message).join(' | ')}`);
   const p = bot.entity.position;
   console.log(`  [добыча] бот: ${p.x.toFixed(2)} ${p.y.toFixed(2)} ${p.z.toFixed(2)} (начал в ${o.x + 0.5} ${o.y} ${o.z + 0.5})`);
   const wet = bot.blockAt(o.offset(2, -3, -5));

@@ -1,5 +1,7 @@
 node_modules/
 dist/
+# сборка рядом с запущенной панелью (её exe в dist/ занят)
+dist-next/
 *.log
 # тестовый стенд: скачанные сервер, античит, мир и логи
 test-server/server/

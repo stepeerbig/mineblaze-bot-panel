@@ -273,13 +273,14 @@ class QuestAutopilot extends EventEmitter {
         else if (p.type === 'kill') add(`kill:${p.mobs.join('/')}`, p, st.nick, p.left);
         else if (p.type === 'breed' || p.type === 'no_food' || p.type === 'no_animals') add(`${p.type}:${p.mobs.join('/')}`, p, st.nick);
         else if (p.type === 'kill_none') add(`kill_none:${p.home}`, p, st.nick);
-        else if (p.type === 'no_dig') add(`no_dig:${p.home}`, p, st.nick);
+        else if (p.type === 'no_dig') add('no_dig', p, st.nick);
+        else if (p.type === 'no_pickaxe') add(`no_pickaxe:${p.goal}`, p, st.nick);
         else if (p.type === 'cant' || p.type === 'unknown_items' || p.type === 'no_ore') add(`${p.type}:${p.goal}`, p, st.nick);
         else add(p.type, p, st.nick);
       }
     }
     const out = [];
-    const order = ['no_home', 'no_storage', 'no_items', 'no_money', 'full', 'kill', 'kill_none', 'breed', 'no_food', 'no_animals', 'no_dig', 'no_ore', 'unknown_items', 'cant', 'pvp', 'error'];
+    const order = ['no_home', 'no_storage', 'no_items', 'no_money', 'full', 'kill', 'kill_none', 'breed', 'no_food', 'no_animals', 'no_pickaxe', 'no_dig', 'no_ore', 'unknown_items', 'cant', 'pvp', 'error'];
     const sorted = [...groups.values()].sort((a, b) => order.indexOf(a.type) - order.indexOf(b.type));
     for (const g of sorted) {
       const nicks = [...g.nicks];
@@ -315,10 +316,13 @@ class QuestAutopilot extends EventEmitter {
           out.push(`Нет корма для «${g.goal}» (${botsNum(n)}): ${mobName(g.mobs[0])} — дай ботам корм (например, пшеницу коровам и овцам, морковь свиньям, семена курам)`);
           break;
         case 'no_dig':
-          out.push(`Шахта «${g.home}»: сервер не даёт там копать (${botsNum(n)}) — поставь ботам /sethome ${g.home} там, где копать можно (своя территория, своя шахта или /rtp)`);
+          out.push(`После /rtp сервер не дал копать (${botsNum(n)}) — попробуют снова в другой раз (другое место)`);
           break;
         case 'no_ore':
-          out.push(`Шахта «${g.home}»: для «${g.goal}» руды не нашлось (${botsNum(n)}) — ${g.text || 'поставь дом шахты глубже или в другом месте'}`);
+          out.push(`Для «${g.goal}» руды не нашлось после /rtp (${botsNum(n)}) — ${g.text || 'в следующий раз — другое место'}`);
+          break;
+        case 'no_pickaxe':
+          out.push(`Нет кирки для «${g.goal}» (${botsNum(n)}) — положи кирки в сундук у дома склада${cfg.storage ? ` (/home ${cfg.storage})` : ' (и впиши «Дом склада» в настройках)'}; для железа, золота, алмазов, редстоуна — не хуже железной`);
           break;
         case 'no_animals':
           out.push(`В загоне «${g.home}» меньше двух взрослых (${mobName(g.mobs[0])}) или их кормили меньше 5 мин назад (${botsNum(n)}) — пригони животных`);
@@ -581,21 +585,21 @@ class QuestAutopilot extends EventEmitter {
           if (p) problems.push(p);
         }
       }
-      // «Передайте редстоун…» — сначала добыть в шахте (по заданию: сколько ещё нужно).
-      if (cfg.mine) {
-        for (const q of plan.deliver) {
-          const ore = (q.items || []).find((id) => ORE_WORDS[id]);
-          if (!ore) continue;
-          const need = Math.max(1, Math.ceil(q.need - q.have));
-          const r = await this._cmd(b, cur, `добываю: ${ORE_WORDS[ore]}`, `#добудь ${ORE_WORDS[ore]} ${need} дом ${cfg.mine}`);
-          if (stopped(r)) return { progress, interrupted: true };
-          if (r.data && r.data.mined > 0) did = true;
-          else if (r.code === 'not_found') problems.push({ type: 'no_ore', npc, goal: q.goal, home: cfg.mine, text: lastLine(r) });
-          else if (r.code === 'protected') problems.push({ type: 'no_dig', npc, goal: q.goal, home: cfg.mine });
-          else {
-            const p = problemOfFailure(r, npc);
-            if (p) problems.push(p);
-          }
+      // «Передайте редстоун…» — добыть руду (по заданию: сколько ещё нужно): нет кирки — взять на общем доме
+      // (дом склада), копать — после /rtp, на случайном месте (там можно ломать).
+      for (const q of plan.deliver) {
+        const ore = (q.items || []).find((id) => ORE_WORDS[id]);
+        if (!ore) continue;
+        const need = Math.max(1, Math.ceil(q.need - q.have));
+        const r = await this._cmd(b, cur, `добываю: ${ORE_WORDS[ore]}`, `#добудь ${ORE_WORDS[ore]} ${need}${cfg.storage ? ` дом ${cfg.storage}` : ''}`);
+        if (stopped(r)) return { progress, interrupted: true };
+        if (r.data && r.data.mined > 0) did = true;
+        else if (r.code === 'not_found') problems.push({ type: 'no_ore', npc, goal: q.goal, text: lastLine(r) });
+        else if (r.code === 'protected') problems.push({ type: 'no_dig', npc, goal: q.goal });
+        else if (r.code === 'no_pickaxe') problems.push({ type: 'no_pickaxe', npc, goal: q.goal, home: cfg.storage });
+        else {
+          const p = problemOfFailure(r, npc);
+          if (p) problems.push(p);
         }
       }
       // Взять, купить, принести со склада, сдать, повысить уровень.

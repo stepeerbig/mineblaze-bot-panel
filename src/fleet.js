@@ -429,10 +429,11 @@ class Fleet extends EventEmitter {
   }
 
   _sharedConfig() {
-    // Пароли всех ботов процессам не нужны (у каждого — свой), ключ и настройки ИИ — тоже.
+    // Пароли всех ботов процессам не нужны (у каждого — свой), ключ и настройки ИИ — тоже. «Дом склада» — нужен:
+    // это общий дом, где #добудь берёт кирку.
     const {
       accounts, aiKey, aiBaseUrl, aiModel, aiProvider, ollamaUrl, ollamaModel, ollamaGpu,
-      questAuto, questStorage, questRewards, questMobHomes, questTogether, questPause, questFarm, questPen, questMine, ...rest
+      questAuto, questRewards, questMobHomes, questTogether, questPause, questFarm, questPen, questMine, ...rest
     } = this.config;
     // Ники всех ботов панели: охрана каждого считает остальных своими (у одного склада их много).
     rest.fleetNicks = this.order.map((id) => this.bots.get(id).username).join('\n');
