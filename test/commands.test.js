@@ -1131,27 +1131,58 @@ test('команды: #разведи без корма в инвентаре �
   assert.ok(u.bot.entity.position.x < 2.4, `в загон не вошёл: x = ${u.bot.entity.position.x.toFixed(2)}`);
 });
 
-test('команды: #добудь — открытая руда рядом; мало — лестницей вниз к лучшей высоте и туннелем, руда в стенах; кирка; где искать', async () => {
-  const s = setup({ inventory: [['iron_pickaxe', 1]] });
-  s.world.set(new Vec3(3, 63, 0), 'iron_ore'); // в полу, сверху воздух — видна
-  // Добыв её, бот смотрит на восток (+x) — туда и пойдёт лестница; руда — в стене второй ступеньки.
-  s.world.set(new Vec3(2, 62, 1), 'iron_ore');
-  const r = await s.run('#добудь железо 2', 300000);
-  assert.equal(r.ok, true, [].concat(r.message).join('\n'));
-  assert.equal(r.data.mined, 2);
-  assert.equal(s.world.get(new Vec3(3, 63, 0)), 'air');
-  assert.equal(s.world.get(new Vec3(2, 62, 1)), 'air');
-  assert.ok(r.data.steps >= 2 && r.data.y < 64, `спустился лестницей: шагов ${r.data.steps}, Y ${r.data.y}`);
-  assert.equal(s.world.get(new Vec3(1, 63, 0)), 'air', 'ступенька');
-  assert.equal(s.bot.heldItem && s.bot.heldItem.name, 'iron_pickaxe');
+/** Клетки ниже поверхности (y < 64), которые стали воздухом или блоком, — что бот выкопал и поставил. */
+const changedBelow = (world, name) => world.list().filter((p) => p.y < 64 && world.get(p) === name);
 
-  // Вода рядом со следующей ступенькой — не копает туда.
-  const w = setup({ inventory: [['stone_pickaxe', 1]] });
-  w.world.set(new Vec3(0, 63, 2), 'water');
-  const wet = await w.run('#добудь железо 1', 120000);
-  assert.equal(wet.ok, false);
-  assert.match([].concat(wet.message).join('\n'), /Остановился: рядом вода или лава/);
-  assert.match([].concat(wet.message).join('\n'), /Где искать: Y −64…72, больше всего — Y ≈ 16/);
+test('команды: #добудь — руда в толще камня: прокапывается прямо к ней (вниз под себя), потом столбом на свою высоту', async () => {
+  const s = setup({ inventory: [['iron_pickaxe', 1], ['cobblestone', 32]] });
+  const ore = new Vec3(6, 58, 0); // со всех сторон камень — не видна, но в загруженном мире известна
+  s.world.set(ore, 'iron_ore');
+  const r = await s.run('#добудь железо 1', 600000);
+  const text = [].concat(r.message).join('\n');
+  assert.equal(r.ok, true, text);
+  assert.equal(r.data.mined, 1);
+  assert.notEqual(s.world.get(ore), 'iron_ore', 'руду выкопал (на её месте теперь столб)');
+  const changed = [...changedBelow(s.world, 'air'), ...changedBelow(s.world, 'cobblestone')];
+  const dug = changed.length;
+  assert.ok(dug <= 8, `прямо к руде, а не туннель: выкопано ${dug} блоков: ${changed.map((c) => `${c}=${s.world.get(c)}`).join(' ')}`);
+  // Обратно: столбом (блок под себя) — шахта заложена булыжником, бот там, откуда начал.
+  assert.ok(changedBelow(s.world, 'cobblestone').length >= 4, 'поднимался, ставя блоки под себя');
+  const p = s.bot.entity.position;
+  assert.ok(Math.abs(p.y - 64) < 0.01 && Math.hypot(p.x - 0.5, p.z - 0.5) < 0.7, `вернулся: ${p}`);
+  assert.equal(r.data.back, true);
+  assert.match(text, /Вернулся туда, откуда начал \(Y 64\)/);
+  assert.equal(s.bot.heldItem && s.bot.heldItem.name, 'iron_pickaxe', 'копал киркой');
+});
+
+test('команды: #добудь — руду у воды не трогает (потечёт), берёт другую; рядом нет — копает дальше и ищет снова; кирка; где искать', async () => {
+  const s = setup({ inventory: [['stone_pickaxe', 1], ['cobblestone', 16]] });
+  s.world.set(new Vec3(3, 62, 0), 'iron_ore');
+  s.world.set(new Vec3(4, 62, 0), 'water'); // рядом с этой рудой — вода
+  s.world.set(new Vec3(-4, 62, 2), 'iron_ore');
+  const r = await s.run('#добудь железо 1', 600000);
+  assert.equal(r.ok, true, [].concat(r.message).join('\n'));
+  assert.notEqual(s.world.get(new Vec3(-4, 62, 2)), 'iron_ore');
+  assert.equal(s.world.get(new Vec3(3, 62, 0)), 'iron_ore', 'руду у воды не тронул');
+  assert.equal(s.world.get(new Vec3(4, 62, 0)), 'water');
+
+  // Уголь (лучше всего — выше) дальше, чем видно (45 блоков на юг, куда смотрит бот): идёт/копает вбок и находит.
+  const far = setup({ inventory: [['wooden_pickaxe', 1]] });
+  far.world.set(new Vec3(0, 62, 45), 'coal_ore');
+  const c = await far.run('#добудь уголь 1', 600000);
+  const text = [].concat(c.message).join('\n');
+  assert.equal(c.ok, true, text);
+  assert.equal(far.world.get(new Vec3(0, 62, 45)), 'air');
+  assert.ok(Math.hypot(far.bot.entity.position.x - 0.5, far.bot.entity.position.z - 0.5) < 0.7, `вернулся к началу: ${far.bot.entity.position}`);
+
+  // Руды нет вовсе — честно: не нашёл, где искать.
+  const none = setup({ inventory: [['stone_pickaxe', 1]] });
+  for (let x = -40; x <= 40; x += 1) for (let z = -40; z <= 40; z += 1) none.world.set(new Vec3(x, 62, z), 'bedrock');
+  const n = await none.run('#добудь железо 1', 600000);
+  assert.equal(n.ok, false);
+  assert.equal(n.code, 'not_found');
+  assert.match([].concat(n.message).join('\n'), /Руды «железо» не нашёл/);
+  assert.match([].concat(n.message).join('\n'), /Где искать: Y −64…72, больше всего — Y ≈ 16/);
 
   const weak = setup({ inventory: [['wooden_pickaxe', 1]] });
   assert.match((await weak.run('#добудь алмазы')).message, /нужна кирка не хуже: железная \(есть wooden_pickaxe\)/);

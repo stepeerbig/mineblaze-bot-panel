@@ -54,7 +54,8 @@ test('копание: взгляд на видимую грань, удар, в�
   assert.deepEqual([sent[start].params.face, sent[start].params.sequence, sent[stop].params.sequence], [2, 1, 2]);
   const during = sent.slice(start, stop + 1);
   assert.ok(!during.some((p) => p.name === 'look' || p.name === 'position_look'), 'пока копает — голова неподвижна');
-  assert.equal(during.filter((p) => p.name === 'tick_end').length, 9, 'конец — в 10-м тике, считая тик удара');
+  // Как с зажатой кнопкой: в тике удара прогресса нет, конец — через 10 тиков после него (Grim FastBreak).
+  assert.equal(during.filter((p) => p.name === 'tick_end').length, 10, 'конец — через 10 тиков после удара');
   assert.equal(sent.slice(start, stop + 2).filter((p) => p.name === 'arm_animation').length, 11, 'взмах каждый тик и ещё один от нажатия');
   // Внутри тика — сначала копание и взмах, потом движение: как нажатия мыши у клиента.
   for (const tick of byTick(during)) {
@@ -124,6 +125,98 @@ test('установка: нажатие по видимой грани сосе
   assert.ok(Math.abs(hit.x - (0 + first.cursorX)) < 1e-3 && Math.abs(hit.z - (2 + first.cursorZ)) < 1e-3, 'курсор = точка под взглядом');
   const gap = sent.slice(places[0], places[1]).filter((p) => p.name === 'tick_end').length;
   assert.ok(gap >= 4, `между нажатиями — ${gap} тиков`);
+});
+
+test('столбом: взгляд прямо вниз, прыжок, блок под себя — когда сервер уже знает, что ноги выше клетки', async () => {
+  const { clock, world, bot } = setup();
+  bot.inventory.slots[36] = { name: 'iron_pickaxe' };
+  bot.inventory.slots[37] = { name: 'cobblestone', count: 10 };
+  bot.heldItem = bot.inventory.slots[36];
+  const write = bot._client.write;
+  const serverY = [];
+  bot._client.write = (name, params) => {
+    if (name === 'block_place') serverY.push(bot.serverView.position.y);
+    write(name, params);
+  };
+  const res = await runFor(clock, bot.actions.pillarUp({ item: 'cobblestone', count: 2 }));
+  assert.ifError(res.error);
+  assert.equal(world.get(new Vec3(0, 64, 0)), 'cobblestone');
+  assert.equal(world.get(new Vec3(0, 65, 0)), 'cobblestone');
+  assert.ok(Math.abs(bot.entity.position.y - 66) < 1e-6 && bot.entity.onGround, `стоит на столбе: ${bot.entity.position}`);
+  assert.ok(serverY[0] >= 65 && serverY[1] >= 66, `блок — когда сервер знает, что ноги выше: ${serverY.join(', ')}`);
+
+  const sent = take(bot);
+  const places = sent.map((p, i) => (p.name === 'block_place' ? i : -1)).filter((i) => i >= 0);
+  const first = sent[places[0]].params;
+  assert.deepEqual([first.location.x, first.location.y, first.location.z, first.direction, first.cursorY], [0, 63, 0, 1, 1], 'по верхней грани опоры');
+  assert.equal(lastLook(sent, places[0]).pitch, 90, 'взгляд прямо вниз');
+  assert.equal(sent[places[0] + 1].name, 'arm_animation');
+  assert.ok(sent.some((p) => p.name === 'held_item_slot' && p.params.slotId === 1), 'взял булыжник');
+});
+
+test('столбом: ответ сервера медленный — блок уже стоит у бота (не проваливается); сервер отказал — понятная ошибка', async () => {
+  // Сервер ставит блок через 6 тиков после нажатия (пинг ~300 мс).
+  const clock = fakeClock();
+  const world = makeWorld(require('prismarine-registry')(VERSION));
+  const bot = physicsBot({ clock, world, actions: true });
+  bot.emit('login');
+  teleport(bot);
+  clock.advance(100);
+  bot.inventory.slots[36] = { name: 'dirt', count: 5 };
+  bot.heldItem = bot.inventory.slots[36];
+  const write = bot._client.write;
+  let reject = false;
+  bot._client.write = (name, params) => {
+    write(name, params);
+    if (name !== 'block_place') return;
+    const at = new Vec3(params.location.x, params.location.y + 1, params.location.z);
+    clock.setTimeout(() => {
+      world.set(at, reject ? 'air' : 'dirt');
+      bot.emit('blockUpdate', null, world.blockAt(at)); // как mineflayer по пакету сервера
+    }, 300);
+  };
+  let lowest = Infinity;
+  let placed = false;
+  bot.on('physicsTick', () => {
+    if (placed) lowest = Math.min(lowest, bot.entity.position.y);
+    if (world.get(new Vec3(0, 64, 0)) === 'dirt') placed = true;
+  });
+  const ok = await runFor(clock, bot.actions.pillarUp());
+  assert.ifError(ok.error);
+  assert.ok(lowest >= 65 - 1e-9, `после установки ниже блока не опускался: ${lowest}`);
+  assert.ok(Math.abs(bot.entity.position.y - 65) < 1e-6);
+
+  reject = true;
+  const no = await runFor(clock, bot.actions.pillarUp());
+  assert.match(no.error && no.error.message, /сервер не дал поставить блок/);
+  assert.ok(Math.abs(bot.entity.position.y - 65) < 1e-6, 'вернулся на прежнюю высоту');
+});
+
+test('копание под себя: блок у себя пропадает сразу (как у клиента) — бот падает, не дожидаясь ответа сервера', async () => {
+  const clock = fakeClock();
+  const world = makeWorld(require('prismarine-registry')(VERSION));
+  const bot = physicsBot({ clock, world, actions: true });
+  bot.emit('login');
+  teleport(bot);
+  clock.advance(100);
+  // Сервер отвечает через 300 мс (пинг): тогда и ставит у себя воздух.
+  const write = bot._client.write;
+  let yWhenAnswered = null;
+  bot._client.write = (name, params) => {
+    write(name, params);
+    if (name !== 'block_dig' || params.status !== 2) return;
+    const at = new Vec3(params.location.x, params.location.y, params.location.z);
+    clock.setTimeout(() => {
+      yWhenAnswered = bot.entity.position.y;
+      world.set(at, 'air');
+      bot.emit('blockUpdate', null, world.blockAt(at));
+    }, 300);
+  };
+  const res = await runFor(clock, bot.actions.dig(new Vec3(0, 63, 0)));
+  assert.ifError(res.error);
+  assert.ok(yWhenAnswered !== null && yWhenAnswered < 63.5, `к ответу сервера уже падал: y = ${yWhenAnswered}`);
+  for (let i = 0; i < 20; i += 1) clock.advance(50);
+  assert.ok(Math.abs(bot.entity.position.y - 63) < 1e-6 && bot.entity.onGround, `спрыгнул на блок ниже: ${bot.entity.position}`);
 });
 
 test('установка: понятные ошибки', async () => {

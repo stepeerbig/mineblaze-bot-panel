@@ -19,6 +19,8 @@
 //                                                  --clicks --no-clicks — то же без исправления (для сравнения)
 //         npm run stand:check -- --fight         — бой: бот в стеклянном загоне бьёт пауков командой #бей (как в
 //                                                  панели); Grim смотрит дальность, наводку и порядок пакетов ударов
+//         npm run stand:check -- --mine          — добыча: руда спрятана в толще камня; бот (#добудь) прокапывается к ней
+//                                                  и поднимается обратно «столбом»; Grim смотрит копание и прыжки с блоком
 // Перед первым запуском один раз открой test-server\start-test-server.bat: он скачает сервер и спросит про EULA.
 // Код выхода 0 — бот простоял всё время, его не кикнули, и ни Grim, ни сервер ничего не заметили.
 // Журнал пакетов каждой проверки: test-server\server\journals.
@@ -40,10 +42,11 @@ const BOT_NAME = 'StandBot';
 const HELPER_NAME = 'Helper'; // второй игрок в сценарии — для команд по нику
 
 const ARGS = process.argv.slice(2);
-const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--no-clicks', '--scenario', '--clicks', '--fight', '--electron']);
+const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--no-clicks', '--scenario', '--clicks', '--fight', '--mine', '--electron']);
 const SCENARIO = ARGS.includes('--scenario');
 const CLICKS = ARGS.includes('--clicks');
 const FIGHT = ARGS.includes('--fight');
+const MINE = ARGS.includes('--mine');
 const ELECTRON_ARG = ARGS.find((a) => a === '--electron' || a.startsWith('--electron='));
 const ELECTRON = Boolean(ELECTRON_ARG);
 const ELECTRON_EXE = ELECTRON_ARG && ELECTRON_ARG.includes('=') ? ELECTRON_ARG.slice(ELECTRON_ARG.indexOf('=') + 1).replace(/^"|"$/g, '') : '';
@@ -51,7 +54,7 @@ const BOTS_ARG = ARGS.find((a) => a.startsWith('--bots='));
 const BOTS = BOTS_ARG ? Math.max(1, Math.min(200, parseInt(BOTS_ARG.slice('--bots='.length), 10) || 1)) : 1;
 const isStandBot = (name) => name === BOT_NAME || (BOTS > 1 && new RegExp(`^${BOT_NAME}\\d+$`).test(name));
 const ROOT = path.join(__dirname, '..');
-const STAY_MS = Math.max(5, parseInt(ARGS.find((a) => /^\d+$/.test(a)), 10) || (SCENARIO || CLICKS || FIGHT ? 10 : 60)) * 1000;
+const STAY_MS = Math.max(5, parseInt(ARGS.find((a) => /^\d+$/.test(a)), 10) || (SCENARIO || CLICKS || FIGHT || MINE ? 10 : 60)) * 1000;
 const LEGACY = ARGS.includes('--legacy');
 const COMPAT = {
   physics: !LEGACY && !ARGS.includes('--no-physics'),
@@ -144,7 +147,9 @@ function summarize(logText) {
 }
 
 function startServer() {
-  const child = spawn('java', ['-Xms1G', '-Xmx2G', '-jar', 'paper.jar', '--nogui'], {
+  // STAND_XMX=1G — меньше памяти серверу (когда рядом открыт Minecraft и свободной памяти мало).
+  const xmx = /^\d+[MG]$/i.test(process.env.STAND_XMX || '') ? process.env.STAND_XMX : '2G';
+  const child = spawn('java', [`-Xms${/^1G$|M$/i.test(xmx) ? '512M' : '1G'}`, `-Xmx${xmx}`, '-jar', 'paper.jar', '--nogui'], {
     cwd: SERVER_DIR,
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
@@ -331,6 +336,44 @@ async function runFightCheck(manager, cmd) {
   cmd('kill @e[type=minecraft:spider]');
   cmd('time set day');
   return r.data && r.data.total >= COUNT ? 0 : 1;
+}
+
+/**
+ * Добыча (--mine): консоль сервера делает под ботом толщу камня, прячет в ней две железные руды (не видны —
+ * со всех сторон камень) и третью — рядом с водой. Бот командой #добудь железо 2 (как в панели) прокапывается
+ * прямо к первым двум, руду у воды не трогает и возвращается на свою высоту — где нужно, «столбом» из выкопанного
+ * булыжника. Grim смотрит копание, прыжки с блоком под себя и движение. Возвращает 0 — всё так.
+ */
+async function runMineCheck(manager, cmd) {
+  if (!cmd) throw new Error('для добычи сервер должна запускать сама проверка: закрой окно тестового сервера и запусти снова');
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  await wait(2000);
+  const bot = manager.getBot();
+  if (!bot || !bot.actions) throw new Error('у бота нет безопасных действий (они работают только со своей физикой)');
+  const o = bot.entity.position.floored();
+  const at = (dx, dy, dz) => `${o.x + dx} ${o.y + dy} ${o.z + dz}`;
+  for (const c of [
+    'difficulty peaceful',
+    'time set day',
+    `fill ${at(-8, -12, -8)} ${at(8, -1, 8)} minecraft:stone`,
+    `fill ${at(-8, 0, -8)} ${at(8, 4, 8)} minecraft:air`,
+    `setblock ${at(5, -5, 2)} minecraft:iron_ore`,
+    `setblock ${at(-3, -8, -4)} minecraft:deepslate_iron_ore`,
+    `setblock ${at(2, -3, -5)} minecraft:iron_ore`,
+    `setblock ${at(3, -3, -5)} minecraft:water`, // рядом с этой рудой — вода: сломаешь — потечёт
+    `clear ${BOT_NAME}`,
+    `give ${BOT_NAME} minecraft:iron_pickaxe`,
+  ]) cmd(c);
+  await wait(3000);
+  const started = Date.now();
+  const r = await runCommand(bot, '#добудь железо 2');
+  console.log(`  [добыча] #добудь железо 2 → ${r.ok ? 'да' : 'НЕТ'} (${((Date.now() - started) / 1000).toFixed(1)} с): ${[].concat(r.message).join(' | ')}`);
+  const p = bot.entity.position;
+  console.log(`  [добыча] бот: ${p.x.toFixed(2)} ${p.y.toFixed(2)} ${p.z.toFixed(2)} (начал в ${o.x + 0.5} ${o.y} ${o.z + 0.5})`);
+  const wet = bot.blockAt(o.offset(2, -3, -5));
+  if (wet) console.log(`  [добыча] руда у воды: ${wet.name}`);
+  const ok = r.data && r.data.mined >= 2 && r.data.back === true && Math.abs(p.y - o.y) < 0.1 && (!wet || wet.name === 'iron_ore');
+  return ok ? 0 : 1;
 }
 
 // Предметы для проверки кликов: как в меню NPC на MineBlaze (название с цветом, описание из нескольких строк)
@@ -587,13 +630,15 @@ function runBot(host, port, version, cmd) {
         onlineAt = Date.now();
         onlineAtJournal = performance.timeOrigin + performance.now();
         clearTimeout(onlineTimer);
-        if (SCENARIO || CLICKS || FIGHT) {
-          console.log(SCENARIO ? 'Бот в мире: готовлю площадку и действую…' : CLICKS ? 'Бот в мире: проверяю клики в меню…' : 'Бот в мире: готовлю загон и пауков…');
-          const what = SCENARIO ? 'сценарий' : CLICKS ? 'клики' : 'бой';
-          (SCENARIO ? runScenario : CLICKS ? runClickCheck : runFightCheck)(manager, cmd).then(
+        if (SCENARIO || CLICKS || FIGHT || MINE) {
+          console.log(SCENARIO ? 'Бот в мире: готовлю площадку и действую…' : CLICKS ? 'Бот в мире: проверяю клики в меню…' : MINE ? 'Бот в мире: прячу руду в камне…' : 'Бот в мире: готовлю загон и пауков…');
+          const what = SCENARIO ? 'сценарий' : CLICKS ? 'клики' : MINE ? 'добыча' : 'бой';
+          (SCENARIO ? runScenario : CLICKS ? runClickCheck : MINE ? runMineCheck : runFightCheck)(manager, cmd).then(
             (failed) => {
-              console.log(`${SCENARIO ? 'Сценарий закончен' : CLICKS ? 'Клики проверены' : 'Бой окончен'}, бот стоит ещё ${STAY_MS / 1000} с…`);
-              const why = SCENARIO ? `не выполнено команд — ${failed}` : CLICKS ? `неудачных проверок — ${failed}` : 'убил не всех пауков';
+              console.log(`${SCENARIO ? 'Сценарий закончен' : CLICKS ? 'Клики проверены' : MINE ? 'Добыча окончена' : 'Бой окончен'}, бот стоит ещё ${STAY_MS / 1000} с…`);
+              const why = SCENARIO ? `не выполнено команд — ${failed}`
+                : CLICKS ? `неудачных проверок — ${failed}`
+                  : MINE ? 'добыл не всё, тронул руду у воды или не вернулся на свою высоту' : 'убил не всех пауков';
               stayTimer = setTimeout(() => finish(failed ? `${what}: ${why}` : null), STAY_MS);
             },
             (err) => finish(`${what}: ${err.message}`),
@@ -616,12 +661,12 @@ async function main() {
     console.error('--bots=N — только вместе с --electron (боты заходят через панель, как «Старт всех»)');
     return 2;
   }
-  if (ELECTRON && (SCENARIO || CLICKS || FIGHT || ARGS.some((a) => /^--(legacy|no-)/.test(a)))) {
+  if (ELECTRON && (SCENARIO || CLICKS || FIGHT || MINE || ARGS.some((a) => /^--(legacy|no-)/.test(a)))) {
     console.error('--electron проверяет бота таким, какой он в панели: без --scenario, --clicks, --fight, --legacy и --no-…');
     return 2;
   }
-  if ([SCENARIO, CLICKS, FIGHT].filter(Boolean).length > 1) {
-    console.error('--scenario, --clicks и --fight — разные проверки: запусти их по очереди');
+  if ([SCENARIO, CLICKS, FIGHT, MINE].filter(Boolean).length > 1) {
+    console.error('--scenario, --clicks, --fight и --mine — разные проверки: запусти их по очереди');
     return 2;
   }
   if (unknown.length) {
@@ -665,7 +710,7 @@ async function main() {
 
     console.log('');
     console.log('===== Итог =====');
-    const stayed = `${Math.round(result.onlineMs / 1000)} с${SCENARIO || CLICKS || FIGHT ? ' (проверка и пауза после неё)' : ` из ${STAY_MS / 1000}`}`;
+    const stayed = `${Math.round(result.onlineMs / 1000)} с${SCENARIO || CLICKS || FIGHT || MINE ? ' (проверка и пауза после неё)' : ` из ${STAY_MS / 1000}`}`;
     console.log(`Бот в мире: ${result.online ? stayed : 'не появился'}`);
     if (result.kick) console.log(`Кик: ${result.kick}`);
     if (result.problem) console.log(`Проблема: ${result.problem}`);

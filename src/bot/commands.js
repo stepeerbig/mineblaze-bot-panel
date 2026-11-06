@@ -2218,10 +2218,16 @@ const ORE_WORDS = [
 ];
 const PICK_TIERS = { wooden_pickaxe: 0, golden_pickaxe: 0, stone_pickaxe: 1, iron_pickaxe: 2, diamond_pickaxe: 3, netherite_pickaxe: 4 };
 const TIER_NAMES = ['деревянная', 'каменная', 'железная', 'алмазная'];
-const MINE_MAX_STEPS = 96; // шагов туннеля за раз
+const MINE_SCAN = 32; // руду ищем в этом радиусе — в загруженном мире видна и та, что в толще камня
+const MINE_REACH = 40; // к руде прокапываемся не дальше (по горизонтали)
+const MINE_MAX_HOPS = 12; // рядом руды нет — столько раз копать дальше (вглубь или вбок) и искать снова
+const MINE_HOP_DOWN = 8;
+const MINE_HOP_SIDE = 12;
+const MINE_FLOOR_Y = -58; // ниже — бедрок
 const MINE_MAX_MS = 15 * 60 * 1000;
 const LIQUID_RE = /^(?:lava|water|flowing_lava|flowing_water)$/;
-const UNBREAKABLE_RE = /^(?:bedrock|barrier|end_portal_frame|reinforced_deepslate)$/;
+// Чем строить «столб» (подняться на свою высоту): простые блоки, которые и так набираются при копании.
+const PILLAR_BLOCKS = ['cobblestone', 'cobbled_deepslate', 'dirt', 'netherrack', 'stone', 'deepslate', 'andesite', 'diorite', 'granite', 'tuff', 'blackstone', 'basalt', 'calcite', 'end_stone', 'coarse_dirt', 'sandstone'];
 
 const oreOf = (text) => {
   const t = ` ${norm(text)}`;
@@ -2229,7 +2235,8 @@ const oreOf = (text) => {
   return hit ? hit[1] : null;
 };
 const posKey = (p) => `${p.x},${p.y},${p.z}`;
-const isAirBlock = (b) => !b || /^(?:cave_|void_)?air$/.test(b.name);
+// Остановили, бот погиб или вышел — копать дальше нечем.
+const isFatal = (err) => isStopped(err) || Boolean(err && (err.code === 'interrupted' || err.code === 'not_ready'));
 const SIDES = [new Vec3(1, 0, 0), new Vec3(-1, 0, 0), new Vec3(0, 1, 0), new Vec3(0, -1, 0), new Vec3(0, 0, 1), new Vec3(0, 0, -1)];
 
 /** Рядом с блоком вода или лава: сломаешь — потечёт на бота. */
@@ -2237,79 +2244,68 @@ const nearLiquid = (bot, pos) => SIDES.some((d) => {
   const b = bot.blockAt(pos.plus(d));
   return b && LIQUID_RE.test(b.name);
 });
-/** Открытая руда: хоть одна сторона — воздух (её видно, до неё можно дотянуться, не копая вслепую). */
-const exposed = (bot, pos) => SIDES.some((d) => isAirBlock(bot.blockAt(pos.plus(d))));
+/** Чем строить «столб»: самый многочисленный простой блок в инвентаре (булыжник, земля…) или null. */
+function pillarItem(bot) {
+  const counts = new Map();
+  for (const it of inventoryItems(bot)) {
+    if (PILLAR_BLOCKS.includes(it.name)) counts.set(it.name, (counts.get(it.name) || 0) + (it.count || 1));
+  }
+  let best = null;
+  for (const [name, n] of counts) if (!best || n > best[1]) best = [name, n];
+  return best ? best[0] : null;
+}
+
+const feetY = (bot) => Math.floor(bot.entity.position.y + 0.01);
 
 /**
- * Добыть руду: сначала открытую рядом, потом — лестницей вниз до лучшей высоты (выше — не поднимается) и туннелем
- * вперёд, выкапывая руду в стенах. Вода и лава рядом, обрыв впереди, бедрок, полный инвентарь — стоп.
- * → { mined, steps, note, y }
+ * Вернуться туда, откуда начал копать: по выкопанному, где нужно — «столбом» (блок под себя) или прокапываясь.
+ * Туда не выходит — хотя бы на ту же высоту рядом. → { ok, moved, y, why? }
  */
-async function mine(bot, ore, want) {
+async function climbBack(bot, start, opts) {
+  const startY = Math.floor(start.y + 0.01);
+  if (bot.entity.position.distanceTo(start) < 1.5) return { ok: true, moved: false, y: startY };
+  try {
+    await bot.actions.digTo(start, { range: 0.6, vertical: 0, maxDistance: 160, maxNodes: 30000, ...opts() });
+    return { ok: true, moved: true, y: startY };
+  } catch (err) {
+    if (isFatal(err)) throw err;
+    if (feetY(bot) >= startY) return { ok: false, moved: false, y: feetY(bot), why: err.message };
+    try {
+      const p = bot.entity.position;
+      await bot.actions.digTo(new Vec3(p.x, startY, p.z), { range: 6, vertical: 0, maxDistance: 32, maxNodes: 20000, ...opts() });
+      return { ok: true, moved: true, y: startY, nearby: true };
+    } catch (err2) {
+      if (isFatal(err2)) throw err2;
+      return { ok: false, moved: false, y: feetY(bot), why: err2.message };
+    }
+  }
+}
+
+/**
+ * Добыть руду: найти её в загруженном мире (до MINE_SCAN блоков — и спрятанную в толще камня) и прокопаться прямо
+ * к ближайшей: вперёд, ступеньками, под себя; выкопать, потом следующую (жила — рядом). Руды рядом нет — вглубь к
+ * лучшей высоте (по MINE_HOP_DOWN блоков), на ней — вбок, и снова искать. В конце — обратно на свою высоту: по
+ * выкопанному, а где нужно — «столбом». Вода и лава рядом, гравий над головой, бедрок — в обход; полный
+ * инвентарь, 15 минут — стоп.
+ * → { mined, dug, hops, note, y, startY, back, placed }
+ */
+async function mine(bot, ore, want, pick) {
   const ids = new Set(ore.blocks);
+  const start = bot.entity.position.clone();
   const skip = new Set();
   const started = Date.now();
   let mined = 0;
-  let steps = 0;
+  let dug = 0;
+  let hops = 0;
   let note = '';
-  const enough = () => mined >= want || Boolean(note);
-  const digSafe = async (pos) => {
-    const b = bot.blockAt(pos);
-    if (isAirBlock(b)) return true;
-    if (LIQUID_RE.test(b.name)) {
-      note = `впереди ${b.name === 'lava' ? 'лава' : 'вода'}`;
-      return false;
-    }
-    if (UNBREAKABLE_RE.test(b.name)) {
-      note = `впереди ${b.name} — не ломается`;
-      return false;
-    }
-    if (nearLiquid(bot, pos)) {
-      note = 'рядом вода или лава — дальше не копаю';
-      return false;
-    }
-    for (let attempt = 0; attempt < 4 && !isAirBlock(bot.blockAt(pos)); attempt += 1) {
-      const isOre = ids.has(bot.blockAt(pos).name);
-      try {
-        await bot.actions.dig(pos); // гравий и песок сверху падают — тогда копать ещё раз
-        if (isOre) mined += 1; // руда прямо на пути туннеля — тоже добыча
-      } catch (err) {
-        if (isStopped(err)) throw err;
-        note = `не смог сломать ${bot.blockAt(pos) ? bot.blockAt(pos).name : 'блок'}: ${err.message}`;
-        return false;
-      }
-    }
-    return isAirBlock(bot.blockAt(pos));
+  const onDig = (block) => {
+    dug += 1;
+    if (block && ids.has(block.name)) mined += 1; // руда на пути — тоже добыча
   };
-  const mineVisible = async (radius) => {
-    for (;;) {
-      if (enough()) return;
-      if (freeSlots(bot) === 0) {
-        note = 'инвентарь полон';
-        return;
-      }
-      if (Date.now() - started > MINE_MAX_MS) {
-        note = 'прошло 15 мин — на один раз хватит';
-        return;
-      }
-      const next = scanBlocks(bot, radius, (b) => ids.has(b.name)).find((x) => !skip.has(posKey(x.pos)) && exposed(bot, x.pos));
-      if (!next) return;
-      skip.add(posKey(next.pos));
-      if (nearLiquid(bot, next.pos)) continue;
-      if (!(await comeClose(bot, next.pos))) continue;
-      try {
-        await bot.actions.dig(next.pos);
-        mined += 1;
-      } catch (err) {
-        if (isStopped(err)) throw err;
-      }
-    }
-  };
-  await mineVisible(16);
-  // Мало — туннель: куда смотрит бот (по ближайшей оси), вниз лестницей до лучшей высоты.
+  const opts = () => ({ tool: pick, item: pillarItem(bot), onDig });
   const yaw = bot.entity.yaw;
-  const dir = Math.abs(Math.sin(yaw)) > Math.abs(Math.cos(yaw)) ? new Vec3(-Math.sign(Math.sin(yaw)), 0, 0) : new Vec3(0, 0, -Math.sign(Math.cos(yaw)));
-  while (!enough() && steps < MINE_MAX_STEPS) {
+  let dir = Math.abs(Math.sin(yaw)) > Math.abs(Math.cos(yaw)) ? new Vec3(-Math.sign(Math.sin(yaw)), 0, 0) : new Vec3(0, 0, -Math.sign(Math.cos(yaw)));
+  while (mined < want) {
     if (freeSlots(bot) === 0) {
       note = 'инвентарь полон';
       break;
@@ -2318,37 +2314,56 @@ async function mine(bot, ore, want) {
       note = 'прошло 15 мин — на один раз хватит';
       break;
     }
-    const feet = bot.entity.position.floored();
-    const down = feet.y > ore.best + 1 && feet.y > -60;
-    const ahead = feet.plus(dir);
-    const to = down ? ahead.offset(0, -1, 0) : ahead;
-    // Под новым местом должна быть опора — в пещеру или пропасть не шагаем.
-    const floor = bot.blockAt(to.offset(0, -1, 0));
-    if (isAirBlock(floor) || (floor && LIQUID_RE.test(floor.name))) {
-      note = 'впереди обрыв или пустота — дальше не иду';
+    const target = scanBlocks(bot, MINE_SCAN, (b) => ids.has(b.name)).find((x) => !skip.has(posKey(x.pos)) && !nearLiquid(bot, x.pos));
+    if (target) {
+      skip.add(posKey(target.pos));
+      try {
+        await bot.actions.digTo(target.pos, { reach: true, maxDistance: MINE_REACH, ...opts() });
+        const b = bot.blockAt(target.pos);
+        if (b && ids.has(b.name)) {
+          if (pick) await bot.actions.equip(pick);
+          await bot.actions.dig(target.pos);
+          onDig(b);
+        }
+      } catch (err) {
+        if (isFatal(err)) throw err; // не прокопаться (вода, лава, бедрок) — к следующей
+      }
+      continue;
+    }
+    // Руды рядом не видно: вглубь к лучшей высоте, на ней — вбок; и снова искать.
+    if (hops >= MINE_MAX_HOPS) {
+      note = `рядом руды нет — ${hops} раз копал дальше и искал снова, на один раз хватит`;
       break;
     }
-    const cells = down ? [ahead.offset(0, 1, 0), ahead, to] : [ahead.offset(0, 1, 0), ahead];
-    let clear = true;
-    for (const c of cells) {
-      if (!(await digSafe(c))) {
-        clear = false;
-        break;
+    hops += 1;
+    const feet = bot.entity.position.floored();
+    const deeper = feet.y > ore.best + 1 && feet.y > MINE_FLOOR_Y;
+    let moved = false;
+    for (let turn = 0; turn < 4 && !moved; turn += 1) {
+      const down = Math.min(MINE_HOP_DOWN, feet.y - Math.max(ore.best, MINE_FLOOR_Y));
+      const to = deeper ? feet.offset(dir.x * 4 * Math.sign(turn), -down, dir.z * 4 * Math.sign(turn)) : feet.plus(dir.scaled(MINE_HOP_SIDE));
+      try {
+        await bot.actions.digTo(to, { range: deeper ? 2.5 : 1.5, vertical: 0, maxDistance: 24, ...opts() });
+        moved = true;
+      } catch (err) {
+        if (isFatal(err)) throw err;
+        dir = new Vec3(-dir.z, 0, dir.x); // туда не прокопаться — в другую сторону
       }
     }
-    if (!clear) break;
-    try {
-      await bot.actions.walkTo(new Vec3(to.x + 0.5, to.y, to.z + 0.5), { range: 0.3 });
-    } catch (err) {
-      if (isStopped(err)) throw err;
-      note = `не прошёл дальше: ${err.message}`;
+    if (!moved) {
+      note = 'дальше не прокопаться: вокруг вода, лава или бедрок';
       break;
     }
-    steps += 1;
-    await mineVisible(4); // руда в стенах туннеля
   }
-  if (!note && mined < want && steps >= MINE_MAX_STEPS) note = `туннель ${MINE_MAX_STEPS} блоков — на один раз хватит`;
-  return { mined, steps, note, y: Math.floor(bot.entity.position.y) };
+  const back = await climbBack(bot, start, opts);
+  if (pick && back.moved) {
+    try {
+      await bot.actions.equip(pick); // после столба в руке булыжник — снова кирку
+    } catch (err) {
+      if (isFatal(err)) throw err;
+    }
+  }
+  return { mined, dug, hops, note, y: feetY(bot), startY: Math.floor(start.y + 0.01), back };
 }
 
 /** «#добудь железо», «#добудь алмазы 5», «#добудь уголь 64 дом шахта» — руда: где её искать, кирка, добыча. */
@@ -2370,14 +2385,21 @@ async function cmdMine({ bot, args: allArgs, words = [] }) {
   const dim = bot.game && bot.game.dimension ? String(bot.game.dimension) : '';
   if (ore.nether && dim && !/nether/.test(dim)) throw new CommandError(`«${ore.name}» — только в Незере (${ore.where}); бот сейчас не там`);
   await bot.actions.equip(picks[0].name);
-  const r = await mine(bot, ore, want);
+  const r = await mine(bot, ore, want, picks[0].name);
   const lines = [r.mined
     ? `Добыл: ${ore.name} — блоков руды ${r.mined} (выпадает ${ore.item})`
     : `Руды «${ore.name}» не нашёл`];
-  if (r.steps) lines.push(`Туннель: ${r.steps} блоков, бот на высоте Y ${r.y}`);
+  if (r.dug > r.mined) lines.push(`Прокопал к руде блоков: ${r.dug - r.mined}`);
+  if (!r.back.ok) lines.push(`На свою высоту (Y ${r.startY}) не вернулся: ${r.back.why}. Бот на Y ${r.y}`);
+  else if (r.back.moved) lines.push(`Вернулся ${r.back.nearby ? 'на свою высоту' : 'туда, откуда начал'} (Y ${r.startY})`);
   if (r.note) lines.push(`Остановился: ${r.note}`);
   if (r.mined < want) lines.push(`Где искать: ${ore.where}`);
-  return { ok: r.mined > 0, code: r.mined ? undefined : 'not_found', message: lines, data: { ore: key, item: ore.item, mined: r.mined, steps: r.steps, y: r.y, note: r.note } };
+  return {
+    ok: r.mined > 0,
+    code: r.mined ? undefined : 'not_found',
+    message: lines,
+    data: { ore: key, item: ore.item, mined: r.mined, dug: r.dug, y: r.y, back: r.back.ok, note: r.note },
+  };
 }
 
 // ---------- пинг ----------
@@ -2567,8 +2589,10 @@ const COMMANDS = [
     aliases: ['добыть', 'шахта', 'mine'],
     usage: ['#добудь железо', '#добудь алмазы 5', '#добудь уголь 64'],
     about: 'добыть руду (уголь, медь, железо, лазурит, золото, редстоун, алмазы, изумруды; в Незере — кварц, золото, древние обломки): ' +
-      'сначала открытую рядом, потом лестницей вниз до лучшей высоты (железо Y≈16, алмазы и редстоун Y≈−58…) и туннелем туда, куда смотрит, ' +
-      'с рудой в стенах; нужна подходящая кирка; вода и лава рядом, обрыв, полный инвентарь — стоп; не нашёл — скажет, где искать',
+      'находит её в мире рядом (до 32 блоков, и в толще камня) и прокапывается прямо к ней — вперёд, вниз под себя, ступеньками; ' +
+      'рядом нет — копает вглубь к лучшей высоте (железо Y≈16, алмазы и редстоун Y≈−58…), там вбок, и ищет снова; потом возвращается ' +
+      'на свою высоту — где нужно, «столбом» (блок под себя); руду и блоки у воды и лавы, под гравием не трогает; нужна подходящая кирка; ' +
+      'не нашёл — скажет, где искать',
     run: cmdMine,
   },
   {

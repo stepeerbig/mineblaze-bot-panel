@@ -62,6 +62,16 @@ function makeWorld(registry) {
       const p = floor(pos);
       return cells.get(key(p)) || (p.y < 64 ? 'stone' : 'air');
     },
+    /** Заданные клетки (без камня и воздуха по умолчанию). */
+    list() {
+      return [...cells.keys()].map((k) => new Vec3(...k.split(',').map(Number)));
+    },
+    /** Как у мира mineflayer: блок по номеру состояния. */
+    setBlockStateId(pos, stateId) {
+      const b = Block.fromStateId(stateId, 0);
+      const info = registry.blocksByName[b.name];
+      world.set(pos, stateId === info.defaultState ? b.name : `${b.name}#${stateId - info.minStateId}`);
+    },
     /** «water#3» — вода 3-го уровня (растекающаяся); без «#» — состояние по умолчанию. */
     blockAt(pos) {
       const p = floor(pos);
@@ -108,6 +118,18 @@ function physicsBot({ clock, world, tickEnd = true, actions = false, random = 0.
     isCollidedHorizontally: false, isCollidedVertically: false, elytraFlying: false,
   };
   bot.blockAt = (pos) => w.blockAt(pos);
+  // Поиск блоков, как у mineflayer (по номерам блоков) — среди заданных клеток мира: камень и воздух по умолчанию
+  // не ищутся (перебор куба 65³ блоков был бы слишком долгим для тестов).
+  if (typeof w.list === 'function') {
+    bot.findBlocks = ({ matching, maxDistance = 16, count = 1, point } = {}) => {
+      const ids = new Set([].concat(matching));
+      const from = point || bot.entity.position;
+      return w.list()
+        .filter((p) => ids.has(w.blockAt(p).type) && p.offset(0.5, 0.5, 0.5).distanceTo(from) <= maxDistance)
+        .sort((a, b) => a.distanceTo(from) - b.distanceTo(from))
+        .slice(0, count);
+    };
+  }
   // Время копания по умолчанию — 10 тиков; для отдельных блоков можно задать своё.
   bot.digTicks = { short_grass: 1 };
   bot.digTime = (block) => (bot.digTicks[block.name] || 10) * 50;
@@ -175,13 +197,21 @@ function autoServer(bot, world, { chests = {}, storage = {}, npcs = {}, onClick 
     }
     open(w);
   };
+  // Ответ сервера о клетке — как у mineflayer (событие blockUpdate), чуть позже, как пакет по сети.
+  const answer = (pos) => setImmediate(() => {
+    const block = world.blockAt(pos);
+    bot.emit('blockUpdate', null, block);
+  });
   bot._client.write = (name, params) => {
     write(name, params);
     if (name === 'use_entity' && params.mouse === 0 && npcs[params.target]) {
       open(npcs[params.target]());
     } else if (name === 'block_dig') {
       const block = world.blockAt(params.location);
-      if (params.status === 2 || (params.status === 0 && bot.digTime(block) <= 50)) world.set(params.location, 'air');
+      if (params.status === 2 || (params.status === 0 && bot.digTime(block) <= 50)) {
+        world.set(params.location, 'air');
+        answer(new Vec3(params.location.x, params.location.y, params.location.z));
+      }
     } else if (name === 'block_place') {
       const loc = new Vec3(params.location.x, params.location.y, params.location.z);
       const clicked = world.get(loc);
@@ -199,6 +229,7 @@ function autoServer(bot, world, { chests = {}, storage = {}, npcs = {}, onClick 
         // Семена на грядку — росток; блок в руке — сам блок.
         const PLANTS = { wheat_seeds: 'wheat', carrot: 'carrots', potato: 'potatoes', beetroot_seeds: 'beetroots', nether_wart: 'nether_wart' };
         world.set(loc.plus(FACE_VECTORS[params.direction]), PLANTS[bot.heldItem.name] || bot.heldItem.name);
+        answer(loc.plus(FACE_VECTORS[params.direction]));
       }
     }
   };

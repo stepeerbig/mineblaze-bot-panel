@@ -13,15 +13,18 @@
 
 const { Vec3 } = require('vec3');
 const { RaycastIterator } = require('prismarine-world').iterators;
-const { findPath } = require('./pathfinder');
+const { findPath, LIQUID_RE, UNBREAKABLE_RE } = require('./pathfinder');
 
 const BLOCK_REACH = 4.4; // у игрока 4,5 блока — оставляем запас
 const ENTITY_REACH = 2.9; // у игрока 3 блока
 const USE_DELAY_TICKS = 4; // пауза между нажатиями правой кнопки у клиента
-const DESTROY_DELAY_TICKS = 5; // пауза после сломанного блока у клиента
+// Пауза после сломанного блока: у клиента с зажатой кнопкой следующий удар — на 6-м тике (5 тиков задержки);
+// Grim (FastBreak) копит, если удар раньше 275 мс после конца прошлого.
+const DESTROY_DELAY_TICKS = 6;
 const CONFIRM_TICKS = 20; // столько ждём, что сервер подтвердит сломанный или поставленный блок
 const LOOK_TIMEOUT_TICKS = 60;
 const STUCK_TICKS = 60; // столько тиков без продвижения — бот застрял
+const FIRST_SEARCH_NODES = 3000; // путь с копанием: точный поиск — до стольких клеток, дальше — жадный
 const ATTACK_COOLDOWN_TICKS = 12; // пауза между ударами (меч восстанавливается за 12,5 тика)
 const CHAT_INTERVAL_MS = 1500;
 // Клики в меню: первый — через 0,5–0,9 с после открытия, следующие — через 0,25–0,55 с; ответ сервера ждём до 0,5 с.
@@ -147,6 +150,7 @@ function inject(bot, { random, now }) {
   const isAir = (block) => !block || airIds.has(block.type);
 
   let sequence = 0; // как у клиента: растёт с каждым копанием, установкой, использованием предмета
+  let selfUpdate = false; // мир меняет наше же предсказание (а не ответ сервера)
   let lastUseTick = -Infinity;
   let lastDestroyTick = -Infinity;
   let lastAttackTick = -Infinity;
@@ -607,57 +611,327 @@ function inject(bot, { random, now }) {
   /** Сломать блок: взгляд на видимую грань, удар, взмах рукой каждый тик, время — как у клиента. */
   function dig(position) {
     const pos = new Vec3(Math.floor(position.x), Math.floor(position.y), Math.floor(position.z));
-    return run('копать', async (signal) => {
-      const block = blockAtOrThrow(pos);
-      if (isAir(block)) throw new ActionError(`в ${fmt(pos)} нечего ломать — там воздух`);
-      if (block.hardness === null || block.hardness < 0 || block.diggable === false) throw new ActionError(`${block.name} в ${fmt(pos)} не ломается`);
-      await standStill(signal);
-      const spot = visibleFacePoint(pos, block);
-      if (!spot) throw new ActionError(`блок ${block.name} в ${fmt(pos)} не виден или слишком далеко`);
-      const a = anglesTo(eyePosition(), spot.point);
-      await settleLook(a.yaw, a.pitch, signal);
-      // Пауза после предыдущего сломанного блока — как у клиента.
-      while (ticks() - lastDestroyTick < DESTROY_DELAY_TICKS) await inTick(() => {}, signal);
+    return run('копать', (signal) => digBlock(pos, signal));
+  }
 
-      const needTicks = Math.max(1, Math.round(bot.digTime(block) / 50));
-      let face = spot.face;
-      let progress = 0;
-      let started = false;
-      const abortDig = () => {
-        if (started && progress < needTicks) bot._client.write('block_dig', { status: 1, location: pos, face: 0, sequence: 0 });
-      };
-      try {
-        await everyTick(() => {
-          const hit = lookedAtBlock(BLOCK_REACH, pos);
-          if (!hit || !hit.position.equals(pos)) throw new ActionError(`блок ${fmt(pos)} ушёл из-под взгляда`);
-          if (isAir(blockAt(pos))) return true; // его уже нет (сломал кто-то другой)
-          if (!started) {
-            face = hit.face;
-            started = true;
-            bot._client.write('block_dig', { status: 0, location: pos, face, sequence: nextSequence() });
-            swing(); // взмах от нажатия кнопки
-            if (needTicks <= 1) {
-              progress = 1; // ломается сразу (трава, факел): только начало, без конца
-              lastDestroyTick = ticks();
-              return true;
-            }
-          }
-          progress += 1;
-          if (progress >= needTicks) {
-            bot._client.write('block_dig', { status: 2, location: pos, face, sequence: nextSequence() });
-            swing();
+  /** Сломать блок внутри действия (dig, digTo). */
+  async function digBlock(pos, signal) {
+    const block = blockAtOrThrow(pos);
+    if (isAir(block)) throw new ActionError(`в ${fmt(pos)} нечего ломать — там воздух`);
+    if (block.hardness === null || block.hardness < 0 || block.diggable === false) throw new ActionError(`${block.name} в ${fmt(pos)} не ломается`);
+    await standStill(signal);
+    const spot = visibleFacePoint(pos, block);
+    if (!spot) throw new ActionError(`блок ${block.name} в ${fmt(pos)} не виден или слишком далеко`);
+    const a = anglesTo(eyePosition(), spot.point);
+    await settleLook(a.yaw, a.pitch, signal);
+    // Пауза после предыдущего сломанного блока — как у клиента.
+    while (ticks() - lastDestroyTick < DESTROY_DELAY_TICKS) await inTick(() => {}, signal);
+
+    const needTicks = Math.max(1, Math.round(bot.digTime(block) / 50));
+    let face = spot.face;
+    let progress = 0;
+    let started = false;
+    const abortDig = () => {
+      if (started && progress < needTicks) bot._client.write('block_dig', { status: 1, location: pos, face: 0, sequence: 0 });
+    };
+    try {
+      await everyTick(() => {
+        const hit = lookedAtBlock(BLOCK_REACH, pos);
+        if (!hit || !hit.position.equals(pos)) throw new ActionError(`блок ${fmt(pos)} ушёл из-под взгляда`);
+        if (isAir(blockAt(pos))) return true; // его уже нет (сломал кто-то другой)
+        if (!started) {
+          face = hit.face;
+          started = true;
+          bot._client.write('block_dig', { status: 0, location: pos, face, sequence: nextSequence() });
+          swing(); // взмах от нажатия кнопки
+          if (needTicks <= 1) {
+            progress = 1; // ломается сразу (трава, факел): только начало, без конца
             lastDestroyTick = ticks();
+            setLocalBlock(pos, 'air');
             return true;
           }
-          swing(); // пока кнопка зажата — взмах каждый тик
+          // Как у клиента с зажатой кнопкой (копает блок за блоком): в тике удара прогресса ещё нет, конец — через
+          // полное время. Конец на тик раньше Grim копит (FastBreak): за 20 блоков подряд набегает секунда — флаг.
           return undefined;
-        }, signal);
-      } catch (err) {
-        abortDig();
-        throw err;
+        }
+        progress += 1;
+        if (progress >= needTicks) {
+          bot._client.write('block_dig', { status: 2, location: pos, face, sequence: nextSequence() });
+          swing();
+          lastDestroyTick = ticks();
+          // Как обычный клиент: у себя блок пропадает сразу. Стоял на нём — падает тогда же, когда этого ждёт
+          // античит (иначе, пока ответ сервера в пути, бот «висел» бы в воздухе — и Grim откатывал его).
+          setLocalBlock(pos, 'air');
+          return true;
+        }
+        swing(); // пока кнопка зажата — взмах каждый тик
+        return undefined;
+      }, signal);
+    } catch (err) {
+      abortDig();
+      throw err;
+    }
+    if (!(await waitServerBlock(pos, isAir, signal))) throw new ActionError(`сервер не дал сломать блок в ${fmt(pos)}`, 'rejected');
+    return { position: pos, face: FACE_NAMES[face], ticks: needTicks };
+  }
+
+  // ---------- столбом вверх и прокапывание ----------
+
+  const solidAt = (p) => {
+    const b = blockAt(p);
+    return Boolean(b && b.shapes && b.shapes.length);
+  };
+  const isLiquid = (b) => Boolean(b) && (LIQUID_RE.test(b.name) || (typeof b.getProperties === 'function' && (() => {
+    try {
+      return b.getProperties().waterlogged === true;
+    } catch (_) {
+      return false;
+    }
+  })()));
+  const clamp01 = (v) => Math.min(1, Math.max(0, v));
+  const countItem = (name) => (bot.inventory && bot.inventory.slots ? bot.inventory.slots : [])
+    .reduce((n, it, i) => n + (i >= 9 && it && it.name === name ? it.count || 1 : 0), 0);
+
+  /** Блок у себя в мире — как предсказание обычного клиента (сервер потом подтвердит или вернёт как было). */
+  function setLocalBlock(pos, name) {
+    const info = bot.registry.blocksByName[name];
+    if (!info) return;
+    selfUpdate = true;
+    try {
+      if (typeof bot._updateBlockState === 'function') bot._updateBlockState(pos, info.defaultState);
+      else if (bot.world && typeof bot.world.setBlockStateId === 'function') bot.world.setBlockStateId(pos, info.defaultState);
+    } catch (_) {
+      // не вышло — блок придёт от сервера
+    } finally {
+      selfUpdate = false;
+    }
+  }
+
+  /** Слушать ответы сервера о клетке pos (изменения мира не от своего предсказания). → { answered, stop() } */
+  function watchServerBlock(pos) {
+    const w = { answered: false };
+    const onUpdate = (oldBlock, newBlock) => {
+      const p = (newBlock && newBlock.position) || (oldBlock && oldBlock.position);
+      if (!selfUpdate && p && p.x === pos.x && p.y === pos.y && p.z === pos.z) w.answered = true;
+    };
+    bot.on('blockUpdate', onUpdate);
+    w.stop = () => bot.removeListener('blockUpdate', onUpdate);
+    return w;
+  }
+
+  /**
+   * После предсказания (блок у себя уже убран или поставлен) — дождаться ответа сервера о клетке (обычно — через
+   * пинг) и проверить, что там так, как ждали: отказал — сервер вернул как было.
+   */
+  async function waitServerBlock(pos, check, signal) {
+    const w = watchServerBlock(pos);
+    try {
+      for (let i = 0; i < CONFIRM_TICKS && !w.answered; i += 1) await inTick(() => {}, signal);
+    } finally {
+      w.stop();
+    }
+    return check(blockAt(pos));
+  }
+
+  /** Почему блок сейчас ломать нельзя (вода, лава рядом — потечёт; не ломается) или null — можно. */
+  function breakProblem(pos) {
+    const b = blockAt(pos);
+    if (!b) return 'мир не загружен';
+    if (isLiquid(b)) return /lava/.test(b.name) ? 'там лава' : 'там вода';
+    if (UNBREAKABLE_RE.test(b.name) || b.hardness === null || b.hardness < 0 || b.diggable === false) return `${b.name} не ломается`;
+    for (const d of FACE_VECTORS) if (isLiquid(blockAt(pos.plus(d)))) return 'рядом вода или лава';
+    return null;
+  }
+
+  /** Дождаться, пока бот встанет (или всплывёт) на высоте y. */
+  async function waitLanded(y, signal) {
+    for (let t = 0; t < 40; t += 1) {
+      const p = bot.entity.position;
+      if ((bot.entity.onGround || bot.entity.isInWater) && Math.abs(p.y - y) < 0.6) return;
+      await inTick(() => {}, signal);
+    }
+  }
+
+  /**
+   * Подняться на блок «столбом» (внутри действия): взгляд вниз, прыжок, в верхней точке — блок под себя по верхней
+   * грани опоры, как у человека. Блок сразу ставим и у себя, как обычный клиент: иначе, пока ответ сервера в пути,
+   * бот упал бы обратно в клетку, где у сервера уже блок, — и античит откатил бы его.
+   */
+  async function pillarStep(item, signal) {
+    await standStill(signal);
+    const p0 = bot.entity.position;
+    const feet = new Vec3(Math.floor(p0.x), Math.floor(p0.y + 0.25), Math.floor(p0.z));
+    const floorPos = feet.offset(0, -1, 0);
+    if (!solidAt(floorPos)) throw new ActionError('под ногами пусто — не на что поставить блок');
+    if (!isAir(blockAtOrThrow(feet))) throw new ActionError(`клетка ${fmt(feet)} занята — блок не поставить`);
+    if (solidAt(feet.offset(0, 2, 0))) throw new ActionError('над головой блок — подняться некуда');
+    if (item) await equipItem(item, signal);
+    const held = bot.heldItem;
+    if (!held || !bot.registry.blocksByName[held.name]) throw new ActionError(held ? `в руке не блок: ${held.name}` : 'нет блоков, чтобы подняться');
+    // В узкой шахте прыгать — из середины клетки (иначе коробка бота задевает потолок соседней).
+    const p = bot.entity.position;
+    if (Math.abs(p.x - (feet.x + 0.5)) > 0.15 || Math.abs(p.z - (feet.z + 0.5)) > 0.15) {
+      await followPath([feet], { range: 0.1 }, signal);
+      await standStill(signal);
+    }
+    await settleLook(bot.serverView.yaw, -Math.PI / 2, signal); // прямо вниз — как человек «столбом»
+    while (ticks() - lastUseTick < USE_DELAY_TICKS) await inTick(() => {}, signal);
+    let tick = 0;
+    let placedAt = -1;
+    const server = watchServerBlock(feet); // ответ сервера о клетке (своё предсказание не в счёт)
+    try {
+      await everyTick(() => {
+        tick += 1;
+        if (tick === 1) {
+          bot.setControlState('jump', true);
+          return undefined;
+        }
+        if (tick === 2) bot.setControlState('jump', false); // прыжок пошёл — клавишу отпустить
+        if (placedAt < 0) {
+          // И сервер, и мы знаем: ноги уже выше клетки — блок не заденет бота.
+          if (bot.serverView.position.y >= feet.y + 1 && bot.entity.position.y >= feet.y + 1) {
+            const hit = lookedAtBlock(BLOCK_REACH, floorPos);
+            if (!hit || !hit.position.equals(floorPos) || hit.face !== 1) throw new ActionError('не видно опоры под ногами');
+            const cursor = hit.point.minus(floorPos);
+            bot._client.write('block_place', {
+              hand: 0,
+              location: floorPos,
+              direction: 1,
+              cursorX: clamp01(cursor.x),
+              cursorY: 1,
+              cursorZ: clamp01(cursor.z),
+              insideBlock: false,
+              worldBorderHit: false,
+              sequence: nextSequence(),
+            });
+            swing();
+            lastUseTick = ticks();
+            setLocalBlock(feet, held.name);
+            placedAt = tick;
+          } else if (tick > 12 || (tick > 3 && bot.entity.onGround)) {
+            throw new ActionError('не допрыгнул: мешает потолок');
+          }
+          return undefined;
+        }
+        // Встал на новый блок — и сервер ответил, что в клетке (или прошла секунда).
+        const onTop = bot.entity.onGround && bot.entity.position.y >= feet.y + 0.99;
+        if (onTop && (server.answered || tick - placedAt > CONFIRM_TICKS)) return true;
+        if (bot.entity.onGround && bot.entity.position.y < feet.y + 0.5) throw new ActionError(`сервер не дал поставить блок в ${fmt(feet)}`, 'rejected');
+        if (tick - placedAt > 60) throw new ActionError('не встал на поставленный блок');
+        return undefined;
+      }, signal);
+    } finally {
+      server.stop();
+    }
+    if (!solidAt(feet)) throw new ActionError(`сервер не дал поставить блок в ${fmt(feet)}`, 'rejected');
+    return { position: feet, block: held.name };
+  }
+
+  /**
+   * Подняться «столбом»: прыжок и блок под себя, count раз.
+   * @param {object} [opts]
+   * @param {string} [opts.item]   какой блок ставить (по умолчанию — что в руке)
+   * @param {number} [opts.count=1]
+   */
+  function pillarUp({ item, count = 1 } = {}) {
+    return run('столбом вверх', async (signal) => {
+      for (let i = 0; i < count; i += 1) await pillarStep(item, signal);
+      return { placed: count, position: bot.entity.position.clone() };
+    });
+  }
+
+  /**
+   * Пройти путь с копанием (findPath с dig/place): сломать блоки шага, шагнуть, спрыгнуть, подняться столбом.
+   * false — мир не такой, как думали (открылась вода, обвалился гравий, под ногами пусто): искать путь заново.
+   */
+  async function walkDigPath(path, { tool, item, onDig }, signal) {
+    const plain = (s) => !s.dig && !s.place && s.move !== 'drop';
+    // Клетки шага свободны: в ногах — пусто или низкое (плита, ковёр), в голове — пусто.
+    const lowOrEmpty = (b) => !b || !b.shapes || !b.shapes.length || Math.max(...b.shapes.map((x) => x[4])) <= 0.6;
+    const free = (s) => lowOrEmpty(blockAt(s)) && !solidAt(s.offset(0, 1, 0));
+    let i = 0;
+    while (i < path.length) {
+      if (plain(path[i])) {
+        // Без копания — подряд, не останавливаясь; но только по клеткам, которые и правда свободны.
+        let j = i;
+        while (j < path.length && plain(path[j]) && free(path[j])) j += 1;
+        if (j === i) return false;
+        await followPath(path.slice(i, j), { range: 0.3 }, signal);
+        i = j;
+        continue;
       }
-      if (!(await waitBlockChange(pos, isAir, signal))) throw new ActionError(`сервер не дал сломать блок в ${fmt(pos)}`, 'rejected');
-      return { position: pos, face: FACE_NAMES[face], ticks: needTicks };
+      const step = path[i];
+      for (const c of step.dig || []) {
+        if (!solidAt(c)) {
+          if (isLiquid(blockAt(c))) return false;
+          continue; // уже пусто
+        }
+        if (breakProblem(c)) return false;
+        for (let k = 0; k < 4 && solidAt(c); k += 1) {
+          if (tool) await equipItem(tool, signal);
+          const was = blockAt(c);
+          await digBlock(c, signal);
+          if (onDig) onDig(was, c);
+          if (solidAt(c) && breakProblem(c)) return false; // сверху упало что-то, что ломать нельзя
+        }
+        if (solidAt(c)) return false;
+      }
+      // Куда встанем — там опора (а не открывшаяся пещера).
+      if (step.move !== 'pillar' && !solidAt(step.offset(0, -1, 0)) && !isLiquid(blockAt(step))) return false;
+      if (step.move === 'pillar') {
+        await pillarStep(item, signal);
+      } else if (step.move === 'drop') {
+        await waitLanded(step.y, signal);
+      } else {
+        await followPath([step], { range: step.move === 'down' ? 0.15 : 0.25 }, signal);
+        await waitLanded(step.y, signal);
+      }
+      const p = bot.entity.position;
+      if (Math.floor(p.x) !== step.x || Math.floor(p.z) !== step.z || Math.abs(p.y - step.y) > 0.6) return false;
+      i += 1;
+    }
+    return true;
+  }
+
+  /**
+   * Дойти, прокапываясь сквозь блоки (и поднимаясь «столбом», если есть блоки item): к точке target (с точностью
+   * range по горизонтали и vertical по высоте) или — reach — туда, откуда можно сломать блок target.
+   * @param {Vec3}     target
+   * @param {object}   [opts]
+   * @param {boolean}  [opts.reach=false]
+   * @param {string}   [opts.tool]      чем копать (кирка) — берётся в руку перед каждым блоком
+   * @param {string}   [opts.item]      чем строить столб (булыжник…)
+   * @param {Function} [opts.onDig]     (блок до слома, позиция) — после каждого сломанного
+   * Мир оказался не таким (вода, гравий, пещера) — путь заново; пути нет — ошибка с кодом no_path.
+   */
+  function digTo(target, { reach = false, range = 0.5, vertical = 0, tool = null, item = null, onDig = null, maxDistance = 48, maxNodes = 12000 } = {}) {
+    const goal = reach ? new Vec3(Math.floor(target.x), Math.floor(target.y), Math.floor(target.z)) : new Vec3(target.x, target.y, target.z);
+    return run('копать путь', async (signal) => {
+      let replans = 0;
+      let lastLeft = Infinity;
+      let noProgress = 0;
+      for (;;) {
+        const search = (weight, nodes) => findPath(blockAt, bot.entity.position, goal, {
+          dig: true, place: Boolean(item) && countItem(item) > 0, reach, range, vertical, maxDistance, maxNodes: nodes, weight, signal,
+        });
+        // Сначала — точный поиск (лучший путь: столбом там, где столбом дешевле) с небольшим запасом клеток; далеко
+        // сквозь камень он перебирал бы десятки тысяч — тогда жадный (вес 4): путь чуть хуже, зато сразу.
+        let res = await search(1.5, Math.min(FIRST_SEARCH_NODES, maxNodes));
+        if (!res.complete && res.nodes >= Math.min(FIRST_SEARCH_NODES, maxNodes)) res = await search(4, maxNodes);
+        if (res.complete && !res.path.length) return { arrived: true, position: bot.entity.position.clone() };
+        if (!res.path.length) throw new ActionError(`не прокопаться к ${fmt(goal)}: ${res.reason}`, 'no_path');
+        const ok = await walkDigPath(res.path, { tool, item, onDig }, signal);
+        if (ok && res.complete) return { arrived: true, position: bot.entity.position.clone() };
+        if (!ok && (replans += 1) > 8) throw new ActionError(`не прокопаться к ${fmt(goal)}: мир всё время не такой, как видно`, 'no_path');
+        if (ok) {
+          // Путь был только до края известного — дальше заново; ближе не становится — сдаёмся.
+          const p = bot.entity.position;
+          const left = Math.hypot(goal.x - p.x, goal.z - p.z) + Math.abs(goal.y - p.y);
+          noProgress = left > lastLeft - 0.5 ? noProgress + 1 : 0;
+          lastLeft = left;
+          if (noProgress >= 2) throw new ActionError(`не прокопаться к ${fmt(goal)}: ${res.reason || 'ближе не подойти'}`, 'no_path');
+        }
+      }
     });
   }
 
@@ -1002,6 +1276,8 @@ function inject(bot, { random, now }) {
     lookAt,
     walkTo,
     goTo,
+    digTo,
+    pillarUp,
     dig,
     place,
     plant,
