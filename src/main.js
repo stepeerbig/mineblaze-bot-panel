@@ -634,6 +634,11 @@ function createAi() {
       catalog: () => require('./bot/commands').catalog(), // список команд ботов — тот же, что #помощь
       startOllama,
       ollamaInstalled: () => ollamaLaunchers().length > 0,
+      // Ollama падает на видеокарте — дальше только процессор (галочка «Видеокарта» в настройках ИИ вернёт).
+      disableGpu: () => {
+        config.ollamaGpu = false;
+        saveConfig();
+      },
     },
   });
   agent.on('action', ({ text }) => {

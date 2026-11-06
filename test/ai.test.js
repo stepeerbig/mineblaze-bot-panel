@@ -362,7 +362,7 @@ test('Ollama: родной API — окно контекста, инструме
   assert.deepEqual(hist[hist.length - 1], { role: 'tool', tool_name: 'run_command', content: 'Farm01: да — #квесты взять: готово у Farm01\nFarm02: да — #квесты взять: готово у Farm02' });
   assert.deepEqual(chat[1].body.messages[chat[1].body.messages.length - 1].tool_name, 'list_bots');
   assert.deepEqual(commands.map((c) => [c.ids, c.line]), [[null, '#квесты взять']]);
-  assert.ok(events.some(([n, p]) => n === 'progress' && /^ИИ думает… Первый ответ на процессоре/.test(p.text)));
+  assert.ok(events.some(([n, p]) => n === 'progress' && /^ИИ думает… Первое задание на процессоре/.test(p.text)));
   assert.ok(events.some(([n, p]) => n === 'progress' && p.text === 'ИИ думает… (ход 2)'));
 });
 
@@ -417,6 +417,41 @@ test('Ollama не запущена — панель запускает её; м�
   assert.ok(progress.includes('Скачиваю модель qwen3:4b-instruct: 100 % (2,5 из 2,5 ГБ)'), progress.join('\n'));
 });
 
+test('Ollama: скачивание модели — скорость и сколько осталось (часы подменены)', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1000000 });
+  const total = 2500000000;
+  // Скачано через каждые 10 с. Поток просит следующую порцию, когда предыдущую забрали, но ещё не разобрали, —
+  // часы сдвигаются перед каждой следующей порцией: строка с 0 разбирается на 10-й секунде, со 100 МБ — на 20-й…
+  const steps = [0, 100e6, 200e6, 1250e6];
+  const enc = new TextEncoder();
+  const fake = fakeOllama({
+    models: {},
+    chats: [osay('Готово.')],
+    pull: ({ body, state }) => {
+      state.models[body.model] = ['completion', 'tools'];
+      let i = 0;
+      return new Response(new ReadableStream({
+        pull(controller) {
+          if (i > 0) t.mock.timers.tick(10000);
+          if (i < steps.length) {
+            controller.enqueue(enc.encode(`${JSON.stringify({ status: 'pulling 85e4', digest: 'sha256:85e4', total, completed: steps[i] })}\n`));
+          } else {
+            controller.enqueue(enc.encode('{"status":"success"}\n'));
+            controller.close();
+          }
+          i += 1;
+        },
+      }), { status: 200 });
+    },
+  });
+  const { agent, events } = makeLocal(fake);
+  assert.equal((await agent.run('привет')).text, 'Готово.');
+  const progress = events.filter(([n]) => n === 'progress').map(([, p]) => p.text);
+  assert.ok(progress.includes('Скачиваю модель qwen3:4b-instruct: 0 % (0,0 из 2,5 ГБ)'), progress.join('\n'));
+  assert.ok(progress.includes('Скачиваю модель qwen3:4b-instruct: 4 % (0,1 из 2,5 ГБ, 10,0 МБ/с, осталось ≈ 4 мин)'), progress.join('\n'));
+  assert.ok(progress.includes('Скачиваю модель qwen3:4b-instruct: 50 % (1,3 из 2,5 ГБ, 41,7 МБ/с, осталось ≈ 30 с)'), progress.join('\n'));
+});
+
 test('Ollama: не установлена, на другом ПК не отвечает, модель без инструментов, нет памяти — понятные причины', async () => {
   const none = makeEnv();
   none.env.startOllama = async () => false;
@@ -465,7 +500,7 @@ test('Ollama: состояние для панели и список модел�
   const off = makeLocal(fakeOllama({ running: false }));
   off.env.ollamaInstalled = () => true;
   assert.deepEqual(await off.agent.status(), {
-    provider: 'ollama', model: 'qwen3:4b-instruct', url: 'http://127.0.0.1:11434', local: true, running: false, installed: true,
+    provider: 'ollama', model: 'qwen3:4b-instruct', url: 'http://127.0.0.1:11434', local: true, gpu: true, running: false, installed: true,
   });
 
   const on = makeLocal(fakeOllama({ models: { 'qwen3:latest': ['completion', 'tools'] } }), { cfg: { ollamaModel: 'qwen3' } });
@@ -478,6 +513,32 @@ test('Ollama: состояние для панели и список модел�
 
   const online = makeAgent([], { cfg: { aiKey: '' } });
   assert.equal((await online.agent.status()).keyMissing, true, 'интернет-сервис без ключа');
+});
+
+test('Ollama упала на видеокарте (старый драйвер) — тот же ход на процессоре, панель запоминает', async () => {
+  // Так падала Ollama 0.40 на GTX 1060 с драйвером 560.94.
+  const crash = 'llama-server process has terminated: exit status 0xc0000409: The system detected an overrun of a stack-based buffer in this application.: CUDA error: the provided PTX was compiled with an unsupported toolchain.';
+  const fake = fakeOllama({ chats: [() => json({ error: crash }, 500), osay('', [ocall('list_bots')]), osay('В сети двое.')] });
+  const env = makeEnv();
+  let disabled = 0;
+  env.env.disableGpu = () => {
+    disabled += 1;
+  };
+  const { agent, events } = makeLocal(fake, { env });
+  const result = await agent.run('сколько ботов в сети?');
+  assert.deepEqual([result.text, result.requests], ['В сети двое.', 2], 'упавший ход — не ход');
+  const chats = fake.calls.filter((c) => c.path === '/api/chat');
+  assert.deepEqual(chats.map((c) => c.body.options.num_gpu), [undefined, 0, 0], 'сначала — как решит Ollama, потом только процессор');
+  assert.equal(disabled, 1);
+  assert.ok(events.some(([n, p]) => n === 'action' && /^видеокарта не подошла Ollama/.test(p.text)));
+
+  // Видеокарта выключена в настройках — сразу процессор; другие ошибки — без повтора.
+  const cpu = makeLocal(fakeOllama({ chats: [osay('Ок')] }), { cfg: { ollamaGpu: false } });
+  await cpu.agent.run('привет');
+  assert.equal(cpu.agent.getConfig().ollamaGpu, false);
+  const noRetry = makeLocal(fakeOllama({ chats: [() => json({ error: 'model requires more system memory (5.1 GiB) than is available (3.2 GiB)' }, 500)] }));
+  assert.equal(await noRetry.agent.run('привет'), null);
+  assert.match(errorOf(noRetry.events), /^не хватает памяти/);
 });
 
 test('Ollama: длинная история — старые ответы ботов сокращаются, подсказка, задание и два последних ответа целы', () => {

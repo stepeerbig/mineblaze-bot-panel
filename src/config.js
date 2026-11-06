@@ -24,6 +24,7 @@ const DEFAULT_CONFIG = Object.freeze({
   aiProvider: 'ollama',
   ollamaUrl: 'http://127.0.0.1:11434',
   ollamaModel: 'qwen3:4b-instruct',
+  ollamaGpu: true, // часть модели — на видеокарту; Ollama падает на ней (старый драйвер) — панель сама выключит
   aiBaseUrl: 'https://openrouter.ai/api/v1', // интернет-сервис; ключ хранится зашифрованным
   aiKey: '',
   aiModel: 'nvidia/nemotron-3-ultra-550b-a55b:free',
@@ -97,6 +98,7 @@ function sanitize(src) {
   if (typeof src.aiKey === 'string') out.aiKey = src.aiKey.replace(/\s+/g, '').slice(0, 300);
   if (typeof src.aiModel === 'string') out.aiModel = src.aiModel.trim().replace(/\s+/g, '').slice(0, 200) || DEFAULT_CONFIG.aiModel;
   if (AI_PROVIDERS.includes(src.aiProvider)) out.aiProvider = src.aiProvider;
+  if (typeof src.ollamaGpu === 'boolean') out.ollamaGpu = src.ollamaGpu;
   if (typeof src.ollamaUrl === 'string') {
     const url = src.ollamaUrl.trim().replace(/\/+$/, '');
     if (!url) out.ollamaUrl = DEFAULT_CONFIG.ollamaUrl;

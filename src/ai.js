@@ -42,6 +42,8 @@ const OLLAMA_START_MS = 30 * 1000; // запустили Ollama — ждать, 
 const PULL_STALL_MS = 2 * 60 * 1000; // скачивание модели без единого байта столько — застряло
 const LOCAL_URL_RE = /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i; // этот ПК: без ключа
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
+// Ollama не смогла запустить модель на видеокарте (а не «нет памяти» и не «нет модели»).
+const GPU_CRASH_RE = /CUDA|PTX|cublas|ggml-cuda|ROCm|HIP error|vulkan|GPU|llama-server process has terminated|exit status 0xc0000409/i;
 const SERVICE = { timeout: 'сервис ИИ не ответил', offline: 'нет связи с сервисом ИИ' };
 const OLLAMA = { timeout: 'Ollama не ответила', offline: 'нет связи с Ollama' };
 
@@ -119,12 +121,16 @@ function systemPrompt(catalog) {
     '- Обычный текст в чат сервера не пиши. Игроков не атакуй. Деньги ботов не трать без нужды (#квесты купить — только для ' +
       'заданий «Купите…»). Команды денег, входа и личных сообщений тебе недоступны.',
     '- Если задание непонятно, опасно или для него нет команды — не выдумывай, а скажи, чего не хватает.',
-    '- В конце — короткий отчёт по-русски: что сделано, что нет и почему, что нужно от пользователя. Простым текстом, ' +
-      'без Markdown (без **, # и таблиц); списки — строками с «- ».',
+    '- В конце — итог по-русски, коротко: до 8 строк. Ответы ботов пользователь и так видит в консоли — не ' +
+      'переписывай их, напиши вывод, строго по ответам, без догадок. Ботов по одному не перечисляй: одинаковое у ' +
+      'многих — одной строкой («у всех…», «у 65 из 70…»), отдельно — только отличия и неудачи с причиной. Нужно ' +
+      'что-то от пользователя — одной строкой. Простым текстом, без Markdown (без **, # и таблиц); списки — «- ».',
     'Сервер MineBlaze:',
     '- NPC с заданиями (Фермер, Алхимик, Оружейник) стоят у /warp ah. #квесты (все виды) и #купи сами телепортируют бота ' +
       'туда, если NPC не видно, — отдельный /warp ah не нужен. После телепорта ждать (wait) не нужно.',
     '- Ответы сервера начинаются с «| ». «Вы не можете использовать команды во время PvP» — бот в бою, подожди ~30 с.',
+    '- В списке заданий (#квесты) «взято» — задание взято, но ещё не выполнено; «не взято» — его надо взять ' +
+      '(#квесты взять); выполнено — когда счёт полный (224/224) или так и написано.',
     'Команды ботов:',
     commands,
   ].join('\n');
@@ -298,7 +304,8 @@ class AiAgent extends EventEmitter {
         if (run.abort.signal.aborted) return this._finish(run, 'Остановлено', true);
         if (local) fitHistory(messages, OLLAMA_HISTORY_CHARS);
         this.emit('progress', {
-          text: local && step === 0 ? 'ИИ думает… Первый ответ на процессоре — до пары минут: модель загружается в память' : `ИИ думает… (ход ${step + 1})`,
+          // На процессоре (Ryzen 5 2600) подсказка с командами читается ≈ 2 мин; дальше она в памяти Ollama — ход ≈ 10–15 с.
+          text: local && step === 0 ? 'ИИ думает… Первое задание на процессоре — до 2–3 минут (модель читает список команд), следующие — быстрее' : `ИИ думает… (ход ${step + 1})`,
         });
         const reply = local ? await this._chatOllama(messages, run) : await this._chatOpenAi(messages, run);
         messages.push(reply.message);
@@ -358,7 +365,7 @@ class AiAgent extends EventEmitter {
   async status() {
     const cfg = this._config();
     if (cfg.provider !== 'ollama') return { provider: cfg.provider, model: cfg.model, keyMissing: !cfg.key && !LOCAL_URL_RE.test(cfg.url) };
-    const base = { provider: 'ollama', model: cfg.model, url: cfg.url, local: LOCAL_URL_RE.test(cfg.url) };
+    const base = { provider: 'ollama', model: cfg.model, url: cfg.url, local: LOCAL_URL_RE.test(cfg.url), gpu: cfg.gpu };
     const version = await this._ollamaVersion(cfg.url, null, 2000);
     if (!version) return { ...base, running: false, installed: Boolean(this.env.ollamaInstalled && this.env.ollamaInstalled()) };
     let models = [];
@@ -378,7 +385,7 @@ class AiAgent extends EventEmitter {
     if (c.aiProvider === 'openai') {
       return { provider: 'openai', url: trimUrl(c.aiBaseUrl) || DEFAULT_BASE_URL, key: String(c.aiKey || ''), model: String(c.aiModel || DEFAULT_MODEL) };
     }
-    return { provider: 'ollama', url: trimUrl(c.ollamaUrl) || OLLAMA_URL, key: '', model: String(c.ollamaModel || OLLAMA_MODEL) };
+    return { provider: 'ollama', url: trimUrl(c.ollamaUrl) || OLLAMA_URL, key: '', model: String(c.ollamaModel || OLLAMA_MODEL), gpu: c.ollamaGpu !== false };
   }
 
   _headers(cfg) {
@@ -460,9 +467,21 @@ class AiAgent extends EventEmitter {
       options: { num_ctx: OLLAMA_CTX, num_predict: OLLAMA_PREDICT, temperature: 0.2 },
     };
     if (run.think) body.think = false;
+    if (!run.cfg.gpu) body.options.num_gpu = 0; // только процессор
     const res = await this._send(`${url}/api/chat`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) },
       { run, timeoutMs: LOCAL_TIMEOUT_MS, who: OLLAMA });
-    if (!res.ok) throw new Error(ollamaProblem(res.status, await res.text().catch(() => ''), model));
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      // Ollama упала, загружая модель на видеокарту (например, драйвер NVIDIA старше её библиотек CUDA:
+      // «PTX was compiled with an unsupported toolchain»), — тот же ход на процессоре, и дальше только так.
+      if (run.cfg.gpu && res.status >= 500 && GPU_CRASH_RE.test(text)) {
+        run.cfg.gpu = false;
+        this.emit('action', { text: 'видеокарта не подошла Ollama (скорее всего, старый драйвер NVIDIA) — считаю на процессоре; включить снова — галочка «Видеокарта» в настройках ИИ' });
+        if (this.env.disableGpu) this.env.disableGpu();
+        return this._chatOllama(messages, run);
+      }
+      throw new Error(ollamaProblem(res.status, text, model));
+    }
     const data = await res.json();
     run.requests += 1;
     if (data && data.error) throw new Error(ollamaProblem(0, JSON.stringify(data), model));
@@ -563,6 +582,17 @@ class AiAgent extends EventEmitter {
     let quarter = 0;
     let shownAt = 0;
     let success = false;
+    let first = null; // { at, got } — с чего считать скорость (докачка начинается не с нуля)
+    /** «, 1,0 МБ/с, осталось ≈ 35 мин» — когда скорость уже понятна (≥ 5 с скачивания). */
+    const pace = (got, total) => {
+      if (!first) first = { at: Date.now(), got };
+      const s = (Date.now() - first.at) / 1000;
+      const speed = s >= 5 ? (got - first.got) / s : 0;
+      if (!speed || got >= total) return '';
+      const left = (total - got) / speed;
+      const eta = left >= 120 ? `${Math.round(left / 60)} мин` : `${Math.max(1, Math.round(left))} с`;
+      return `, ${(speed / 1e6).toFixed(1).replace('.', ',')} МБ/с, осталось ≈ ${eta}`;
+    };
     const onEvent = (line) => {
       let ev;
       try {
@@ -582,9 +612,10 @@ class AiAgent extends EventEmitter {
         got += l.completed;
       }
       const pct = Math.floor((got / total) * 100);
+      const tail = pace(got, total);
       if (Date.now() - shownAt >= 1000 || pct >= 100) {
         shownAt = Date.now();
-        this.emit('progress', { text: `Скачиваю модель ${model}: ${pct} % (${gb(got)} из ${gb(total)} ГБ)` });
+        this.emit('progress', { text: `Скачиваю модель ${model}: ${pct} % (${gb(got)} из ${gb(total)} ГБ${tail})` });
       }
       const q = Math.floor(pct / 25);
       if (q > quarter && q < 4) {

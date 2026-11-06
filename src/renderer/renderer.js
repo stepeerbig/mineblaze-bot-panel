@@ -50,6 +50,7 @@ const el = {
   ollamaModel: $('ollamaModel'),
   ollamaModels: $('ollamaModels'),
   ollamaUrl: $('ollamaUrl'),
+  ollamaGpu: $('ollamaGpu'),
   openaiFields: $('openaiFields'),
   aiKey: $('aiKey'),
   showAiKey: $('showAiKey'),
@@ -432,6 +433,7 @@ function fillForm(cfg) {
     if (document.activeElement !== el[key]) el[key].value = cfg[key] || '';
   }
   el.aiProvider.value = cfg.aiProvider === 'openai' ? 'openai' : 'ollama';
+  el.ollamaGpu.checked = cfg.ollamaGpu !== false;
   setAutoReconnectUi(cfg.autoReconnect);
   updateLabels();
   updateBotsTag();
@@ -453,6 +455,7 @@ const readAiForm = () => ({
   aiProvider: el.aiProvider.value,
   ollamaModel: el.ollamaModel.value,
   ollamaUrl: el.ollamaUrl.value,
+  ollamaGpu: el.ollamaGpu.checked,
   aiKey: el.aiKey.value,
   aiModel: el.aiModel.value,
   aiBaseUrl: el.aiBaseUrl.value,
@@ -493,8 +496,9 @@ function showOllamaStatus(s) {
   let kind = '';
   let install = false;
   if (s && s.ok && s.provider === 'ollama') {
+    if (typeof s.gpu === 'boolean') el.ollamaGpu.checked = s.gpu; // панель могла выключить видеокарту сама
     if (s.running && s.hasModel) {
-      text = `Ollama ${s.version} работает, модель ${s.model} скачана — всё готово.`;
+      text = `Ollama ${s.version} работает, модель ${s.model} скачана — всё готово.${s.gpu ? '' : ' Считает на процессоре.'}`;
       kind = 'ok';
     } else if (s.running) {
       text = `Ollama ${s.version} работает. Модели ${s.model} ещё нет — панель скачает её сама при первом задании (один раз).`;
@@ -726,13 +730,13 @@ el.aiStop.addEventListener('click', async () => {
 });
 
 // Сервис, модель, адрес и ключ сохраняются сразу (ключ — зашифрованным).
-for (const field of [el.aiProvider, el.ollamaModel, el.ollamaUrl, el.aiKey, el.aiModel, el.aiBaseUrl]) {
+for (const field of [el.aiProvider, el.ollamaModel, el.ollamaUrl, el.ollamaGpu, el.aiKey, el.aiModel, el.aiBaseUrl]) {
   field.addEventListener('change', async () => {
     const before = `${el.aiBaseUrl.value}\n${el.aiKey.value}`;
     const cfg = await bridge.saveConfig(readAiForm());
     fillForm(cfg);
     if (`${el.aiBaseUrl.value}\n${el.aiKey.value}` !== before) aiModelsLoaded = false; // другой сервис — другие модели
-    if (field === el.aiProvider || field === el.ollamaModel || field === el.ollamaUrl) refreshAiStatus();
+    if ([el.aiProvider, el.ollamaModel, el.ollamaUrl, el.ollamaGpu].includes(field)) refreshAiStatus();
   });
 }
 el.aiKey.addEventListener('input', updateAiSetupTag);
