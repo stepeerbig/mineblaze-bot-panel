@@ -2104,6 +2104,192 @@ async function cmdBreed({ bot, args: allArgs, words = [] }) {
   return { ok: r.pairs > 0, code: r.pairs ? undefined : r.noFood.length ? 'no_food' : 'no_animals', message: lines, data: { pairs: r.pairs, fed: r.fed, noFood: r.noFood, few: r.few, home } };
 }
 
+// ---------- добыча руды: где искать, лестница вниз, туннель с рудой в стенах ----------
+
+// Руды 1.21: блоки, что из них выпадает, лучшая высота и где искать (распределение руд в 1.18+).
+const ORES = {
+  coal: { name: 'уголь', blocks: ['coal_ore', 'deepslate_coal_ore'], item: 'coal', best: 96, tier: 0, where: 'везде выше Y 0, больше всего — Y ≈ 96 и в горах' },
+  copper: { name: 'медь', blocks: ['copper_ore', 'deepslate_copper_ore'], item: 'raw_copper', best: 48, tier: 1, where: 'Y −16…112, больше всего — Y ≈ 48 и в пещерах с капельником' },
+  iron: { name: 'железо', blocks: ['iron_ore', 'deepslate_iron_ore'], item: 'raw_iron', best: 16, tier: 1, where: 'Y −64…72, больше всего — Y ≈ 16 (и высоко в горах, Y ≈ 232)' },
+  lapis: { name: 'лазурит', blocks: ['lapis_ore', 'deepslate_lapis_ore'], item: 'lapis_lazuli', best: 0, tier: 1, where: 'Y −64…64, больше всего — Y ≈ 0' },
+  gold: { name: 'золото', blocks: ['gold_ore', 'deepslate_gold_ore'], item: 'raw_gold', best: -16, tier: 2, where: 'Y −64…32, больше всего — Y ≈ −16; в пустошах (badlands) — и у поверхности' },
+  redstone: { name: 'редстоун', blocks: ['redstone_ore', 'deepslate_redstone_ore'], item: 'redstone', best: -58, tier: 2, where: 'Y −64…15, больше всего — Y ≈ −58' },
+  diamond: { name: 'алмазы', blocks: ['diamond_ore', 'deepslate_diamond_ore'], item: 'diamond', best: -58, tier: 2, where: 'Y −64…16, больше всего — Y ≈ −58' },
+  emerald: { name: 'изумруды', blocks: ['emerald_ore', 'deepslate_emerald_ore'], item: 'emerald', best: 232, tier: 2, where: 'только в горах, Y −16…320, больше всего — Y ≈ 232' },
+  quartz: { name: 'кварц', blocks: ['nether_quartz_ore'], item: 'quartz', best: 15, tier: 0, nether: true, where: 'Незер, Y 10…117' },
+  nether_gold: { name: 'золото Незера', blocks: ['nether_gold_ore'], item: 'gold_nugget', best: 15, tier: 0, nether: true, where: 'Незер, Y 10…117' },
+  debris: { name: 'древние обломки', blocks: ['ancient_debris'], item: 'ancient_debris', best: 15, tier: 3, nether: true, where: 'Незер, Y 8…22, больше всего — Y ≈ 15' },
+};
+const ORE_WORDS = [
+  [/(?:^|\s)(?:незерск\S*\s+золот|золот\S*\s+незер)/, 'nether_gold'], [/(?:^|\s)(?:древн|обломк)/, 'debris'],
+  [/(?:^|\s)(?:угол|угл[яеиь]|coal)/, 'coal'], [/(?:^|\s)(?:мед[ьи]|copper)/, 'copper'], [/(?:^|\s)(?:желез|iron)/, 'iron'],
+  [/(?:^|\s)(?:лазурит|lapis)/, 'lapis'], [/(?:^|\s)(?:золот|gold)/, 'gold'], [/(?:^|\s)(?:редстоун|красн\S*\s+пыл|redstone)/, 'redstone'],
+  [/(?:^|\s)(?:алмаз|diamond)/, 'diamond'], [/(?:^|\s)(?:изумруд|emerald)/, 'emerald'], [/(?:^|\s)(?:кварц|quartz)/, 'quartz'],
+];
+const PICK_TIERS = { wooden_pickaxe: 0, golden_pickaxe: 0, stone_pickaxe: 1, iron_pickaxe: 2, diamond_pickaxe: 3, netherite_pickaxe: 4 };
+const TIER_NAMES = ['деревянная', 'каменная', 'железная', 'алмазная'];
+const MINE_MAX_STEPS = 96; // шагов туннеля за раз
+const MINE_MAX_MS = 15 * 60 * 1000;
+const LIQUID_RE = /^(?:lava|water|flowing_lava|flowing_water)$/;
+const UNBREAKABLE_RE = /^(?:bedrock|barrier|end_portal_frame|reinforced_deepslate)$/;
+
+const oreOf = (text) => {
+  const t = ` ${norm(text)}`;
+  const hit = ORE_WORDS.find(([re]) => re.test(t));
+  return hit ? hit[1] : null;
+};
+const posKey = (p) => `${p.x},${p.y},${p.z}`;
+const isAirBlock = (b) => !b || /^(?:cave_|void_)?air$/.test(b.name);
+const SIDES = [new Vec3(1, 0, 0), new Vec3(-1, 0, 0), new Vec3(0, 1, 0), new Vec3(0, -1, 0), new Vec3(0, 0, 1), new Vec3(0, 0, -1)];
+
+/** Рядом с блоком вода или лава: сломаешь — потечёт на бота. */
+const nearLiquid = (bot, pos) => SIDES.some((d) => {
+  const b = bot.blockAt(pos.plus(d));
+  return b && LIQUID_RE.test(b.name);
+});
+/** Открытая руда: хоть одна сторона — воздух (её видно, до неё можно дотянуться, не копая вслепую). */
+const exposed = (bot, pos) => SIDES.some((d) => isAirBlock(bot.blockAt(pos.plus(d))));
+
+/**
+ * Добыть руду: сначала открытую рядом, потом — лестницей вниз до лучшей высоты (выше — не поднимается) и туннелем
+ * вперёд, выкапывая руду в стенах. Вода и лава рядом, обрыв впереди, бедрок, полный инвентарь — стоп.
+ * → { mined, steps, note, y }
+ */
+async function mine(bot, ore, want) {
+  const ids = new Set(ore.blocks);
+  const skip = new Set();
+  const started = Date.now();
+  let mined = 0;
+  let steps = 0;
+  let note = '';
+  const enough = () => mined >= want || Boolean(note);
+  const digSafe = async (pos) => {
+    const b = bot.blockAt(pos);
+    if (isAirBlock(b)) return true;
+    if (LIQUID_RE.test(b.name)) {
+      note = `впереди ${b.name === 'lava' ? 'лава' : 'вода'}`;
+      return false;
+    }
+    if (UNBREAKABLE_RE.test(b.name)) {
+      note = `впереди ${b.name} — не ломается`;
+      return false;
+    }
+    if (nearLiquid(bot, pos)) {
+      note = 'рядом вода или лава — дальше не копаю';
+      return false;
+    }
+    for (let attempt = 0; attempt < 4 && !isAirBlock(bot.blockAt(pos)); attempt += 1) {
+      const isOre = ids.has(bot.blockAt(pos).name);
+      try {
+        await bot.actions.dig(pos); // гравий и песок сверху падают — тогда копать ещё раз
+        if (isOre) mined += 1; // руда прямо на пути туннеля — тоже добыча
+      } catch (err) {
+        if (isStopped(err)) throw err;
+        note = `не смог сломать ${bot.blockAt(pos) ? bot.blockAt(pos).name : 'блок'}: ${err.message}`;
+        return false;
+      }
+    }
+    return isAirBlock(bot.blockAt(pos));
+  };
+  const mineVisible = async (radius) => {
+    for (;;) {
+      if (enough()) return;
+      if (freeSlots(bot) === 0) {
+        note = 'инвентарь полон';
+        return;
+      }
+      if (Date.now() - started > MINE_MAX_MS) {
+        note = 'прошло 15 мин — на один раз хватит';
+        return;
+      }
+      const next = scanBlocks(bot, radius, (b) => ids.has(b.name)).find((x) => !skip.has(posKey(x.pos)) && exposed(bot, x.pos));
+      if (!next) return;
+      skip.add(posKey(next.pos));
+      if (nearLiquid(bot, next.pos)) continue;
+      if (!(await comeClose(bot, next.pos))) continue;
+      try {
+        await bot.actions.dig(next.pos);
+        mined += 1;
+      } catch (err) {
+        if (isStopped(err)) throw err;
+      }
+    }
+  };
+  await mineVisible(16);
+  // Мало — туннель: куда смотрит бот (по ближайшей оси), вниз лестницей до лучшей высоты.
+  const yaw = bot.entity.yaw;
+  const dir = Math.abs(Math.sin(yaw)) > Math.abs(Math.cos(yaw)) ? new Vec3(-Math.sign(Math.sin(yaw)), 0, 0) : new Vec3(0, 0, -Math.sign(Math.cos(yaw)));
+  while (!enough() && steps < MINE_MAX_STEPS) {
+    if (freeSlots(bot) === 0) {
+      note = 'инвентарь полон';
+      break;
+    }
+    if (Date.now() - started > MINE_MAX_MS) {
+      note = 'прошло 15 мин — на один раз хватит';
+      break;
+    }
+    const feet = bot.entity.position.floored();
+    const down = feet.y > ore.best + 1 && feet.y > -60;
+    const ahead = feet.plus(dir);
+    const to = down ? ahead.offset(0, -1, 0) : ahead;
+    // Под новым местом должна быть опора — в пещеру или пропасть не шагаем.
+    const floor = bot.blockAt(to.offset(0, -1, 0));
+    if (isAirBlock(floor) || (floor && LIQUID_RE.test(floor.name))) {
+      note = 'впереди обрыв или пустота — дальше не иду';
+      break;
+    }
+    const cells = down ? [ahead.offset(0, 1, 0), ahead, to] : [ahead.offset(0, 1, 0), ahead];
+    let clear = true;
+    for (const c of cells) {
+      if (!(await digSafe(c))) {
+        clear = false;
+        break;
+      }
+    }
+    if (!clear) break;
+    try {
+      await bot.actions.walkTo(new Vec3(to.x + 0.5, to.y, to.z + 0.5), { range: 0.3 });
+    } catch (err) {
+      if (isStopped(err)) throw err;
+      note = `не прошёл дальше: ${err.message}`;
+      break;
+    }
+    steps += 1;
+    await mineVisible(4); // руда в стенах туннеля
+  }
+  if (!note && mined < want && steps >= MINE_MAX_STEPS) note = `туннель ${MINE_MAX_STEPS} блоков — на один раз хватит`;
+  return { mined, steps, note, y: Math.floor(bot.entity.position.y) };
+}
+
+/** «#добудь железо», «#добудь алмазы 5», «#добудь уголь 64 дом шахта» — руда: где её искать, кирка, добыча. */
+async function cmdMine({ bot, args: allArgs, words = [] }) {
+  const { home, args } = homeArg(allArgs, words, '#добудь редстоун 64 дом шахта');
+  const num = args.find((a) => /^\d+$/.test(a));
+  const want = num ? Math.max(1, Math.min(512, parseInt(num, 10))) : 32;
+  const text = args.filter((a) => a !== num).join(' ');
+  const key = oreOf(text);
+  if (!key) {
+    throw new CommandError(`какую руду? Например: #добудь железо 20. Знаю: ${Object.values(ORES).map((o) => o.name).join(', ')}`);
+  }
+  const ore = ORES[key];
+  const picks = inventoryItems(bot).filter((it) => PICK_TIERS[it.name] !== undefined).sort((a, b) => PICK_TIERS[b.name] - PICK_TIERS[a.name]);
+  if (!picks.length || PICK_TIERS[picks[0].name] < ore.tier) {
+    throw new CommandError(`для «${ore.name}» нужна кирка не хуже: ${TIER_NAMES[ore.tier]}${picks.length ? ` (есть ${picks[0].name})` : ' (кирки нет)'}`);
+  }
+  if (home) await teleportBy(bot, `/home ${home}`);
+  const dim = bot.game && bot.game.dimension ? String(bot.game.dimension) : '';
+  if (ore.nether && dim && !/nether/.test(dim)) throw new CommandError(`«${ore.name}» — только в Незере (${ore.where}); бот сейчас не там`);
+  await bot.actions.equip(picks[0].name);
+  const r = await mine(bot, ore, want);
+  const lines = [r.mined
+    ? `Добыл: ${ore.name} — блоков руды ${r.mined} (выпадает ${ore.item})`
+    : `Руды «${ore.name}» не нашёл`];
+  if (r.steps) lines.push(`Туннель: ${r.steps} блоков, бот на высоте Y ${r.y}`);
+  if (r.note) lines.push(`Остановился: ${r.note}`);
+  if (r.mined < want) lines.push(`Где искать: ${ore.where}`);
+  return { ok: r.mined > 0, code: r.mined ? undefined : 'not_found', message: lines, data: { ore: key, item: ore.item, mined: r.mined, steps: r.steps, y: r.y, note: r.note } };
+}
+
 // ---------- пинг ----------
 
 const PING_SAMPLES = 3;
@@ -2284,6 +2470,15 @@ const COMMANDS = [
     about: 'собрать спелое в радиусе (по умолчанию 16): пшеница, морковь, картофель, свёкла, незерский нарост, какао, ягоды, ' +
       'арбузы, тыквы, тростник, кактус, бамбук — подойти, сломать, подобрать выпавшее и посадить семена обратно; «дом ферма» — сначала /home ферма',
     run: cmdHarvest,
+  },
+  {
+    name: 'добудь',
+    aliases: ['добыть', 'шахта', 'mine'],
+    usage: ['#добудь железо', '#добудь алмазы 5', '#добудь уголь 64'],
+    about: 'добыть руду (уголь, медь, железо, лазурит, золото, редстоун, алмазы, изумруды; в Незере — кварц, золото, древние обломки): ' +
+      'сначала открытую рядом, потом лестницей вниз до лучшей высоты (железо Y≈16, алмазы и редстоун Y≈−58…) и туннелем туда, куда смотрит, ' +
+      'с рудой в стенах; нужна подходящая кирка; вода и лава рядом, обрыв, полный инвентарь — стоп; не нашёл — скажет, где искать',
+    run: cmdMine,
   },
   {
     name: 'разведи',

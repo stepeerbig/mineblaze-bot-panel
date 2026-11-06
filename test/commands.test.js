@@ -1070,6 +1070,33 @@ test('команды: #разведи — пары взрослых (малыш�
   assert.match((await s.run('#разведи драконов')).message, /кого разводить\?/);
 });
 
+test('команды: #добудь — открытая руда рядом; мало — лестницей вниз к лучшей высоте и туннелем, руда в стенах; кирка; где искать', async () => {
+  const s = setup({ inventory: [['iron_pickaxe', 1]] });
+  s.world.set(new Vec3(3, 63, 0), 'iron_ore'); // в полу, сверху воздух — видна
+  // Добыв её, бот смотрит на восток (+x) — туда и пойдёт лестница; руда — в стене второй ступеньки.
+  s.world.set(new Vec3(2, 62, 1), 'iron_ore');
+  const r = await s.run('#добудь железо 2', 300000);
+  assert.equal(r.ok, true, [].concat(r.message).join('\n'));
+  assert.equal(r.data.mined, 2);
+  assert.equal(s.world.get(new Vec3(3, 63, 0)), 'air');
+  assert.equal(s.world.get(new Vec3(2, 62, 1)), 'air');
+  assert.ok(r.data.steps >= 2 && r.data.y < 64, `спустился лестницей: шагов ${r.data.steps}, Y ${r.data.y}`);
+  assert.equal(s.world.get(new Vec3(1, 63, 0)), 'air', 'ступенька');
+  assert.equal(s.bot.heldItem && s.bot.heldItem.name, 'iron_pickaxe');
+
+  // Вода рядом со следующей ступенькой — не копает туда.
+  const w = setup({ inventory: [['stone_pickaxe', 1]] });
+  w.world.set(new Vec3(0, 63, 2), 'water');
+  const wet = await w.run('#добудь железо 1', 120000);
+  assert.equal(wet.ok, false);
+  assert.match([].concat(wet.message).join('\n'), /Остановился: рядом вода или лава/);
+  assert.match([].concat(wet.message).join('\n'), /Где искать: Y −64…72, больше всего — Y ≈ 16/);
+
+  const weak = setup({ inventory: [['wooden_pickaxe', 1]] });
+  assert.match((await weak.run('#добудь алмазы')).message, /нужна кирка не хуже: железная \(есть wooden_pickaxe\)/);
+  assert.match((await weak.run('#добудь пирожки')).message, /какую руду\? .*Знаю: уголь, медь, железо/);
+});
+
 test('команды: сундук на чужой территории — сервер не даёт открыть, бот так и пишет', async () => {
   const { run, world } = setup({ storage: { '1,64,2': { deny: true } } });
   world.set(new Vec3(1, 64, 2), 'chest');

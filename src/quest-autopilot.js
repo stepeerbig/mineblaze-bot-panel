@@ -26,6 +26,11 @@ const CROP_WORDS = {
   wheat: 'пшеница', carrot: 'морковь', potato: 'картофель', beetroot: 'свёкла', sweet_berries: 'ягоды', sugar_cane: 'тростник',
   melon_slice: 'арбуз', pumpkin: 'тыква', cocoa_beans: 'какао', nether_wart: 'нарост', cactus: 'кактус', bamboo: 'бамбук',
 };
+// Что из «Передайте…» добывается из руды — слова для #добудь (слитки нужно плавить — их не добываем).
+const ORE_WORDS = {
+  coal: 'уголь', redstone: 'редстоун', diamond: 'алмазы', emerald: 'изумруды', lapis_lazuli: 'лазурит', quartz: 'кварц',
+  raw_iron: 'железо', raw_copper: 'медь', raw_gold: 'золото',
+};
 const MAX_PAUSE_MIN = 120; // сделать нечего — проверять всё реже, но не реже раза в 2 ч
 const MAX_PASSES = 3; // у одного NPC за ход: новый уровень или новые задания — посмотреть ещё раз
 const JOURNAL = 40; // строк журнала автопилота для панели
@@ -268,12 +273,12 @@ class QuestAutopilot extends EventEmitter {
         else if (p.type === 'kill') add(`kill:${p.mobs.join('/')}`, p, st.nick, p.left);
         else if (p.type === 'breed' || p.type === 'no_food' || p.type === 'no_animals') add(`${p.type}:${p.mobs.join('/')}`, p, st.nick);
         else if (p.type === 'kill_none') add(`kill_none:${p.home}`, p, st.nick);
-        else if (p.type === 'cant' || p.type === 'unknown_items') add(`${p.type}:${p.goal}`, p, st.nick);
+        else if (p.type === 'cant' || p.type === 'unknown_items' || p.type === 'no_ore') add(`${p.type}:${p.goal}`, p, st.nick);
         else add(p.type, p, st.nick);
       }
     }
     const out = [];
-    const order = ['no_home', 'no_storage', 'no_items', 'no_money', 'full', 'kill', 'kill_none', 'breed', 'no_food', 'no_animals', 'unknown_items', 'cant', 'pvp', 'error'];
+    const order = ['no_home', 'no_storage', 'no_items', 'no_money', 'full', 'kill', 'kill_none', 'breed', 'no_food', 'no_animals', 'no_ore', 'unknown_items', 'cant', 'pvp', 'error'];
     const sorted = [...groups.values()].sort((a, b) => order.indexOf(a.type) - order.indexOf(b.type));
     for (const g of sorted) {
       const nicks = [...g.nicks];
@@ -308,6 +313,9 @@ class QuestAutopilot extends EventEmitter {
         case 'no_food':
           out.push(`Нет корма для «${g.goal}» (${botsNum(n)}): ${mobName(g.mobs[0])} — дай ботам корм (например, пшеницу коровам и овцам, морковь свиньям, семена курам)`);
           break;
+        case 'no_ore':
+          out.push(`Шахта «${g.home}»: для «${g.goal}» руды не нашлось (${botsNum(n)}) — ${g.text || 'поставь дом шахты глубже или в другом месте'}`);
+          break;
         case 'no_animals':
           out.push(`В загоне «${g.home}» меньше двух взрослых (${mobName(g.mobs[0])}) или их кормили меньше 5 мин назад (${botsNum(n)}) — пригони животных`);
           break;
@@ -339,6 +347,7 @@ class QuestAutopilot extends EventEmitter {
       rewards: String(c.questRewards || ''),
       farm: String(c.questFarm || ''),
       pen: String(c.questPen || ''),
+      mine: String(c.questMine || ''),
       rooms: parseMobHomes(c.questMobHomes),
       together: Math.max(1, Math.min(5, Number(c.questTogether) || 2)),
       pause: Math.max(1, Number(c.questPause) || 15),
@@ -566,6 +575,22 @@ class QuestAutopilot extends EventEmitter {
         else if (r.code !== 'nothing') {
           const p = problemOfFailure(r, npc);
           if (p) problems.push(p);
+        }
+      }
+      // «Передайте редстоун…» — сначала добыть в шахте (по заданию: сколько ещё нужно).
+      if (cfg.mine) {
+        for (const q of plan.deliver) {
+          const ore = (q.items || []).find((id) => ORE_WORDS[id]);
+          if (!ore) continue;
+          const need = Math.max(1, Math.ceil(q.need - q.have));
+          const r = await this._cmd(b, cur, `добываю: ${ORE_WORDS[ore]}`, `#добудь ${ORE_WORDS[ore]} ${need} дом ${cfg.mine}`);
+          if (stopped(r)) return { progress, interrupted: true };
+          if (r.data && r.data.mined > 0) did = true;
+          else if (r.code === 'not_found') problems.push({ type: 'no_ore', npc, goal: q.goal, home: cfg.mine, text: lastLine(r) });
+          else {
+            const p = problemOfFailure(r, npc);
+            if (p) problems.push(p);
+          }
         }
       }
       // Взять, купить, принести со склада, сдать, повысить уровень.

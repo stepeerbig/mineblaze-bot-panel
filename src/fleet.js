@@ -432,7 +432,7 @@ class Fleet extends EventEmitter {
     // Пароли всех ботов процессам не нужны (у каждого — свой), ключ и настройки ИИ — тоже.
     const {
       accounts, aiKey, aiBaseUrl, aiModel, aiProvider, ollamaUrl, ollamaModel, ollamaGpu,
-      questAuto, questStorage, questRewards, questMobHomes, questTogether, questPause, questFarm, questPen, ...rest
+      questAuto, questStorage, questRewards, questMobHomes, questTogether, questPause, questFarm, questPen, questMine, ...rest
     } = this.config;
     // Ники всех ботов панели: охрана каждого считает остальных своими (у одного склада их много).
     rest.fleetNicks = this.order.map((id) => this.bots.get(id).username).join('\n');

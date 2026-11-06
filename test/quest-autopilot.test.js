@@ -237,6 +237,24 @@ test('автопилот: ферма и загон — «Передайте пш
   assert.deepEqual(pilot.needs(), ['Нет корма для «Разведите коров» (1 бот): корова — дай ботам корм (например, пшеницу коровам и овцам, морковь свиньям, семена курам)']);
 });
 
+test('автопилот: шахта — «Передайте редстоун» сначала добыть (#добудь … дом шахта); руды нет — в «что нужно»', async () => {
+  const { pilot, env, calls } = makePilot((bot, line) => {
+    if (line === '#квесты у Алхимик') return ok(view('Алхимик', 1, []));
+    if (line === '#квесты у Фермер') return ok(view('Фермер', 3, [q({ goal: 'Передайте редстоун', items: ['redstone'], have: 100, need: 300 })]));
+    if (line === '#добудь редстоун 200 дом шахта') {
+      if (bot === 'farm02') return { ok: false, code: 'not_found', message: ['Руды «редстоун» не нашёл', 'Где искать: Y −64…15, больше всего — Y ≈ −58'], data: { mined: 0 } };
+      return ok({ mined: 40, steps: 30 });
+    }
+    if (line.startsWith('#квесты принести')) return ok({ gave: [], took: [], levelUps: [], short: [] });
+    throw new Error(`лишняя команда: ${line}`);
+  }, { nicks: ['Farm01', 'Farm02'], cfg: { questMine: 'шахта', questTogether: 1 } });
+  await oneRound(pilot, env);
+  assert.deepEqual(calls.filter((c) => c.bot === 'farm01').map((c) => c.line).slice(0, 3), [
+    '#квесты у Фермер', '#добудь редстоун 200 дом шахта', '#квесты принести урожай награды у Фермер',
+  ]);
+  assert.deepEqual(pilot.needs(), ['Шахта «шахта»: для «Передайте редстоун» руды не нашлось (1 бот) — Где искать: Y −64…15, больше всего — Y ≈ −58']);
+});
+
 test('автопилот: пауза (ИИ, «по очереди») — начатое бросают и продолжают потом; стоп; не в сети — не трогает', async () => {
   let release = null;
   const { pilot, env, calls } = makePilot((bot, line, signal) => {
