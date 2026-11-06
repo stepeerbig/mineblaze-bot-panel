@@ -219,6 +219,28 @@ test('копание под себя: блок у себя пропадает с
   assert.ok(Math.abs(bot.entity.position.y - 63) < 1e-6 && bot.entity.onGround, `спрыгнул на блок ниже: ${bot.entity.position}`);
 });
 
+test('копание: сервер молча не дал сломать (спавн, «приключение») — на его подтверждении блок у бота возвращается, ошибка «не дал»', async () => {
+  const clock = fakeClock();
+  const world = makeWorld(require('prismarine-registry')(VERSION));
+  const bot = physicsBot({ clock, world, actions: true });
+  autoServer(bot, world, { denyDig: true }); // клетку не присылает, только подтверждает номер действия (как Paper)
+  bot.emit('login');
+  teleport(bot);
+  clock.advance(100);
+  world.set(new Vec3(0, 64, 2), 'iron_ore');
+  const seen = [];
+  bot.on('physicsTick', () => seen.push(world.get(new Vec3(0, 64, 2))));
+  const res = await runFor(clock, bot.actions.dig(new Vec3(0, 64, 2)));
+  assert.match(res.error && res.error.message, /сервер не дал сломать блок в 0 64 2/);
+  assert.equal(res.error.code, 'rejected');
+  assert.equal(world.get(new Vec3(0, 64, 2)), 'iron_ore', 'вернулся как был');
+  assert.ok(seen.includes('air'), 'до подтверждения у бота блок был сломан (предсказание, как у клиента)');
+  // Копание под себя на спавне: бот не проваливается насовсем — пол возвращается.
+  const under = await runFor(clock, bot.actions.dig(new Vec3(0, 63, 0)));
+  assert.equal(under.error && under.error.code, 'rejected');
+  assert.equal(world.get(new Vec3(0, 63, 0)), 'stone');
+});
+
 test('установка: понятные ошибки', async () => {
   const { clock, world, bot } = setup();
   const err = async (promise) => (await runFor(clock, promise)).error.message;

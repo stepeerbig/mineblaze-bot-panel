@@ -353,6 +353,22 @@ test('физика: вода сносит бота по течению (посл
   assert.ok(Math.abs(bot.entity.position.z - 0.5) < 0.01, 'вбок не сносит');
 });
 
+test('физика: у края подземного озера (камень над водой) бота не тянет — снос, как в игре 1.21, а не старой prismarine', () => {
+  const clock = fakeClock();
+  const bot = physicsBot({ clock });
+  // Вода в (-1 64 0) — бот задевает её краем; к западу — камень, а под ним вода (озеро уходит под камень).
+  bot.world.set(new Vec3(-1, 64, 0), 'water');
+  bot.world.set(new Vec3(-2, 64, 0), 'stone');
+  bot.world.set(new Vec3(-2, 63, 0), 'water');
+  bot.emit('login');
+  teleport(bot, { x: -0.25, y: 64, z: 0.5 });
+  clock.advance(300);
+  const x0 = bot.entity.position.x;
+  clock.advance(3000);
+  assert.ok(Math.abs(bot.entity.position.x - x0) < 1e-9, `стоит на месте: сдвиг ${(bot.entity.position.x - x0).toFixed(4)}`);
+  // (Настоящее течение по-прежнему сносит — тест «вода сносит бота по течению» выше.)
+});
+
 test('физика: игроки, с которыми бот пересёкся, расталкивают его (как в игре); правила столкновений команд — тоже', () => {
   const run = ({ dx, teams = null, gamemode = 0 }) => {
     const clock = fakeClock();

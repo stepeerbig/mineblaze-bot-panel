@@ -25,6 +25,7 @@ const CONFIRM_TICKS = 20; // столько ждём, что сервер под
 const LOOK_TIMEOUT_TICKS = 60;
 const STUCK_TICKS = 60; // столько тиков без продвижения — бот застрял
 const FIRST_SEARCH_NODES = 3000; // путь с копанием: точный поиск — до стольких клеток, дальше — жадный
+const SETBACK_CALM_TICKS = 6; // после отката сервером — столько тиков без клавиш
 const ATTACK_COOLDOWN_TICKS = 12; // пауза между ударами (меч восстанавливается за 12,5 тика)
 const CHAT_INTERVAL_MS = 1500;
 // Клики в меню: первый — через 0,5–0,9 с после открытия, следующие — через 0,25–0,55 с; ответ сервера ждём до 0,5 с.
@@ -151,6 +152,8 @@ function inject(bot, { random, now }) {
 
   let sequence = 0; // как у клиента: растёт с каждым копанием, установкой, использованием предмета
   let selfUpdate = false; // мир меняет наше же предсказание (а не ответ сервера)
+  let ackedSequence = 0; // до какого номера сервер подтвердил действия (block_changed_ack)
+  const predictions = new Map(); // «x,y,z» → { pos, state: номер состояния по серверу, sequence }
   let lastUseTick = -Infinity;
   let lastDestroyTick = -Infinity;
   let lastAttackTick = -Infinity;
@@ -174,6 +177,8 @@ function inject(bot, { random, now }) {
   // Новый мир или сервер — у клиента новый счётчик sequence; всё, что бот делал, прерывается.
   const interrupt = (why) => () => {
     sequence = 0;
+    ackedSequence = 0; // новый счётчик — и подтверждения считаются заново
+    predictions.clear();
     abortAll(new ActionError(why, 'interrupted'));
   };
   bot.on('respawn', interrupt('прервано: смена мира'));
@@ -494,9 +499,12 @@ function inject(bot, { random, now }) {
     let jumpTicks = 0;
     let arrivedTicks = 0;
     const limitTicks = Math.ceil((5000 + points.length * 700) / 50);
-    // Сервер поставил бота в точку (откат, телепорт) — и взгляд тоже: навести его на цель заново.
+    // Сервер поставил бота в точку (откат, телепорт) — и взгляд тоже: навести его на цель заново. После отката —
+    // несколько тиков без клавиш: тот же шаг сразу же античит часто откатывает снова, каждый тик (петля откатов).
+    let calmTicks = 0;
     const onForced = () => {
       lastLookYaw = null;
+      calmTicks = SETBACK_CALM_TICKS;
     };
     bot.on('forcedMove', onForced);
     try {
@@ -540,6 +548,12 @@ function inject(bot, { random, now }) {
         throw new ActionError(`не могу пройти к ${fmt(target)}: застрял`, 'stuck');
       }
       if (tick > limitTicks) throw new ActionError(`не успел дойти до ${fmt(target)}`, 'timeout');
+      if (calmTicks > 0) {
+        calmTicks -= 1;
+        releaseControls();
+        bestTick = tick; // пауза после отката — не «застрял»
+        return undefined;
+      }
 
       const yaw = Math.atan2(-dx, -dz);
       if (dist > 0.05 && (lastLookYaw === null || Math.abs(angleDiff(yaw, lastLookYaw)) > 0.02)) {
@@ -550,11 +564,17 @@ function inject(bot, { random, now }) {
       const forward = facing < 0.7; // сильно сбоку — сначала развернуться
       bot.setControlState('forward', forward && dist > (last ? range * 0.6 : 0.05));
       bot.setControlState('sprint', Boolean(sprint) && forward && facing < 0.26 && points.length - i > 3 && (bot.food === undefined || bot.food > 6));
-      // Ступенька — прыжок: точка выше, бот на земле у неё (или упёрся); в воде — всплываем.
+      // Ступенька — прыжок: точка выше, бот на земле у неё (или упёрся); в воде — всплываем. Под потолком (над
+      // головой блок) не прыгаем: прыжок обрежется, бот упадёт на край ступеньки — такое античит откатывает.
       let jump = Boolean(bot.entity.isInWater) && target.y >= pos.y - 0.2;
       if (jumpTicks > 0) jumpTicks -= 1;
       const higher = target.y > pos.y + 0.6;
-      if (!jump && higher && forward && bot.entity.onGround && jumpTicks === 0 && (bot.entity.isCollidedHorizontally || dist < 1.3)) {
+      // Место над головой — во всех столбцах, которые задевает коробка бота (0,6 блока): задела соседний столбец с
+      // потолком хоть на сотую — прыжок обрежется о него.
+      const y2 = Math.floor(pos.y + 0.01) + 2;
+      const headroom = [pos.x - 0.3, pos.x + 0.2999].every((hx) => [pos.z - 0.3, pos.z + 0.2999]
+        .every((hz) => !solidAt(new Vec3(Math.floor(hx), y2, Math.floor(hz)))));
+      if (!jump && higher && forward && headroom && bot.entity.onGround && jumpTicks === 0 && (bot.entity.isCollidedHorizontally || dist < 1.3)) {
         jump = true;
         jumpTicks = 10;
       }
@@ -692,19 +712,54 @@ function inject(bot, { random, now }) {
   const countItem = (name) => (bot.inventory && bot.inventory.slots ? bot.inventory.slots : [])
     .reduce((n, it, i) => n + (i >= 9 && it && it.name === name ? it.count || 1 : 0), 0);
 
-  /** Блок у себя в мире — как предсказание обычного клиента (сервер потом подтвердит или вернёт как было). */
-  function setLocalBlock(pos, name) {
-    const info = bot.registry.blocksByName[name];
-    if (!info) return;
+  // Предсказания, как у обычного клиента (BlockStatePredictionHandler): сломал или поставил — у себя сразу, а для
+  // клетки помним, что там по словам сервера. Сервер прислал клетку — запоминаем его состояние. Сервер подтвердил
+  // действие (block_changed_ack с номером) — всё, что предсказано до этого номера, становится тем, что сказал сервер:
+  // не прислал ничего (не дал сломать — спавн, приват, «приключение») — блок возвращается как был.
+  const posKeyOf = (p) => `${p.x},${p.y},${p.z}`;
+
+  function applyLocalState(pos, stateId) {
     selfUpdate = true;
     try {
-      if (typeof bot._updateBlockState === 'function') bot._updateBlockState(pos, info.defaultState);
-      else if (bot.world && typeof bot.world.setBlockStateId === 'function') bot.world.setBlockStateId(pos, info.defaultState);
+      if (typeof bot._updateBlockState === 'function') bot._updateBlockState(pos, stateId);
+      else if (bot.world && typeof bot.world.setBlockStateId === 'function') bot.world.setBlockStateId(pos, stateId);
     } catch (_) {
       // не вышло — блок придёт от сервера
     } finally {
       selfUpdate = false;
     }
+  }
+
+  /** Блок у себя в мире — предсказание действия с номером seq (сервер потом подтвердит или вернёт как было). */
+  function setLocalBlock(pos, name, seq = sequence) {
+    const info = bot.registry.blocksByName[name];
+    if (!info) return;
+    const key = posKeyOf(pos);
+    const before = blockAt(pos);
+    const known = predictions.get(key);
+    predictions.set(key, { pos: pos.clone(), state: known ? known.state : before ? before.stateId : 0, sequence: seq });
+    applyLocalState(pos, info.defaultState);
+  }
+
+  // Сервер прислал клетку, где ждём подтверждения, — это и есть её состояние.
+  bot.on('blockUpdate', (oldBlock, newBlock) => {
+    if (selfUpdate || !predictions.size) return;
+    const p = (newBlock && newBlock.position) || (oldBlock && oldBlock.position);
+    const known = p && predictions.get(posKeyOf(p));
+    if (known) known.state = newBlock ? newBlock.stateId : 0;
+  });
+  if (bot._client && typeof bot._client.on === 'function') {
+    bot._client.on('acknowledge_player_digging', (packet) => {
+      const seq = packet && Number(packet.sequenceId !== undefined ? packet.sequenceId : packet.sequence);
+      if (!Number.isFinite(seq)) return;
+      ackedSequence = Math.max(ackedSequence, seq);
+      for (const [key, p] of predictions) {
+        if (p.sequence > seq) continue;
+        predictions.delete(key);
+        const now = blockAt(p.pos);
+        if (now && now.stateId !== p.state) applyLocalState(p.pos, p.state); // сервер не согласился — как было
+      }
+    });
   }
 
   /** Слушать ответы сервера о клетке pos (изменения мира не от своего предсказания). → { answered, stop() } */
@@ -720,13 +775,16 @@ function inject(bot, { random, now }) {
   }
 
   /**
-   * После предсказания (блок у себя уже убран или поставлен) — дождаться ответа сервера о клетке (обычно — через
-   * пинг) и проверить, что там так, как ждали: отказал — сервер вернул как было.
+   * После предсказания действия seq (блок у себя уже убран или поставлен) — дождаться ответа сервера: клетка
+   * пришла или действие подтверждено (обычно — через пинг). Потом проверить, что в клетке то, что ждали:
+   * отказал — там снова как было.
    */
-  async function waitServerBlock(pos, check, signal) {
+  async function waitServerBlock(pos, check, signal, seq = sequence) {
     const w = watchServerBlock(pos);
     try {
-      for (let i = 0; i < CONFIRM_TICKS && !w.answered; i += 1) await inTick(() => {}, signal);
+      for (let i = 0; i < CONFIRM_TICKS && !w.answered && ackedSequence < seq; i += 1) await inTick(() => {}, signal);
+      // Подтверждение пришло — предсказание уже сменилось на слово сервера; ещё тик, чтобы и физика это увидела.
+      if (ackedSequence >= seq) await inTick(() => {}, signal);
     } finally {
       w.stop();
     }
@@ -778,6 +836,7 @@ function inject(bot, { random, now }) {
     while (ticks() - lastUseTick < USE_DELAY_TICKS) await inTick(() => {}, signal);
     let tick = 0;
     let placedAt = -1;
+    let placeSeq = Infinity; // номер установки — ждём его подтверждения
     const server = watchServerBlock(feet); // ответ сервера о клетке (своё предсказание не в счёт)
     try {
       await everyTick(() => {
@@ -808,14 +867,16 @@ function inject(bot, { random, now }) {
             lastUseTick = ticks();
             setLocalBlock(feet, held.name);
             placedAt = tick;
+            placeSeq = sequence;
           } else if (tick > 12 || (tick > 3 && bot.entity.onGround)) {
             throw new ActionError('не допрыгнул: мешает потолок');
           }
           return undefined;
         }
-        // Встал на новый блок — и сервер ответил, что в клетке (или прошла секунда).
+        // Встал на новый блок — и сервер ответил: прислал клетку или подтвердил установку (или прошла секунда).
+        // Не дал поставить — блок уже снова воздух (проверка после цикла).
         const onTop = bot.entity.onGround && bot.entity.position.y >= feet.y + 0.99;
-        if (onTop && (server.answered || tick - placedAt > CONFIRM_TICKS)) return true;
+        if (onTop && (server.answered || ackedSequence >= placeSeq || tick - placedAt > CONFIRM_TICKS)) return true;
         if (bot.entity.onGround && bot.entity.position.y < feet.y + 0.5) throw new ActionError(`сервер не дал поставить блок в ${fmt(feet)}`, 'rejected');
         if (tick - placedAt > 60) throw new ActionError('не встал на поставленный блок');
         return undefined;

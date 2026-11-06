@@ -20,7 +20,8 @@
 //         npm run stand:check -- --fight         — бой: бот в стеклянном загоне бьёт пауков командой #бей (как в
 //                                                  панели); Grim смотрит дальность, наводку и порядок пакетов ударов
 //         npm run stand:check -- --mine          — добыча: руда спрятана в толще камня; бот (#добудь) прокапывается к ней
-//                                                  и поднимается обратно «столбом»; Grim смотрит копание и прыжки с блоком
+//                                                  и поднимается обратно «столбом»; Grim смотрит копание и прыжки с блоком;
+//                                                  STAND_MINE=denied — там, где копать нельзя (ждём быстрый стоп)
 // Перед первым запуском один раз открой test-server\start-test-server.bat: он скачает сервер и спросит про EULA.
 // Код выхода 0 — бот простоял всё время, его не кикнули, и ни Grim, ни сервер ничего не заметили.
 // Журнал пакетов каждой проверки: test-server\server\journals.
@@ -370,6 +371,16 @@ async function runMineCheck(manager, cmd) {
   bot.panelConfig = { xray: { radius: 1 } };
   const x = await runCommand(bot, '#рентген железо');
   console.log(`  [добыча] #рентген железо → ${[].concat(x.message).join(' | ')}`);
+  if (process.env.STAND_MINE === 'denied') {
+    // Как спавн или чужой приват: сервер возвращает каждый сломанный блок (режим «приключение»).
+    cmd(`gamemode adventure ${BOT_NAME}`);
+    await wait(1000);
+    const t0 = Date.now();
+    const d = await runCommand(bot, '#добудь железо 2');
+    console.log(`  [добыча] копать нельзя: #добудь железо 2 → ${d.code} (${((Date.now() - t0) / 1000).toFixed(1)} с): ${[].concat(d.message).join(' | ')}`);
+    cmd(`gamemode survival ${BOT_NAME}`);
+    return d.code === 'protected' ? 0 : 1;
+  }
   const started = Date.now();
   const r = await runCommand(bot, '#добудь железо 2');
   console.log(`  [добыча] #добудь железо 2 → ${r.ok ? 'да' : 'НЕТ'} (${((Date.now() - started) / 1000).toFixed(1)} с): ${[].concat(r.message).join(' | ')}`);

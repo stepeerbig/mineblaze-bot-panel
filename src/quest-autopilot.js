@@ -273,12 +273,13 @@ class QuestAutopilot extends EventEmitter {
         else if (p.type === 'kill') add(`kill:${p.mobs.join('/')}`, p, st.nick, p.left);
         else if (p.type === 'breed' || p.type === 'no_food' || p.type === 'no_animals') add(`${p.type}:${p.mobs.join('/')}`, p, st.nick);
         else if (p.type === 'kill_none') add(`kill_none:${p.home}`, p, st.nick);
+        else if (p.type === 'no_dig') add(`no_dig:${p.home}`, p, st.nick);
         else if (p.type === 'cant' || p.type === 'unknown_items' || p.type === 'no_ore') add(`${p.type}:${p.goal}`, p, st.nick);
         else add(p.type, p, st.nick);
       }
     }
     const out = [];
-    const order = ['no_home', 'no_storage', 'no_items', 'no_money', 'full', 'kill', 'kill_none', 'breed', 'no_food', 'no_animals', 'no_ore', 'unknown_items', 'cant', 'pvp', 'error'];
+    const order = ['no_home', 'no_storage', 'no_items', 'no_money', 'full', 'kill', 'kill_none', 'breed', 'no_food', 'no_animals', 'no_dig', 'no_ore', 'unknown_items', 'cant', 'pvp', 'error'];
     const sorted = [...groups.values()].sort((a, b) => order.indexOf(a.type) - order.indexOf(b.type));
     for (const g of sorted) {
       const nicks = [...g.nicks];
@@ -312,6 +313,9 @@ class QuestAutopilot extends EventEmitter {
           break;
         case 'no_food':
           out.push(`Нет корма для «${g.goal}» (${botsNum(n)}): ${mobName(g.mobs[0])} — дай ботам корм (например, пшеницу коровам и овцам, морковь свиньям, семена курам)`);
+          break;
+        case 'no_dig':
+          out.push(`Шахта «${g.home}»: сервер не даёт там копать (${botsNum(n)}) — поставь ботам /sethome ${g.home} там, где копать можно (своя территория, своя шахта или /rtp)`);
           break;
         case 'no_ore':
           out.push(`Шахта «${g.home}»: для «${g.goal}» руды не нашлось (${botsNum(n)}) — ${g.text || 'поставь дом шахты глубже или в другом месте'}`);
@@ -587,6 +591,7 @@ class QuestAutopilot extends EventEmitter {
           if (stopped(r)) return { progress, interrupted: true };
           if (r.data && r.data.mined > 0) did = true;
           else if (r.code === 'not_found') problems.push({ type: 'no_ore', npc, goal: q.goal, home: cfg.mine, text: lastLine(r) });
+          else if (r.code === 'protected') problems.push({ type: 'no_dig', npc, goal: q.goal, home: cfg.mine });
           else {
             const p = problemOfFailure(r, npc);
             if (p) problems.push(p);

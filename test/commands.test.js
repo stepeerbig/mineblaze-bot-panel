@@ -12,11 +12,11 @@ const { fakeClock, makeWorld, physicsBot, autoServer, teleport, take, runFor, VE
 const { runCommand, catalog, COMMANDS, parseCoord, parseBlockPos, itemTest, storageArgs, pingReport } = require(path.join(__dirname, '..', 'src', 'bot', 'commands.js'));
 
 /** Бот стоит в 0.5 64 0.5 на камне, смотрит на юг (+z). players: [{ name, at: [x, y, z] }], inventory: [[имя, кол-во]]. */
-function setup({ players = [], farPlayers = [], chests = {}, storage = {}, inventory = [], entities = [], npcs = {}, onClick = null } = {}) {
+function setup({ players = [], farPlayers = [], chests = {}, storage = {}, inventory = [], entities = [], npcs = {}, onClick = null, server = {} } = {}) {
   const clock = fakeClock();
   const world = makeWorld(require('prismarine-registry')(VERSION));
   const bot = physicsBot({ clock, world, actions: true });
-  autoServer(bot, world, { chests, storage, npcs, onClick });
+  autoServer(bot, world, { chests, storage, npcs, onClick, ...server });
   for (const e of entities) bot.entities[e.id] = e;
   bot.emit('login');
   teleport(bot);
@@ -1282,4 +1282,38 @@ test('команды: #рентген — что из списка есть в �
   assert.equal(empty.ok, true);
   assert.match(text(empty), /^Рентген \(радиус 2 чанка, 5×5\): ничего из списка — не нашёл\n.*анти-X-ray/);
   assert.match((await none.run('#рентген пирожки')).message, /что искать\? Например: #рентген алмазы/);
+});
+
+test('команды: #добудь там, где копать не дают (спавн, приват) — сразу стоп и куда отвести бота, а не «не нашёл»', async () => {
+  const s = setup({ inventory: [['iron_pickaxe', 1], ['cobblestone', 16]], server: { denyDig: true } });
+  for (let i = 0; i < 10; i += 1) s.world.set(new Vec3(3 + i, 60, i % 3), 'lapis_ore');
+  const r = await s.run('#добудь лазурит', 600000);
+  const text = [].concat(r.message).join('\n');
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'protected');
+  assert.match(text, /^Не добыл «лазурит»: сервер не даёт ломать блоки здесь \(спавн, варп, чужой приват или лобби\)/);
+  assert.match(text, /Отведи бота туда, где копать можно: #добудь лазурит дом шахта .* или \/rtp/);
+  assert.doesNotMatch(text, /вода, лава|Где искать/);
+  // Два отказа — и стоп: к остальным рудам не ходил.
+  const digs = s.bot._client.sent.filter((p) => p.name === 'block_dig' && p.params.status === 2);
+  assert.ok(digs.length <= 3, `ломал ${digs.length} раз`);
+  assert.equal(s.world.get(new Vec3(3, 60, 0)), 'lapis_ore');
+  assert.equal(r.data.denied, true);
+});
+
+test('команды: #добудь при анти-X-ray — ненастоящую руду (подошёл — камень) распознаёт, берёт настоящую, открытую', async () => {
+  // Две «руды» в толще камня — подделка: сломаешь блок в 2 от неё — сервер покажет камень.
+  const fakeOres = new Set(['3,60,0', '-3,60,0']);
+  const s = setup({ inventory: [['iron_pickaxe', 1], ['cobblestone', 32]], server: { fakeOres } });
+  for (const key of fakeOres) s.world.set(new Vec3(...key.split(',').map(Number)), 'iron_ore');
+  // Настоящая — у пещеры (рядом воздух) и дальше подделок.
+  s.world.set(new Vec3(0, 55, 9), 'iron_ore');
+  for (let z = 6; z <= 8; z += 1) for (const y of [55, 56]) s.world.set(new Vec3(0, y, z), 'air');
+  const r = await s.run('#добудь железо 1', 900000);
+  const text = [].concat(r.message).join('\n');
+  assert.equal(r.ok, true, text);
+  assert.equal(r.data.mined, 1);
+  assert.notEqual(s.world.get(new Vec3(0, 55, 9)), 'iron_ore', 'настоящую выкопал');
+  assert.equal(r.data.antiXray, true);
+  assert.match(text, /Похоже, на сервере анти-X-ray: 2 раз дошёл до руды — а там камень/);
 });

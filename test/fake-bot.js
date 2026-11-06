@@ -154,7 +154,7 @@ function physicsBot({ clock, world, tickEnd = true, actions = false, random = 0.
  * (prismarine-windows): shift-клик переносит стопку, как в игре (reject — сервер не даёт), при закрытии
  * инвентарь из окна переписывается в bot.inventory, как у mineflayer.
  */
-function autoServer(bot, world, { chests = {}, storage = {}, npcs = {}, onClick = null } = {}) {
+function autoServer(bot, world, { chests = {}, storage = {}, npcs = {}, onClick = null, denyDig = false, fakeOres = null } = {}) {
   const write = bot._client.write;
   bot.currentWindow = null;
   bot.clicks = [];
@@ -202,15 +202,35 @@ function autoServer(bot, world, { chests = {}, storage = {}, npcs = {}, onClick 
     const block = world.blockAt(pos);
     bot.emit('blockUpdate', null, block);
   });
+  // Подтверждение действия с номером (block_changed_ack) — после ответа о клетке, как у сервера в конце тика.
+  const ack = (sequence) => setImmediate(() => setImmediate(() => bot._client.emit('acknowledge_player_digging', { sequenceId: sequence })));
   bot._client.write = (name, params) => {
     write(name, params);
+    if ((name === 'block_dig' || name === 'block_place') && params.sequence) ack(params.sequence);
     if (name === 'use_entity' && params.mouse === 0 && npcs[params.target]) {
       open(npcs[params.target]());
     } else if (name === 'block_dig') {
       const block = world.blockAt(params.location);
+      const at = new Vec3(params.location.x, params.location.y, params.location.z);
       if (params.status === 2 || (params.status === 0 && bot.digTime(block) <= 50)) {
-        world.set(params.location, 'air');
-        answer(new Vec3(params.location.x, params.location.y, params.location.z));
+        if (denyDig) {
+          // Спавн или «приключение»: сервер не ломает и клетку не присылает — только подтверждает номер действия
+          // (так делает Paper). Бот, как обычный клиент, на подтверждении возвращает предсказанное как было.
+          return;
+        }
+        world.set(at, 'air');
+        answer(at);
+        // Анти-X-ray: ненастоящая руда в 2 блоках от сломанного — открывается камнем.
+        if (fakeOres) {
+          for (const key of [...fakeOres]) {
+            const [x, y, z] = key.split(',').map(Number);
+            if (Math.max(Math.abs(x - at.x), Math.abs(y - at.y), Math.abs(z - at.z)) > 2) continue;
+            fakeOres.delete(key);
+            const p = new Vec3(x, y, z);
+            if (world.get(p) !== 'air') world.set(p, 'stone');
+            answer(p);
+          }
+        }
       }
     } else if (name === 'block_place') {
       const loc = new Vec3(params.location.x, params.location.y, params.location.z);

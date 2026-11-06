@@ -33,7 +33,9 @@ const UNBREAKABLE_RE = /^(?:bedrock|barrier|light|end_portal|end_portal_frame|en
 const LOW = 0.6; // на столько физика заходит сама (ступенька плиты, ковёр, снег)
 const FLOOR = 0.8; // верх опоры не ниже этого — на ней стоят (грядка 0,94, песок душ 0,88, сундук 0,88)
 const MAX_HARDNESS = 10; // твёрже (обсидиан, 50) — не копаем: слишком долго
-const COST = { flat: 1, diagonal: Math.SQRT2, jump: 1.5, fallPerBlock: 0.4, deepFall: 1, water: 2.5, pillar: 3 };
+// stairDown — надбавка за спуск ступенькой с копанием: с разбега в яму бот летит в её дальнюю стену (античит такое
+// откатывает), поэтому вниз лучше «встать и копать под себя» — без скорости вбок.
+const COST = { flat: 1, diagonal: Math.SQRT2, jump: 1.5, fallPerBlock: 0.4, deepFall: 1, water: 2.5, pillar: 3, stairDown: 3 };
 const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
 const DIRS4 = DIRS.slice(0, 4);
 const SIDES = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
@@ -205,7 +207,7 @@ function makeWorld(cell, maxFall, { dig = null, place = false } = {}) {
         let r = clear([[x, Y + 1, z], [x, Y, z]]); // вперёд: голова, ноги
         if (r && r.dig.length && floorOk(x, Y - 1, z)) out.push({ x, y: Y, z, cost: COST.flat + r.cost, dig: r.dig, move: 'walk' });
         r = clear([[x, Y + 1, z], [x, Y, z], [x, Y - 1, z]]); // ступенькой вниз
-        if (r && r.dig.length && floorOk(x, Y - 2, z)) out.push({ x, y: Y - 1, z, cost: COST.flat + COST.fallPerBlock + r.cost, dig: r.dig, move: 'down' });
+        if (r && r.dig.length && floorOk(x, Y - 2, z)) out.push({ x, y: Y - 1, z, cost: COST.flat + COST.fallPerBlock + COST.stairDown + r.cost, dig: r.dig, move: 'down' });
         r = clear([[X, Y + 2, Z], [x, Y + 2, z], [x, Y + 1, z]]); // ступенькой вверх: над головой — место для прыжка
         if (r && r.dig.length && floorOk(x, Y, z)) out.push({ x, y: Y + 1, z, cost: COST.flat + COST.jump + r.cost, dig: r.dig, move: 'up' });
       }
