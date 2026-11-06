@@ -13,6 +13,7 @@
 
 const { Vec3 } = require('vec3');
 const { RaycastIterator } = require('prismarine-world').iterators;
+const { findPath } = require('./pathfinder');
 
 const BLOCK_REACH = 4.4; // у игрока 4,5 блока — оставляем запас
 const ENTITY_REACH = 2.9; // у игрока 3 блока
@@ -414,6 +415,11 @@ function inject(bot, { random, now }) {
       let lastLookYaw = null;
       let jumpTicks = 0;
       let arrivedTicks = 0;
+      const onForced = () => {
+        lastLookYaw = null; // сервер поставил взгляд сам (откат, телепорт) — навести на цель заново
+      };
+      bot.on('forcedMove', onForced);
+      try {
       await everyTick(() => {
         tick += 1;
         const pos = bot.entity.position;
@@ -462,6 +468,139 @@ function inject(bot, { random, now }) {
         bot.setControlState('jump', jump);
         return undefined;
       }, signal);
+      } finally {
+        bot.removeListener('forcedMove', onForced);
+      }
+    });
+  }
+
+  /**
+   * Пройти по точкам пути (клетки ног, см. pathfinder.js), не останавливаясь на каждой: смотреть на ближайшую ещё не
+   * пройденную, на ступеньку — прыжок, с уступа — шаг вниз, в воде — всплывать. До последней — с точностью range.
+   */
+  async function followPath(points, { range = 0.35, sprint = false } = {}, signal) {
+    if (!points.length) return;
+    const walkPitch = -(0.1 + 0.15 * random());
+    const centre = (p) => new Vec3(p.x + 0.5, p.y, p.z + 0.5);
+    let i = 0;
+    let tick = 0;
+    let best = Infinity;
+    let bestTick = 0;
+    let lastLookYaw = null;
+    let jumpTicks = 0;
+    let arrivedTicks = 0;
+    const limitTicks = Math.ceil((5000 + points.length * 700) / 50);
+    // Сервер поставил бота в точку (откат, телепорт) — и взгляд тоже: навести его на цель заново.
+    const onForced = () => {
+      lastLookYaw = null;
+    };
+    bot.on('forcedMove', onForced);
+    try {
+      await everyTick(() => {
+      tick += 1;
+      const pos = bot.entity.position;
+      // Пройденные точки. По прямой — рядом с ней или уже за ней по ходу; на повороте — только встав в её клетку
+      // (иначе бот срезает угол и цепляется коробкой за край стены).
+      while (i < points.length - 1) {
+        const p = centre(points[i]);
+        const q = centre(points[i + 1]);
+        const d = Math.hypot(p.x - pos.x, p.z - pos.z);
+        const inX = p.x - pos.x;
+        const inZ = p.z - pos.z;
+        const outX = q.x - p.x;
+        const outZ = q.z - p.z;
+        const straight = d < 1e-6 || (inX * outX + inZ * outZ) / (Math.hypot(inX, inZ) * Math.hypot(outX, outZ) || 1) > 0.94;
+        const passed = straight && (pos.x - p.x) * outX + (pos.z - p.z) * outZ > 0 && d < 0.9;
+        const inCell = Math.abs(p.x - pos.x) <= 0.25 && Math.abs(p.z - pos.z) <= 0.25;
+        const levelOk = pos.y > points[i].y - 1.6 && pos.y < points[i].y + 0.6; // на ступеньку ещё не запрыгнул — рано
+        if (((straight && d < 0.45) || passed || inCell) && levelOk) i += 1;
+        else break;
+      }
+      const target = centre(points[i]);
+      const last = i === points.length - 1;
+      const dx = target.x - pos.x;
+      const dz = target.z - pos.z;
+      const dist = Math.hypot(dx, dz);
+      if (last && dist <= range && Math.abs(target.y - pos.y) < 1.5) {
+        releaseControls();
+        arrivedTicks += 1;
+        const v = bot.entity.velocity;
+        return Math.hypot(v.x, v.z) < 0.003 || arrivedTicks > 10 ? true : undefined;
+      }
+      // Продвижение — по оставшемуся пути: нет его STUCK_TICKS — застрял (навигация найдёт путь заново).
+      const left = dist + (points.length - 1 - i);
+      if (left < best - 0.05) {
+        best = left;
+        bestTick = tick;
+      } else if (tick - bestTick > STUCK_TICKS) {
+        throw new ActionError(`не могу пройти к ${fmt(target)}: застрял`, 'stuck');
+      }
+      if (tick > limitTicks) throw new ActionError(`не успел дойти до ${fmt(target)}`, 'timeout');
+
+      const yaw = Math.atan2(-dx, -dz);
+      if (dist > 0.05 && (lastLookYaw === null || Math.abs(angleDiff(yaw, lastLookYaw)) > 0.02)) {
+        bot.look(yaw, walkPitch, true);
+        lastLookYaw = yaw;
+      }
+      const facing = dist > 0.05 ? Math.abs(angleDiff(yaw, bot.serverView.yaw)) : 0;
+      const forward = facing < 0.7; // сильно сбоку — сначала развернуться
+      bot.setControlState('forward', forward && dist > (last ? range * 0.6 : 0.05));
+      bot.setControlState('sprint', Boolean(sprint) && forward && facing < 0.26 && points.length - i > 3 && (bot.food === undefined || bot.food > 6));
+      // Ступенька — прыжок: точка выше, бот на земле у неё (или упёрся); в воде — всплываем.
+      let jump = Boolean(bot.entity.isInWater) && target.y >= pos.y - 0.2;
+      if (jumpTicks > 0) jumpTicks -= 1;
+      const higher = target.y > pos.y + 0.6;
+      if (!jump && higher && forward && bot.entity.onGround && jumpTicks === 0 && (bot.entity.isCollidedHorizontally || dist < 1.3)) {
+        jump = true;
+        jumpTicks = 10;
+      }
+      bot.setControlState('jump', jump);
+      return undefined;
+      }, signal);
+    } finally {
+      bot.removeListener('forcedMove', onForced);
+    }
+  }
+
+  /**
+   * Дойти до точки, обходя препятствия (поиск пути — src/bot/pathfinder.js).
+   * @param {Vec3}    target
+   * @param {object}  [opts]
+   * @param {number}  [opts.range=1]     насколько близко подойти (по горизонтали)
+   * @param {number}  [opts.vertical=2]  и по высоте
+   * @param {boolean} [opts.sprint=false]
+   * Цель за пределами загруженного мира — путь до самой близкой точки, там — заново (чанки подгружаются). Застрял —
+   * найти путь заново (не больше нескольких раз). Пути нет — ошибка с кодом no_path.
+   */
+  function goTo(target, { range = 1, vertical = 2, sprint = false, maxDistance } = {}) {
+    const goal = new Vec3(target.x, target.y, target.z);
+    return run('идти', async (signal) => {
+      let stuck = 0;
+      let lastLeft = Infinity;
+      let noProgress = 0;
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        const pos = bot.entity.position;
+        const left = Math.hypot(goal.x - pos.x, goal.z - pos.z);
+        if (left <= range && Math.abs(goal.y - pos.y) <= vertical) {
+          releaseControls();
+          return { arrived: true, position: pos.clone() };
+        }
+        const res = await findPath(blockAt, pos, goal, { range: Math.max(0, range - 0.25), vertical, signal, ...(maxDistance ? { maxDistance } : {}) });
+        if (!res.path.length) throw new ActionError(`не нашёл пути до ${fmt(goal)}: ${res.reason}`, 'no_path');
+        try {
+          // Последняя клетка пути уже у цели (не дальше range) — до неё вплотную.
+          await followPath(res.path, { range: 0.45, sprint }, signal);
+        } catch (err) {
+          if (err && (err.code === 'stuck' || err.code === 'timeout') && (stuck += 1) <= 3) continue; // мир поменялся — путь заново
+          throw err;
+        }
+        // Шли до края видимого мира (или цель сдвинулась): дальше — снова, но если ближе к цели не становится — сдаёмся.
+        const now = Math.hypot(goal.x - bot.entity.position.x, goal.z - bot.entity.position.z);
+        noProgress = now > lastLeft - 0.5 ? noProgress + 1 : 0;
+        lastLeft = now;
+        if (noProgress >= 2) throw new ActionError(`не дошёл до ${fmt(goal)}: ${res.reason || 'ближе не подойти'}`, 'no_path');
+      }
+      throw new ActionError(`не дошёл до ${fmt(goal)}: слишком далеко`, 'no_path');
     });
   }
 
@@ -862,6 +1001,7 @@ function inject(bot, { random, now }) {
     look,
     lookAt,
     walkTo,
+    goTo,
     dig,
     place,
     plant,

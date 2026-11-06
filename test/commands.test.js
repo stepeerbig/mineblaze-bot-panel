@@ -153,6 +153,28 @@ test('команды: #иди ко мне / к нику / назад N; если
   assert.match((await two.run('#иди туда-сюда')).message, /не понял, куда идти/);
 });
 
+test('команды: #иди X Y Z — поиск пути: обходит стену, запрыгивает на ступеньку, спускается с уступа; заперт — честно скажет', async () => {
+  const s = setup();
+  for (let z = -4; z <= 4; z += 1) for (const y of [64, 65, 66]) s.world.set(new Vec3(4, y, z), 'stone'); // стена поперёк
+  for (let x = 8; x <= 12; x += 1) for (let z = -2; z <= 2; z += 1) s.world.set(new Vec3(x, 64, z), 'stone'); // помост на блок выше
+  const up = await s.run('#иди 10 65 0', 120000);
+  assert.equal(up.ok, true, [].concat(up.message).join('\n'));
+  const p = s.bot.entity.position;
+  assert.ok(Math.hypot(p.x - 10.5, p.z - 0.5) < 1 && Math.abs(p.y - 65) < 0.01, `на помосте: ${p}`);
+  const down = await s.run('#иди 15 64 0', 120000);
+  assert.equal(down.ok, true, [].concat(down.message).join('\n'));
+  assert.ok(Math.abs(s.bot.entity.position.y - 64) < 0.01, 'спустился');
+
+  const shut = setup();
+  for (const [x, z] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+    for (const y of [64, 65, 66]) shut.world.set(new Vec3(x, y, z), 'stone');
+  }
+  const no = await shut.run('#иди 10 64 0', 60000);
+  assert.equal(no.ok, false);
+  assert.equal(no.code, 'no_path');
+  assert.match([].concat(no.message).join('\n'), /не нашёл пути до 10 64 0: пути нет/);
+});
+
 test('команды: #копай — то, на что смотрит, или впереди; #поставь — по-русски и впереди; понятные отказы', async () => {
   const { run, world, bot } = setup({ inventory: [['dirt', 10]] });
   world.set(new Vec3(0, 64, 2), 'stone');
@@ -1094,16 +1116,19 @@ test('команды: #разведи без корма в инвентаре �
   assert.equal(picked.ok, true, [].concat(picked.message).join('\n'));
   assert.equal([].concat(picked.message)[0], 'Корм: пшеница — подобрал с земли');
 
-  // Коровы в загоне за забором: дойти не дал забор — дотягивается через него.
-  const u = setup({ inventory: [['wheat', 4]], entities: [cow(621, 4.8, 0.5), cow(622, 4.8, 0.9)] });
-  // Забор вдоль z: столбики, соединённые на север и юг, — сплошная стенка высотой 1,5.
+  // Коровы в замкнутом загоне: войти нельзя — бот подходит к забору и дотягивается через него.
+  const u = setup({ inventory: [['wheat', 4]], entities: [cow(621, 3.8, 0.5), cow(622, 3.8, 0.9)] });
   const registry = require('prismarine-registry')(VERSION);
-  const fence = require('prismarine-block')(registry).fromProperties('oak_fence', { north: true, south: true, east: false, west: false, waterlogged: false }, 0);
-  for (const z of [-2, -1, 0, 1, 2, 3]) u.world.set(new Vec3(2, 64, z), `oak_fence#${fence.stateId - registry.blocksByName.oak_fence.minStateId}`);
+  const fenceId = (props) => {
+    const b = require('prismarine-block')(registry).fromProperties('oak_fence', { east: false, west: false, north: false, south: false, waterlogged: false, ...props }, 0);
+    return `oak_fence#${b.stateId - registry.blocksByName.oak_fence.minStateId}`;
+  };
+  for (let z = -2; z <= 3; z += 1) for (const x of [2, 7]) u.world.set(new Vec3(x, 64, z), fenceId({ north: z > -2, south: z < 3 }));
+  for (let x = 3; x <= 6; x += 1) for (const z of [-2, 3]) u.world.set(new Vec3(x, 64, z), fenceId({ east: true, west: true }));
   const fenced = await u.run('#разведи коров', 120000);
   assert.equal(fenced.ok, true, [].concat(fenced.message).join('\n'));
   assert.equal(fenced.data.pairs, 1);
-  assert.ok(u.bot.entity.position.x < 2.4, `упёрся в забор и не прошёл: x = ${u.bot.entity.position.x.toFixed(2)}`);
+  assert.ok(u.bot.entity.position.x < 2.4, `в загон не вошёл: x = ${u.bot.entity.position.x.toFixed(2)}`);
 });
 
 test('команды: #добудь — открытая руда рядом; мало — лестницей вниз к лучшей высоте и туннелем, руда в стенах; кирка; где искать', async () => {
@@ -1153,8 +1178,12 @@ test('команды: NPC за прилавком — вплотную не по
   });
   const npc = { id: 501, type: 'mob', name: 'villager', position: new Vec3(0.5, 64, 4.5), height: 1.95, width: 0.6, getCustomName: () => ({ json: { text: 'Фермер' }, toString: () => 'Фермер' }) };
   const s = setup({ entities: [npc], npcs: { 501: quests } });
-  for (let x = -3; x <= 3; x += 1) for (const y of [64, 65]) s.world.set(new Vec3(x, y, 2), 'stone'); // прилавок до потолка
-  const r = await s.run('#квесты');
+  // Будка NPC: прилавок до потолка спереди и стены с боков и сзади — внутрь не пройти (и в обход тоже).
+  for (const y of [64, 65]) {
+    for (let x = -3; x <= 3; x += 1) for (const z of [2, 8]) s.world.set(new Vec3(x, y, z), 'stone');
+    for (let z = 3; z <= 7; z += 1) for (const x of [-3, 3]) s.world.set(new Vec3(x, y, z), 'stone');
+  }
+  const r = await s.run('#квесты', 60000);
   assert.equal(r.ok, true, [].concat(r.message).join('\n'));
   assert.ok(s.bot.entity.position.z < 2, 'за стену не прошёл');
   assert.deepEqual(r.data.quests.map((q) => q.slot), [11]);

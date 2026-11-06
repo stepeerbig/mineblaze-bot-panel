@@ -227,6 +227,8 @@ async function runFor(clock, promise, maxMs = 30000) {
   for (let t = 0; t < maxMs && !state; t += 50) {
     clock.advance(50);
     for (let i = 0; i < 5; i += 1) await Promise.resolve(); // дать продолжиться async-функциям действий
+    // И отложенному через setImmediate (поиск пути отпускает цикл между кусками) — как в настоящем процессе.
+    await new Promise((r) => setImmediate(r));
   }
   if (!state) throw new Error(`не закончилось за ${maxMs} мс`);
   return state;

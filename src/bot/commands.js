@@ -15,7 +15,7 @@ const {
 const { isStorageWindow } = require('./window-clicks');
 const { moveStacks, countIn, itemsIn, storageSlots, playerSlots } = require('./chests');
 
-const MAX_WALK = 64; // по прямой дальше не ходим (поиска пути пока нет)
+const MAX_WALK = 256; // за раз дальше не ходим: путь ищется по загруженному миру, дальше — по ходу
 const MAX_STEPS = 32; // «#вперёд N»: не больше
 const NEAR_PLAYERS = 32; // «ко мне»: кого считаем рядом
 const NEAR_CONTAINERS = 8; // «#рядом»: где искать сундуки
@@ -456,10 +456,19 @@ async function cmdLook({ bot, args, words }) {
   return { ok: true, message: `Смотрит ${what}: ${round(now.yaw)} / ${round(now.pitch)}`, data: now };
 }
 
+/**
+ * Дойти, обходя препятствия (поиск пути). Без своей навигации (старые подделки в тестах) — по прямой.
+ * Пути нет — понятная ошибка (код no_path).
+ */
+async function navigate(bot, target, { range = 0.6, sprint = false, vertical = 2 } = {}) {
+  if (typeof bot.actions.goTo !== 'function') return bot.actions.walkTo(target, { range, sprint });
+  return bot.actions.goTo(target, { range, sprint, vertical });
+}
+
 async function goToPoint(bot, target, sprint) {
   const dist = bot.entity.position.distanceTo(target);
-  if (dist > MAX_WALK) throw new CommandError(`слишком далеко (${Math.round(dist)} блоков): по прямой — не больше ${MAX_WALK}`);
-  await bot.actions.walkTo(target, { sprint });
+  if (dist > MAX_WALK) throw new CommandError(`слишком далеко (${Math.round(dist)} блоков): за раз — не больше ${MAX_WALK}`);
+  await navigate(bot, target, { range: 0.6, sprint, vertical: 1 });
   const p = bot.entity.position;
   return { ok: true, message: `Дошёл до ${round(p.x)} ${round(p.y)} ${round(p.z)}`, data: { position: plain(p) } };
 }
@@ -467,7 +476,7 @@ async function goToPoint(bot, target, sprint) {
 async function goToPlayer(bot, e, sprint) {
   const dist = bot.entity.position.distanceTo(e.position);
   if (dist > MAX_WALK) throw new CommandError(`${e.username} слишком далеко (${Math.round(dist)} блоков)`);
-  await bot.actions.walkTo(e.position.clone(), { range: PLAYER_STOP, sprint });
+  await navigate(bot, e.position.clone(), { range: PLAYER_STOP, sprint });
   if (bot.entities && bot.entities[e.id]) await bot.actions.lookAt(e.position.offset(0, (e.height || 1.8) * 0.9, 0)); // и посмотреть на него
   return { ok: true, message: `Подошёл к ${e.username}`, data: { player: e.username, position: plain(bot.entity.position) } };
 }
@@ -476,7 +485,7 @@ async function goToEntity(bot, e, sprint, query) {
   const label = entityLabel(e) || query || e.name;
   const dist = bot.entity.position.distanceTo(e.position);
   if (dist > MAX_WALK) throw new CommandError(`${label} слишком далеко (${Math.round(dist)} блоков)`);
-  await bot.actions.walkTo(e.position.clone(), { range: 2, sprint }); // на расстояние вытянутой руки
+  await navigate(bot, e.position.clone(), { range: 2, sprint }); // на расстояние вытянутой руки
   return { ok: true, message: `Подошёл к ${label}`, data: { entity: label, id: e.id, position: plain(bot.entity.position) } };
 }
 
@@ -703,9 +712,9 @@ async function openNpcMenu(bot, npc) {
     try {
       await goToEntity(bot, e, false, npc);
     } catch (err) {
-      // NPC часто стоят за прилавком: вплотную не подойти («застрял»), но дотянуться можно — нажать всё равно
-      // попробуем. Прерывания (#стоп, новое действие, телепорт) — не про это: их пробрасываем.
-      if (!err || err.code !== 'stuck') throw err;
+      // NPC часто стоят за прилавком: вплотную не подойти («застрял», «пути нет»), но дотянуться можно — нажать
+      // всё равно попробуем. Прерывания (#стоп, новое действие, телепорт) — не про это: их пробрасываем.
+      if (!err || !['stuck', 'no_path', 'timeout'].includes(err.code)) throw err;
     }
   }
   const before = bot.currentWindow;
@@ -1496,14 +1505,14 @@ function storageArgs(args, words, preps) {
   return { query: q.join(' '), want, at };
 }
 
-/** Подойти к блоку, если до него не дотянуться: по прямой, на своей высоте; упёрся — всё равно попробуем нажать. */
+/** Подойти к блоку, если до него не дотянуться (поиск пути); не подойти вплотную — всё равно попробуем нажать. */
 async function reachBlock(bot, pos) {
   const eye = bot.entity.position.offset(0, 1.62, 0);
   if (eye.distanceTo(pos.offset(0.5, 0.5, 0.5)) <= OPEN_RANGE) return;
   try {
-    await bot.actions.walkTo(new Vec3(pos.x + 0.5, bot.entity.position.y, pos.z + 0.5), { range: 2.5 });
+    await navigate(bot, new Vec3(pos.x + 0.5, pos.y, pos.z + 0.5), { range: 2.5, vertical: 3 });
   } catch (err) {
-    if (!err || err.code !== 'stuck') throw err;
+    if (!err || !['stuck', 'no_path', 'timeout'].includes(err.code)) throw err; // дотянуться можно и не подходя вплотную
   }
 }
 
@@ -1847,12 +1856,12 @@ function freeSlots(bot) {
 
 const hasItem = (bot, name) => inventoryItems(bot).some((it) => it.name === name);
 
-/** Подойти, если клетка дальше вытянутой руки. Не дошёл (застрял, далеко) — false; «#стоп» — дальше. */
+/** Подойти, если клетка дальше вытянутой руки. Не дошёл (застрял, пути нет) — false; «#стоп» — дальше. */
 async function comeClose(bot, pos, range = 2.2) {
   const eye = bot.entity.position.offset(0, 1.62, 0);
   if (eye.distanceTo(pos.offset(0.5, 0.5, 0.5)) <= WORK_REACH) return true;
   try {
-    await bot.actions.walkTo(new Vec3(pos.x + 0.5, pos.y, pos.z + 0.5), { range });
+    await navigate(bot, new Vec3(pos.x + 0.5, pos.y, pos.z + 0.5), { range, vertical: 3 });
     return true;
   } catch (err) {
     if (isStopped(err)) throw err;
@@ -1876,7 +1885,7 @@ async function collectDrops(bot, radius, limit = 64) {
     seen.add(drop.id);
     if (freeSlots(bot) === 0) break;
     try {
-      await bot.actions.walkTo(drop.position.clone(), { range: 0.6 });
+      await navigate(bot, drop.position.clone(), { range: 0.6, vertical: 1 });
       n += 1;
     } catch (err) {
       if (isStopped(err)) throw err; // не дошёл до этого — следующий
@@ -2081,7 +2090,7 @@ async function getFood(bot, kind, want) {
     .sort((a, b) => a.position.distanceTo(me) - b.position.distanceTo(me));
   for (const d of drops) {
     try {
-      await bot.actions.walkTo(d.position.clone(), { range: 0.5 });
+      await navigate(bot, d.position.clone(), { range: 0.5, vertical: 1 });
       await bot.actions.wait(500); // сервер отдаёт предмет, когда игрок вплотную
     } catch (err) {
       if (isStopped(err)) throw err;
@@ -2139,9 +2148,9 @@ async function breed(bot, kinds, pairs, radius = BREED_RADIUS) {
         try {
           if (reachTo(bot, animal) > 2.7) {
             try {
-              await bot.actions.walkTo(animal.position.clone(), { range: 1.8 });
+              await navigate(bot, animal.position.clone(), { range: 1.8 });
             } catch (err) {
-              if (isStopped(err)) throw err; // упёрся в забор загона — дотянуться можно и через него
+              if (isStopped(err)) throw err; // в загон не пройти (забор) — дотянуться можно и через него
             }
           }
           await bot.actions.equip(food);
@@ -2485,7 +2494,8 @@ const COMMANDS = [
     name: 'иди',
     aliases: ['goto', 'go', 'подойди'],
     usage: ['#иди ко мне', '#иди к <ник или имя NPC>', '#иди X Y Z [бегом]', '#иди вперёд 3 [бегом]'],
-    about: 'дойти по прямой (поиска пути пока нет — обходить ямы и стены не умеет)',
+    about: 'дойти, обходя стены и ямы (поиск пути): запрыгивает на блок выше, спускается до 3 блоков, плывёт; лаву, огонь, кактусы ' +
+      'обходит; далеко (до 256 блоков) — по частям, пока догружается мир; пути нет — скажет',
     run: cmdGo,
   },
   { name: 'вперёд', aliases: ['forward'], usage: ['#вперёд 3 [бегом]'], about: 'пройти N блоков вперёд', run: walkCommand(0) },

@@ -260,6 +260,26 @@ test('физика: стоящий бот — позиция раз в 20 тик
   assert.equal(bot.entity.onGround, true);
 });
 
+test('физика: телепорт (в том числе откат античитом) не сбрасывает «стоит на земле» — как у обычного клиента', () => {
+  const clock = fakeClock();
+  const bot = physicsBot({ clock });
+  bot.emit('login');
+  teleport(bot);
+  clock.advance(500);
+  assert.equal(bot.entity.onGround, true);
+  // Шёл и получил откат на шаг назад: следующий тик — разгон «по земле», как считает и античит.
+  bot.setControlState('forward', true);
+  clock.advance(200);
+  teleport(bot, { x: 0.5, z: 0.5, teleportId: 9 });
+  assert.equal(bot.entity.onGround, true, 'сразу после телепорта — как было');
+  take(bot);
+  clock.advance(50);
+  const move = take(bot).find((p) => /^position/.test(p.name));
+  // Разгон — по земле (0,1 за тик), а не «в воздухе» (0,02); «на земле» в этом пакете — false, как у клиента
+  // (вертикальной скорости после телепорта нет — опоры снизу этот шаг не касается).
+  assert.ok(move.params.z - 0.5 > 0.09, `разгон по земле, а не в воздухе: ${(move.params.z - 0.5).toFixed(4)}`);
+});
+
 test('физика: полёт от сервера — после телепорта висит, как клиент; на земле или в движении «приземляется»', () => {
   const clock = fakeClock();
   const bot = physicsBot({ clock });

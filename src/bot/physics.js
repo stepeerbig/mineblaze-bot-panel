@@ -700,7 +700,9 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
       newPitch = (flags & 16 ? curPitch : 0) + packet.pitch;
     }
 
-    bot.entity.onGround = false;
+    // «Стоит на земле» телепорт не меняет: обычный клиент (setValuesFromPositionPacket) его не трогает, и античит
+    // считает следующий тик так же. mineflayer сбрасывал его в false — тогда после отката античитом бот, который шёл,
+    // разгонялся «как в воздухе», расходился с Grim и получал откат снова, и так по кругу (стенд, 6 ноября).
     if (bot.supportFeature('teleportUsesOwnPacket')) bot._client.write('teleport_confirm', { teleportId: packet.teleportId });
 
     const confirm = (at, yawDeg, pitchDeg) => {

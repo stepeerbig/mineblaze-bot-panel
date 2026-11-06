@@ -243,6 +243,9 @@ async function runScenario(manager, cmd) {
       // Меню-сундук у сущности — как меню NPC на MineBlaze: вагонетка с сундуком.
       `execute at ${BOT_NAME} run summon chest_minecart ~-2 ~ ~2 {CustomName:"Market",` +
         'Items:[{Slot:0b,id:"minecraft:diamond",count:3},{Slot:4b,id:"minecraft:emerald",count:5}]}',
+      // Навигация (поиск пути): стена поперёк площадки с проходом у края и помост на блок выше.
+      `execute at ${BOT_NAME} run fill ~4 ~ ~-6 ~4 ~2 ~3 minecraft:stone`,
+      `execute at ${BOT_NAME} run fill ~-5 ~ ~-5 ~-4 ~ ~-4 minecraft:stone`,
     ]) cmd(c);
     await wait(3000);
     const o = bot.entity.position.floored();
@@ -258,6 +261,9 @@ async function runScenario(manager, cmd) {
       `#смотри на ${HELPER_NAME}`,
       '#иди ко мне',
       `#иди ${xyz(0, 0, 0)}`,
+      `#иди ${xyz(5, 0, -3)}`, // за стену — в обход, через проход у края
+      `#иди ${xyz(-4, 1, -4)}`, // на помост — прыжком
+      `#иди ${xyz(0, 0, 0)}`, // обратно — вниз с помоста
       '#смотри юг',
       '#вперёд 3',
       '#назад 3 бегом',
