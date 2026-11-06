@@ -33,6 +33,8 @@ const DEFAULT_CONFIG = Object.freeze({
   questStorage: '', // дом склада с предметами для «Передайте…» (/home <имя> у каждого бота)
   questRewards: '', // дом склада наград
   questMobHomes: '', // комнаты мобов для «Убейте…»: строки «пауки: пауки» (кто: дом)
+  questFarm: '', // дом фермы: «Передайте пшеницу…» — сначала собрать урожай там (#урожай)
+  questPen: '', // дом загона: «Разведите коров…» — покормить пары там (#разведи)
   questTogether: 2, // ботов делают задания одновременно
   questPause: 15, // минут между проверками одного бота
 });
@@ -131,7 +133,7 @@ function sanitize(src) {
     out.ollamaModel = src.ollamaModel.trim().replace(/\s+/g, '').slice(0, 200) || DEFAULT_CONFIG.ollamaModel;
   }
   if (typeof src.questAuto === 'boolean') out.questAuto = src.questAuto;
-  for (const key of ['questStorage', 'questRewards']) {
+  for (const key of ['questStorage', 'questRewards', 'questFarm', 'questPen']) {
     if (typeof src[key] !== 'string') continue;
     const home = src[key].trim().replace(/^\/?home\s+/i, ''); // «/home урожай» — тоже можно
     if (!home || HOME_RE.test(home)) out[key] = home;

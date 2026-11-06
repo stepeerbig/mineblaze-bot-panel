@@ -130,7 +130,12 @@ const MOB_WORDS = [
   [w('магм\\S*\\s+куб|лавов\\S*\\s+слиз'), ['magma_cube']], [w('слизн|слизе'), ['slime']], [w('гаст'), ['ghast']],
   [w('фантом'), ['phantom']], [w('чешуйниц'), ['silverfish']], [w('древн\\S*\\s+страж'), ['elder_guardian']], [w('страж'), ['guardian']],
   [w('разбойник'), ['pillager']], [w('поборник'), ['vindicator']], [w('хоглин'), ['hoglin']], [w('зоглин'), ['zoglin']],
-  [w('коров'), ['cow']], [w('кур(?:иц|ы|ей|а|$)'), ['chicken']], [w('свин'), ['pig']], [w('овц|овеч'), ['sheep']], [w('кролик'), ['rabbit']],
+  // Животные (задания «Разведите…», команда #разведи): составные — раньше простых («грибных коров» ≠ «коров»).
+  [w('грибн\\S*\\s+коров|муушрум'), ['mooshroom']], [w('коров'), ['cow']], [w('кур(?:иц|ы|ей|а|$)'), ['chicken']], [w('свин'), ['pig']],
+  [w('овц|овеч'), ['sheep']], [w('кролик'), ['rabbit']], [w('коз'), ['goat']], [w('лошад|кон(?:ь|ей|я)'), ['horse']], [w('осл'), ['donkey']],
+  [w('лам'), ['llama']], [w('лис(?!т)'), ['fox']], [w('пч[её]л'), ['bee']], [w('панд'), ['panda']], [w('черепах'), ['turtle']],
+  [w('волк|волч'), ['wolf']], [w('кош|кот(?!е)'), ['cat']], [w('лягуш'), ['frog']], [w('верблюд'), ['camel']],
+  [w('страйдер|лавомерк'), ['strider']], [w('нюхач|сниффер'), ['sniffer']], [w('броненос'), ['armadillo']], [w('аксолотл'), ['axolotl']],
 ];
 const MOB_NAMES = {
   spider: 'паук', cave_spider: 'пещерный паук', zombified_piglin: 'зомбифицированный пиглин', piglin_brute: 'пиглин-громила',
@@ -138,7 +143,9 @@ const MOB_NAMES = {
   zombie_villager: 'зомби-житель', husk: 'кадавр', drowned: 'утопленник', zombie: 'зомби', creeper: 'крипер', enderman: 'эндермен',
   witch: 'ведьма', magma_cube: 'магмовый куб', slime: 'слизень', ghast: 'гаст', phantom: 'фантом', silverfish: 'чешуйница',
   elder_guardian: 'древний страж', guardian: 'страж', pillager: 'разбойник', vindicator: 'поборник', hoglin: 'хоглин', zoglin: 'зоглин',
-  cow: 'корова', chicken: 'курица', pig: 'свинья', sheep: 'овца', rabbit: 'кролик',
+  cow: 'корова', chicken: 'курица', pig: 'свинья', sheep: 'овца', rabbit: 'кролик', mooshroom: 'грибная корова', goat: 'коза',
+  horse: 'лошадь', donkey: 'осёл', llama: 'лама', fox: 'лиса', bee: 'пчела', panda: 'панда', turtle: 'черепаха', wolf: 'волк',
+  cat: 'кошка', frog: 'лягушка', camel: 'верблюд', strider: 'страйдер', sniffer: 'нюхач', armadillo: 'броненосец', axolotl: 'аксолотль',
 };
 
 /** «пауков» → ['spider', 'cave_spider'], «пиглинов или ифритов» → ['piglin', 'piglin_brute', 'blaze']. */
@@ -216,7 +223,7 @@ function parseQuest(slot, title, lore, icon = '') {
     done: false,
     items: kind === 'deliver' ? deliverItems(what) : [],
   };
-  if (kind === 'kill') quest.mobs = mobsOf(what);
+  if (kind === 'kill' || kind === 'breed') quest.mobs = mobsOf(what);
   quest.done = (quest.need > 0 && quest.have >= quest.need) || DONE_RE.test(text);
   if (u) quest.unlock = { npc: questNpc(u[1]) || clean(u[1]), level: Number(u[2]) };
   return quest;

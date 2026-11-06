@@ -1011,6 +1011,65 @@ test('команды: #бей — только нужные мобы в дося
   assert.match((await s.run('#бей пауков дом')).message, /какой дом\? Например: #бей пауков 20 дом пауки/);
 });
 
+test('команды: #урожай — только спелое (по возрасту), подобрать выпавшее, посадить семена обратно; «пшеница» — только её', async () => {
+  const s = setup({ inventory: [['wheat_seeds', 10], ['carrot', 3]] });
+  const field = [[2, 0, 'wheat#7'], [2, 1, 'wheat#7'], [3, 0, 'wheat#3'], [-2, 0, 'carrots#7'], [-2, 1, 'carrots#5']];
+  for (const [x, z, crop] of field) {
+    s.world.set(new Vec3(x, 63, z), 'farmland');
+    s.world.set(new Vec3(x, 64, z), crop);
+  }
+  s.world.set(new Vec3(0, 64, 3), 'sugar_cane');
+  s.world.set(new Vec3(0, 65, 3), 'sugar_cane'); // второй снизу — срезать, нижний оставить
+  for (const name of ['wheat', 'carrots', 'sugar_cane']) s.bot.digTicks[name] = 1;
+  s.bot.entities[900] = { id: 900, name: 'item', position: new Vec3(2.5, 64, 2.5) }; // выпало у грядки
+
+  const only = await s.run('#урожай пшеница', 120000);
+  assert.equal(only.ok, true, [].concat(only.message).join('\n'));
+  assert.deepEqual(only.data.harvested, { wheat: 2 }, 'только спелая пшеница; незрелая (возраст 3) и морковь — нет');
+  assert.equal(s.world.get(new Vec3(3, 64, 0)), 'wheat#3');
+  assert.equal(s.world.get(new Vec3(-2, 64, 0)), 'carrots#7');
+  assert.equal(only.data.picked, 1, 'подобрал выпавшее');
+  assert.ok(s.bot.entity.position.distanceTo(new Vec3(2.5, 64, 2.5)) < 1, 'дошёл до предмета');
+  assert.equal(only.data.planted, 2, 'посадил семена обратно');
+  assert.equal(s.world.get(new Vec3(2, 64, 0)), 'wheat');
+  assert.equal(s.world.get(new Vec3(2, 64, 1)), 'wheat');
+
+  const all = await s.run('#урожай', 120000);
+  assert.deepEqual(all.data.harvested, { carrot: 1, sugar_cane: 1 });
+  assert.equal(s.world.get(new Vec3(0, 64, 3)), 'sugar_cane', 'нижний тростник остался');
+  assert.equal(s.world.get(new Vec3(0, 65, 3)), 'air');
+  assert.equal(s.world.get(new Vec3(-2, 64, 0)), 'carrots', 'морковь посажена снова');
+
+  const none = await s.run('#урожай', 60000);
+  assert.equal(none.ok, false);
+  assert.equal(none.code, 'nothing');
+  assert.match([].concat(none.message)[0], /^Спелого рядом нет/);
+  assert.match((await s.run('#урожай камней')).message, /не знаю такой культуры: «камней»/);
+});
+
+test('команды: #разведи — пары взрослых (малышей не трогает), корм из инвентаря; повторно — не раньше 5 мин; нет корма — скажет', async () => {
+  const cow = (id, x, z, baby = false) => ({ id, type: 'mob', name: 'cow', position: new Vec3(x, 64, z), width: 0.9, height: 1.4, metadata: baby ? { 16: true } : {} });
+  const s = setup({ inventory: [['wheat', 5]], entities: [cow(501, 1.5, 1.5), cow(502, 2.5, 1.5), cow(503, 0.5, 2.5, true), cow(504, 3.5, 2.5)] });
+  const fed = () => s.bot._client.sent.filter((p) => p.name === 'use_entity' && p.params.mouse === 0).map((p) => p.params.target);
+  s.bot._client.sent = [];
+  const r = await s.run('#разведи коров', 120000);
+  assert.equal(r.ok, true, [].concat(r.message).join('\n'));
+  assert.equal(r.data.pairs, 1, 'взрослых трое: одна пара');
+  assert.deepEqual(fed().sort(), [501, 502]);
+  assert.ok(!fed().includes(503), 'телёнка не кормит');
+  assert.equal(s.bot.heldItem && s.bot.heldItem.name, 'wheat');
+
+  // Тех же — не раньше 5 мин: осталась одна взрослая — пары нет.
+  const again = await s.run('#разведи коров', 60000);
+  assert.equal(again.ok, false);
+  assert.match([].concat(again.message).join('\n'), /Мало взрослых рядом/);
+
+  const pigs = await s.run('#разведи свиней', 60000);
+  assert.equal(pigs.code, 'no_food');
+  assert.match([].concat(pigs.message).join('\n'), /Нет корма: свинья — carrot\/potato\/beetroot/);
+  assert.match((await s.run('#разведи драконов')).message, /кого разводить\?/);
+});
+
 test('команды: сундук на чужой территории — сервер не даёт открыть, бот так и пишет', async () => {
   const { run, world } = setup({ storage: { '1,64,2': { deny: true } } });
   world.set(new Vec3(1, 64, 2), 'chest');

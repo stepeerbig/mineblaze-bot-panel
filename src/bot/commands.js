@@ -1783,14 +1783,7 @@ async function fight(bot, goals, { idleMs = FIGHT_IDLE_MS, maxMs = FIGHT_MAX_MS 
  * «… дом пауки» — сначала /home пауки (комната со спавнером), бой — там.
  */
 async function cmdFight({ bot, args: allArgs, words = [] }) {
-  let args = allArgs;
-  let home = null;
-  const at = words.indexOf('дом');
-  if (at >= 0) {
-    home = allArgs[at + 1] || null;
-    if (!home || !HOME_NAME_RE.test(home)) throw new CommandError('какой дом? Например: #бей пауков 20 дом пауки');
-    args = allArgs.filter((_, i) => i !== at && i !== at + 1);
-  }
+  const { home, args } = homeArg(allArgs, words, '#бей пауков 20 дом пауки');
   const num = args.find((a) => /^\d+$/.test(a));
   const text = args.filter((a) => a !== num).join(' ');
   let goals;
@@ -1828,6 +1821,287 @@ async function cmdFight({ bot, args: allArgs, words = [] }) {
   const kills = Object.fromEntries(r.kills);
   const ok = total > 0 || reached;
   return { ok, code: ok ? undefined : 'no_targets', message: lines, data: { kills, total, left: left.map((g) => ({ title: g.title, mobs: g.mobs, left: g.left })) } };
+}
+
+// ---------- общее для работы «у дома»: подойти, подобрать выпавшее, «дом <имя>» в словах команды ----------
+
+const WORK_REACH = 4; // дальше — сначала подойти (дотянуться можно на 4,4)
+const isStopped = (err) => Boolean(err && (err.code === 'stopped' || err.code === 'replaced'));
+
+/** «… дом пауки» в словах команды — { home, args без этих слов }; имя дома — как у /home. */
+function homeArg(args, words, example) {
+  const at = words.indexOf('дом');
+  if (at < 0) return { home: null, args };
+  const home = args[at + 1] || null;
+  if (!home || !HOME_NAME_RE.test(home)) throw new CommandError(`какой дом? Например: ${example}`);
+  return { home, args: args.filter((_, i) => i !== at && i !== at + 1) };
+}
+
+/** Свободных ячеек в инвентаре (без брони и второй руки). */
+function freeSlots(bot) {
+  const slots = bot.inventory && bot.inventory.slots ? bot.inventory.slots : [];
+  let free = 0;
+  for (let i = 9; i < 45; i += 1) if (!slots[i]) free += 1;
+  return free;
+}
+
+const hasItem = (bot, name) => inventoryItems(bot).some((it) => it.name === name);
+
+/** Подойти, если клетка дальше вытянутой руки. Не дошёл (застрял, далеко) — false; «#стоп» — дальше. */
+async function comeClose(bot, pos, range = 2.2) {
+  const eye = bot.entity.position.offset(0, 1.62, 0);
+  if (eye.distanceTo(pos.offset(0.5, 0.5, 0.5)) <= WORK_REACH) return true;
+  try {
+    await bot.actions.walkTo(new Vec3(pos.x + 0.5, pos.y, pos.z + 0.5), { range });
+    return true;
+  } catch (err) {
+    if (isStopped(err)) throw err;
+    return false;
+  }
+}
+
+/** Выпавший предмет (сущность «item»). */
+const isDrop = (e) => Boolean(e && e.position && (e.name === 'item' || e.objectType === 'Item' || e.displayName === 'Item'));
+
+/** Подобрать выпавшее рядом: пройти по предметам — сервер отдаёт их, когда игрок подходит вплотную. → сколько. */
+async function collectDrops(bot, radius, limit = 64) {
+  const seen = new Set();
+  let n = 0;
+  for (let i = 0; i < limit; i += 1) {
+    const me = bot.entity.position;
+    const drop = Object.values(bot.entities || {})
+      .filter((e) => isDrop(e) && !seen.has(e.id) && e.position.distanceTo(me) <= radius)
+      .sort((a, b) => a.position.distanceTo(me) - b.position.distanceTo(me))[0];
+    if (!drop) break;
+    seen.add(drop.id);
+    if (freeSlots(bot) === 0) break;
+    try {
+      await bot.actions.walkTo(drop.position.clone(), { range: 0.6 });
+      n += 1;
+    } catch (err) {
+      if (isStopped(err)) throw err; // не дошёл до этого — следующий
+    }
+  }
+  return n;
+}
+
+// ---------- урожай: собрать спелое, подобрать, посадить снова ----------
+
+const HARVEST_RADIUS = 16;
+const HARVEST_MAX = 300; // блоков за один раз
+// Культура (блок) → когда спелая, что из неё выходит и что сажать обратно.
+const CROPS = {
+  wheat: { ripe: 7, seed: 'wheat_seeds', item: 'wheat' },
+  carrots: { ripe: 7, seed: 'carrot', item: 'carrot' },
+  potatoes: { ripe: 7, seed: 'potato', item: 'potato' },
+  beetroots: { ripe: 3, seed: 'beetroot_seeds', item: 'beetroot' },
+  nether_wart: { ripe: 3, seed: 'nether_wart', item: 'nether_wart', soil: 'soul_sand' },
+  cocoa: { ripe: 2, item: 'cocoa_beans' },
+  sweet_berry_bush: { ripe: 2, use: true, item: 'sweet_berries' }, // ягоды срывают правой кнопкой, куст остаётся
+  melon: { whole: true, item: 'melon_slice' },
+  pumpkin: { whole: true, item: 'pumpkin' },
+  sugar_cane: { tall: true, item: 'sugar_cane' }, // нижний блок оставляем — вырастет снова
+  cactus: { tall: true, item: 'cactus' },
+  bamboo: { tall: true, item: 'bamboo' },
+};
+const CROP_OF_ITEM = Object.fromEntries(Object.entries(CROPS).map(([block, c]) => [c.item, block]));
+
+/** Спелая ли культура: возраст, целый плод (арбуз, тыква) или второй снизу блок тростника, кактуса, бамбука. */
+function isRipe(bot, block) {
+  const c = CROPS[block.name];
+  if (!c) return false;
+  if (c.whole) return true;
+  if (c.tall) {
+    const below = bot.blockAt(block.position.offset(0, -1, 0));
+    const below2 = bot.blockAt(block.position.offset(0, -2, 0));
+    return Boolean(below && below.name === block.name && !(below2 && below2.name === block.name));
+  }
+  let age = 0;
+  try {
+    age = Number(block.getProperties().age) || 0;
+  } catch (_) {
+    age = 0;
+  }
+  return age >= c.ripe;
+}
+
+/**
+ * Собрать спелое в радиусе: подойти, сломать (ягоды — сорвать), потом подобрать выпавшее и посадить семена туда,
+ * где было. kinds — какие культуры (имена блоков). → { harvested: Map(предмет → блоков), planted, replant, picked, note, noSeed }
+ */
+async function harvest(bot, kinds, radius) {
+  const want = new Set(kinds);
+  const harvested = new Map();
+  const replant = [];
+  const skip = new Set();
+  const key = (p) => `${p.x},${p.y},${p.z}`;
+  let note = '';
+  let count = 0;
+  for (;;) {
+    if (count >= HARVEST_MAX) {
+      note = `за раз не больше ${HARVEST_MAX} блоков`;
+      break;
+    }
+    if (freeSlots(bot) === 0) {
+      note = 'инвентарь полон';
+      break;
+    }
+    const next = scanBlocks(bot, radius, (b) => want.has(b.name)).find((x) => !skip.has(key(x.pos)) && isRipe(bot, x.block));
+    if (!next) break;
+    const c = CROPS[next.block.name];
+    skip.add(key(next.pos)); // не вышло — к этой клетке не возвращаемся
+    if (!(await comeClose(bot, next.pos))) continue;
+    try {
+      if (c.use) await bot.actions.activate(next.pos);
+      else await bot.actions.dig(next.pos);
+    } catch (err) {
+      if (isStopped(err)) throw err;
+      continue;
+    }
+    count += 1;
+    harvested.set(c.item, (harvested.get(c.item) || 0) + 1);
+    if (c.seed) replant.push({ pos: next.pos.clone(), seed: c.seed, soil: c.soil || 'farmland' });
+  }
+  const picked = count ? await collectDrops(bot, radius) : 0;
+  let planted = 0;
+  const noSeed = new Set();
+  for (const r of replant) {
+    const cell = bot.blockAt(r.pos);
+    const soil = bot.blockAt(r.pos.offset(0, -1, 0));
+    if (!cell || !/^(?:cave_|void_)?air$/.test(cell.name) || !soil || soil.name !== r.soil) continue;
+    if (!hasItem(bot, r.seed)) {
+      noSeed.add(r.seed);
+      continue;
+    }
+    if (!(await comeClose(bot, r.pos))) continue;
+    try {
+      await bot.actions.plant(r.pos, { item: r.seed });
+      planted += 1;
+    } catch (err) {
+      if (isStopped(err)) throw err;
+    }
+  }
+  return { harvested, planted, replant: replant.length, picked, note, noSeed: [...noSeed] };
+}
+
+/** «#урожай», «#урожай пшеница», «#урожай морковь 24 дом ферма» — собрать спелое в радиусе и посадить снова. */
+async function cmdHarvest({ bot, args: allArgs, words = [] }) {
+  const { home, args } = homeArg(allArgs, words, '#урожай пшеница дом ферма');
+  const num = args.find((a) => /^\d+$/.test(a));
+  const radius = num ? Math.max(4, Math.min(32, parseInt(num, 10))) : HARVEST_RADIUS;
+  const text = args.filter((a) => a !== num).join(' ');
+  let kinds = Object.keys(CROPS);
+  if (text) {
+    kinds = [...new Set(deliverItems(text).map((id) => CROP_OF_ITEM[id]).filter(Boolean))];
+    if (!kinds.length) throw new CommandError(`не знаю такой культуры: «${text}». Например: #урожай пшеница, #урожай (всё спелое)`);
+  }
+  if (home) await teleportBy(bot, `/home ${home}`);
+  const r = await harvest(bot, kinds, radius);
+  const total = [...r.harvested.values()].reduce((a, b) => a + b, 0);
+  const lines = [total
+    ? `Собрал: ${[...r.harvested.entries()].map(([id, n]) => `${id} ×${n}`).join(', ')} — блоков ${total}`
+    : `Спелого рядом нет (радиус ${radius})`];
+  if (r.picked) lines.push(`Подобрал выпавшее: ${r.picked}`);
+  if (r.replant) lines.push(`Посадил снова: ${r.planted} из ${r.replant}${r.noSeed.length ? ` (нет семян: ${r.noSeed.join(', ')})` : ''}`);
+  if (r.note) lines.push(`Остановился: ${r.note}`);
+  return {
+    ok: total > 0,
+    code: total ? undefined : 'nothing',
+    message: lines,
+    data: { harvested: Object.fromEntries(r.harvested), total, planted: r.planted, picked: r.picked, note: r.note, home },
+  };
+}
+
+// ---------- разведение: покормить пары взрослых животных ----------
+
+const BREED_RADIUS = 16;
+const BREED_COOLDOWN_MS = 5 * 60 * 1000; // после разведения животное 5 мин не размножается
+const MAX_BREED_PAIRS = 32;
+const MEAT = ['beef', 'porkchop', 'chicken', 'mutton', 'rabbit', 'cooked_beef', 'cooked_porkchop', 'cooked_chicken', 'cooked_mutton', 'cooked_rabbit', 'rotten_flesh'];
+const FLOWERS = ['dandelion', 'poppy', 'blue_orchid', 'allium', 'azure_bluet', 'red_tulip', 'orange_tulip', 'white_tulip', 'pink_tulip', 'oxeye_daisy', 'cornflower', 'lily_of_the_valley', 'sunflower', 'lilac', 'rose_bush', 'peony'];
+// Чем кормить для разведения (как в игре 1.21).
+const BREED_FOOD = {
+  cow: ['wheat'], mooshroom: ['wheat'], sheep: ['wheat'], goat: ['wheat'],
+  pig: ['carrot', 'potato', 'beetroot'],
+  chicken: ['wheat_seeds', 'beetroot_seeds', 'melon_seeds', 'pumpkin_seeds', 'torchflower_seeds', 'pitcher_pod'],
+  rabbit: ['carrot', 'golden_carrot', 'dandelion'],
+  horse: ['golden_carrot', 'golden_apple', 'enchanted_golden_apple'], donkey: ['golden_carrot', 'golden_apple', 'enchanted_golden_apple'],
+  llama: ['hay_block'], camel: ['cactus'], panda: ['bamboo'], fox: ['sweet_berries', 'glow_berries'], turtle: ['seagrass'],
+  wolf: MEAT, cat: ['cod', 'salmon'], bee: FLOWERS, frog: ['slime_ball'], strider: ['warped_fungus'], hoglin: ['crimson_fungus'],
+  sniffer: ['torchflower_seeds'], armadillo: ['spider_eye'], axolotl: ['tropical_fish_bucket'],
+};
+const lastFed = new Map(); // id животного → когда покормили (не кормить, пока не прошло 5 мин)
+// Детёныш: у AgeableMob в 1.20.5+ — ячейка 16 метаданных «is_baby».
+const isBaby = (e) => Boolean(e.metadata && e.metadata[16] === true);
+
+/**
+ * Покормить пары взрослых животных (kinds — виды), чтобы они размножились: не больше pairs пар. Корм — то, что есть
+ * у бота для этого вида. → { pairs, fed, byKind: Map(вид → пар), noFood: [вид], few: [вид] }
+ */
+async function breed(bot, kinds, pairs, radius = BREED_RADIUS) {
+  const byKind = new Map();
+  const noFood = [];
+  const few = [];
+  let done = 0;
+  let fed = 0;
+  for (const kind of kinds) {
+    if (done >= pairs) break;
+    const food = (BREED_FOOD[kind] || []).find((f) => hasItem(bot, f));
+    if (!food) {
+      noFood.push(kind);
+      continue;
+    }
+    const now = Date.now();
+    const me = bot.entity.position;
+    const adults = Object.values(bot.entities || {})
+      .filter((e) => e && e.name === kind && e.position && !isBaby(e) && e.position.distanceTo(me) <= radius)
+      .filter((e) => !(lastFed.has(e.id) && now - lastFed.get(e.id) < BREED_COOLDOWN_MS))
+      .sort((a, b) => a.position.distanceTo(me) - b.position.distanceTo(me));
+    if (adults.length < 2) {
+      few.push(kind);
+      continue;
+    }
+    for (let i = 0; i + 1 < adults.length && done < pairs; i += 2) {
+      if (!hasItem(bot, food)) break;
+      let ok = 0;
+      for (const animal of [adults[i], adults[i + 1]]) {
+        if (!bot.entities[animal.id]) continue;
+        try {
+          if (bot.entity.position.distanceTo(animal.position) > 2.5) await bot.actions.walkTo(animal.position.clone(), { range: 1.8 });
+          await bot.actions.equip(food);
+          await bot.actions.interact(animal);
+          lastFed.set(animal.id, Date.now());
+          ok += 1;
+          fed += 1;
+        } catch (err) {
+          if (isStopped(err)) throw err;
+        }
+      }
+      if (ok === 2) {
+        done += 1;
+        byKind.set(kind, (byKind.get(kind) || 0) + 1);
+      }
+    }
+  }
+  return { pairs: done, fed, byKind, noFood, few };
+}
+
+/** «#разведи коров», «#разведи кур 5 дом загон» — покормить пары взрослых животных (на всех — сколько есть пар). */
+async function cmdBreed({ bot, args: allArgs, words = [] }) {
+  const { home, args } = homeArg(allArgs, words, '#разведи коров 5 дом загон');
+  const num = args.find((a) => /^\d+$/.test(a));
+  const pairs = num ? Math.max(1, Math.min(MAX_BREED_PAIRS, parseInt(num, 10))) : MAX_BREED_PAIRS;
+  const text = args.filter((a) => a !== num).join(' ');
+  const kinds = mobsOf(text).filter((m) => BREED_FOOD[m]);
+  if (!kinds.length) throw new CommandError(`кого разводить? Например: #разведи коров, #разведи кур 5 (знаю: коровы, овцы, свиньи, куры, кролики, козы, лошади…)`);
+  if (home) await teleportBy(bot, `/home ${home}`);
+  const r = await breed(bot, kinds, pairs);
+  const lines = [r.pairs
+    ? `Покормил пар: ${r.pairs} (${[...r.byKind.entries()].map(([k, n]) => `${mobName(k)} ×${n}`).join(', ')}) — малыши появятся через пару секунд`
+    : 'Никого не покормил'];
+  if (r.noFood.length) lines.push(`Нет корма: ${r.noFood.map((k) => `${mobName(k)} — ${BREED_FOOD[k].slice(0, 3).join('/')}`).join('; ')}`);
+  if (r.few.length) lines.push(`Мало взрослых рядом (или ещё не прошло 5 мин после прошлого раза): ${r.few.map(mobName).join(', ')}`);
+  return { ok: r.pairs > 0, code: r.pairs ? undefined : r.noFood.length ? 'no_food' : 'no_animals', message: lines, data: { pairs: r.pairs, fed: r.fed, noFood: r.noFood, few: r.few, home } };
 }
 
 // ---------- пинг ----------
@@ -2002,6 +2276,22 @@ const COMMANDS = [
       'N штук или пока подходят; без слов — сколько нужно для заданий «Убейте…» (бот запоминает их у NPC); ' +
       '«дом пауки» — сначала /home пауки (комната со спавнером)',
     run: cmdFight,
+  },
+  {
+    name: 'урожай',
+    aliases: ['собери', 'собрать', 'harvest', 'ферма'],
+    usage: ['#урожай', '#урожай пшеница', '#урожай морковь 24', '#урожай дом ферма'],
+    about: 'собрать спелое в радиусе (по умолчанию 16): пшеница, морковь, картофель, свёкла, незерский нарост, какао, ягоды, ' +
+      'арбузы, тыквы, тростник, кактус, бамбук — подойти, сломать, подобрать выпавшее и посадить семена обратно; «дом ферма» — сначала /home ферма',
+    run: cmdHarvest,
+  },
+  {
+    name: 'разведи',
+    aliases: ['развести', 'разводи', 'breed'],
+    usage: ['#разведи коров', '#разведи кур 5', '#разведи овец дом загон'],
+    about: 'покормить пары взрослых животных рядом, чтобы родились малыши (корм — как в игре: коровам и овцам пшеница, свиньям морковь, ' +
+      'курам семена…; он должен быть у бота); число — сколько пар; одних и тех же — не чаще раза в 5 мин; «дом загон» — сначала /home загон',
+    run: cmdBreed,
   },
   {
     name: 'пинг',

@@ -79,7 +79,8 @@ test('автопилот: что делать у NPC — взять, прине�
   assert.deepEqual(p.deliver.map((x) => x.slot), [10]);
   assert.deepEqual(p.unknown.map((x) => x.slot), [15]);
   assert.deepEqual(p.kill, [{ title: 'Задание', goal: 'Убейте пауков', mobs: ['spider', 'cave_spider'], left: 15 }]);
-  assert.deepEqual(p.cant.map((x) => x.goal), ['Разведите коров']);
+  assert.deepEqual(p.breed.map((x) => x.goal), ['Разведите коров']);
+  assert.deepEqual(p.cant, []);
   assert.equal(p.waitMin, 120, 'до конца «Проведите…» — 2 ч');
   assert.equal(p.bring, true);
 
@@ -135,7 +136,7 @@ test('автопилот: «что нужно от тебя» — склад, д
     q({ slot: 10, title: 'Грядки', goal: 'Передайте пшеницу' }),
     q({ slot: 11, kind: 'buy', goal: 'Купите', need: 12000, items: [] }),
     q({ slot: 12, kind: 'kill', title: 'Паутина', goal: 'Убейте пауков', need: 20, items: [], mobs: ['spider', 'cave_spider'] }),
-    q({ slot: 13, kind: 'breed', goal: 'Разведите коров', need: 10, items: [] }),
+    q({ slot: 13, kind: 'breed', goal: 'Разведите коров', need: 10, items: [], mobs: ['cow'] }),
   ]);
   const { pilot, env } = makePilot((bot, line) => {
     if (line === '#квесты у Фермер') return ok(farmer);
@@ -153,7 +154,7 @@ test('автопилот: «что нужно от тебя» — склад, д
     'Положи на склад (/home урожай) для «Передайте пшеницу»: ещё 200 — не хватило 2 ботам',
     'Дай денег 2 ботам для «Купите…» (всего 17000): /pay Farm01 12000, /pay Farm02 5000',
     '«Убейте пауков» у 2 ботов: нужна комната с ними — впиши в «Комнаты мобов» строку «паук: <дом>» и поставь ботам этот дом',
-    'Пока не умею: «Разведите коров» (2 бота)',
+    '«Разведите коров» у 2 ботов: нужен загон — впиши «Дом загона» в настройках автопилота и поставь ботам /sethome там',
     'Включи автореконнект (ON): «Проведите на сервере» идёт, только пока бот в сети, а выпавший сам не вернётся',
   ]);
   pilot.running = false;
@@ -205,6 +206,35 @@ test('автопилот: «Убейте…» — в комнате мобов (
   assert.equal(st.npcs['Фермер'].finished, true);
   assert.equal(st.npcs['Оружейник'].locked, true, 'Оружейник — когда и Алхимик 4-го');
   assert.deepEqual(pilot.levels(), ['Фермер: пройден — 1', 'Алхимик: ур. 1 — 1', 'Оружейник: закрыт — 1']);
+});
+
+test('автопилот: ферма и загон — «Передайте пшеницу» сначала с фермы (#урожай), «Разведите коров» — в загоне (#разведи); нет корма — в «что нужно»', async () => {
+  let fed = false;
+  const quests = () => [
+    q({ slot: 10, goal: 'Передайте пшеницу', items: ['wheat'], have: 0, need: 64 }),
+    q({ slot: 11, kind: 'breed', goal: 'Разведите коров', have: fed ? 1 : 0, need: 3, items: [], mobs: ['cow'] }),
+  ];
+  const { pilot, env, calls } = makePilot((bot, line) => {
+    if (line === '#квесты у Фермер') return ok(view('Фермер', 1, quests()));
+    if (line === '#урожай пшеница дом ферма') return ok({ harvested: { wheat: 40 }, total: 40, planted: 40 });
+    if (line === '#квесты принести урожай награды у Фермер') return ok({ gave: [{ slot: 10, done: false }], took: [], levelUps: [], short: [] });
+    if (line.startsWith('#разведи корова')) {
+      if (bot === 'farm02') return { ok: false, code: 'no_food', message: ['Нет корма: корова — wheat'], data: { pairs: 0 } };
+      fed = true;
+      return ok({ pairs: 1, fed: 2 });
+    }
+    throw new Error(`лишняя команда: ${line}`);
+  }, { nicks: ['Farm01', 'Farm02'], cfg: { questFarm: 'ферма', questPen: 'загон', questTogether: 1 } });
+  await oneRound(pilot, env);
+  const farm01 = calls.filter((c) => c.bot === 'farm01').map((c) => c.line);
+  assert.deepEqual(farm01.slice(0, 4), [
+    '#квесты у Фермер',
+    '#урожай пшеница дом ферма', // сначала — с фермы
+    '#квесты принести урожай награды у Фермер', // потом сдать (недостающее — со склада)
+    '#разведи корова 3 дом загон',
+  ]);
+  assert.deepEqual(pilot.state.bots.farm01.problems, []);
+  assert.deepEqual(pilot.needs(), ['Нет корма для «Разведите коров» (1 бот): корова — дай ботам корм (например, пшеницу коровам и овцам, морковь свиньям, семена курам)']);
 });
 
 test('автопилот: пауза (ИИ, «по очереди») — начатое бросают и продолжают потом; стоп; не в сети — не трогает', async () => {

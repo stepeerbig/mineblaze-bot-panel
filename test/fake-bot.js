@@ -196,7 +196,9 @@ function autoServer(bot, world, { chests = {}, storage = {}, npcs = {}, onClick 
         bot.currentWindow = { title: clicked, containerItems: () => items.map((it) => ({ ...it })) };
         bot.emit('windowOpen', bot.currentWindow);
       } else if (bot.heldItem) {
-        world.set(loc.plus(FACE_VECTORS[params.direction]), bot.heldItem.name);
+        // Семена на грядку — росток; блок в руке — сам блок.
+        const PLANTS = { wheat_seeds: 'wheat', carrot: 'carrots', potato: 'potatoes', beetroot_seeds: 'beetroots', nether_wart: 'nether_wart' };
+        world.set(loc.plus(FACE_VECTORS[params.direction]), PLANTS[bot.heldItem.name] || bot.heldItem.name);
       }
     }
   };

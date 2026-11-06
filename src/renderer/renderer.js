@@ -48,6 +48,8 @@ const el = {
   questStorage: $('questStorage'),
   questRewards: $('questRewards'),
   questMobHomes: $('questMobHomes'),
+  questFarm: $('questFarm'),
+  questPen: $('questPen'),
   questTogether: $('questTogether'),
   questPause: $('questPause'),
   aiTag: $('aiTag'),
@@ -449,7 +451,7 @@ function fillForm(cfg) {
   }
   el.aiProvider.value = cfg.aiProvider === 'openai' ? 'openai' : 'ollama';
   el.ollamaGpu.checked = cfg.ollamaGpu !== false;
-  for (const key of ['questStorage', 'questRewards', 'questMobHomes', 'questTogether', 'questPause']) {
+  for (const key of ['questStorage', 'questRewards', 'questFarm', 'questPen', 'questMobHomes', 'questTogether', 'questPause']) {
     if (document.activeElement !== el[key]) el[key].value = cfg[key] === undefined || cfg[key] === null ? '' : cfg[key];
   }
   updateQuestSetupTag();
@@ -468,6 +470,8 @@ let questState = null; // последнее состояние автопило
 const readQuestForm = () => ({
   questStorage: el.questStorage.value,
   questRewards: el.questRewards.value,
+  questFarm: el.questFarm.value,
+  questPen: el.questPen.value,
   questMobHomes: el.questMobHomes.value,
   questTogether: el.questTogether.value,
   questPause: el.questPause.value,
@@ -809,7 +813,7 @@ el.questToggle.addEventListener('click', async () => {
   }
 });
 el.questCheckNow.addEventListener('click', async () => renderQuests(await bridge.questsCheckNow()));
-for (const field of [el.questStorage, el.questRewards, el.questMobHomes, el.questTogether, el.questPause]) {
+for (const field of [el.questStorage, el.questRewards, el.questFarm, el.questPen, el.questMobHomes, el.questTogether, el.questPause]) {
   field.addEventListener('change', async () => fillForm(await bridge.saveConfig(readQuestForm())));
 }
 el.questStorage.addEventListener('input', updateQuestSetupTag);

@@ -21,6 +21,11 @@ const { QUEST_NPCS, MAX_NPC_LEVEL, mobsOf, mobName } = require('./bot/quests');
 const { parseMobHomes } = require('./config');
 
 const NPC_NAMES = QUEST_NPCS.map((n) => n.name);
+// Что из «Передайте…» растёт на ферме — слова для #урожай (предмет → как назвать культуру).
+const CROP_WORDS = {
+  wheat: 'пшеница', carrot: 'морковь', potato: 'картофель', beetroot: 'свёкла', sweet_berries: 'ягоды', sugar_cane: 'тростник',
+  melon_slice: 'арбуз', pumpkin: 'тыква', cocoa_beans: 'какао', nether_wart: 'нарост', cactus: 'кактус', bamboo: 'бамбук',
+};
 const MAX_PAUSE_MIN = 120; // сделать нечего — проверять всё реже, но не реже раза в 2 ч
 const MAX_PASSES = 3; // у одного NPC за ход: новый уровень или новые задания — посмотреть ещё раз
 const JOURNAL = 40; // строк журнала автопилота для панели
@@ -62,9 +67,10 @@ function planNpc(view) {
   const deliver = taken.filter((q) => q.kind === 'deliver' && q.items && q.items.length);
   const unknown = taken.filter((q) => q.kind === 'deliver' && !(q.items && q.items.length));
   const buy = taken.filter((q) => q.kind === 'buy');
-  const kill = taken.filter((q) => q.kind === 'kill')
-    .map((q) => ({ title: q.title, goal: q.goal, mobs: q.mobs || [], left: Math.max(1, Math.ceil(q.need - q.have)) }));
-  const cant = taken.filter((q) => q.kind === 'breed' || q.kind === 'other');
+  const left = (q) => Math.max(1, Math.ceil(q.need - q.have));
+  const kill = taken.filter((q) => q.kind === 'kill').map((q) => ({ title: q.title, goal: q.goal, mobs: q.mobs || [], left: left(q) }));
+  const breed = taken.filter((q) => q.kind === 'breed').map((q) => ({ title: q.title, goal: q.goal, mobs: q.mobs || [], left: left(q) }));
+  const cant = taken.filter((q) => q.kind === 'other');
   const time = open.filter((q) => q.kind === 'time');
   const waitMin = time.length ? Math.min(...time.map((q) => Math.max(0, q.need - q.have))) : Infinity;
   const take = untaken.length > 0 || levelReady;
@@ -76,6 +82,7 @@ function planNpc(view) {
     deliver,
     unknown,
     kill,
+    breed,
     cant,
     waitMin,
     bring: take || buy.length > 0 || deliver.length > 0,
@@ -259,13 +266,14 @@ class QuestAutopilot extends EventEmitter {
         else if (p.type === 'no_money') add('money', p, st.nick, p.amount);
         else if (p.type === 'no_home') add(`home:${p.home}`, p, st.nick);
         else if (p.type === 'kill') add(`kill:${p.mobs.join('/')}`, p, st.nick, p.left);
+        else if (p.type === 'breed' || p.type === 'no_food' || p.type === 'no_animals') add(`${p.type}:${p.mobs.join('/')}`, p, st.nick);
         else if (p.type === 'kill_none') add(`kill_none:${p.home}`, p, st.nick);
         else if (p.type === 'cant' || p.type === 'unknown_items') add(`${p.type}:${p.goal}`, p, st.nick);
         else add(p.type, p, st.nick);
       }
     }
     const out = [];
-    const order = ['no_home', 'no_storage', 'no_items', 'no_money', 'full', 'kill', 'kill_none', 'unknown_items', 'cant', 'pvp', 'error'];
+    const order = ['no_home', 'no_storage', 'no_items', 'no_money', 'full', 'kill', 'kill_none', 'breed', 'no_food', 'no_animals', 'unknown_items', 'cant', 'pvp', 'error'];
     const sorted = [...groups.values()].sort((a, b) => order.indexOf(a.type) - order.indexOf(b.type));
     for (const g of sorted) {
       const nicks = [...g.nicks];
@@ -294,6 +302,15 @@ class QuestAutopilot extends EventEmitter {
         case 'kill_none':
           out.push(`В комнате «${g.home}» боты никого не убили (${botsNum(n)}) — мобы должны подходить к боту на удар`);
           break;
+        case 'breed':
+          out.push(`«${g.goal || g.title}» у ${botsOf(n)}: нужен загон — впиши «Дом загона» в настройках автопилота и поставь ботам /sethome там`);
+          break;
+        case 'no_food':
+          out.push(`Нет корма для «${g.goal}» (${botsNum(n)}): ${mobName(g.mobs[0])} — дай ботам корм (например, пшеницу коровам и овцам, морковь свиньям, семена курам)`);
+          break;
+        case 'no_animals':
+          out.push(`В загоне «${g.home}» меньше двух взрослых (${mobName(g.mobs[0])}) или их кормили меньше 5 мин назад (${botsNum(n)}) — пригони животных`);
+          break;
         case 'unknown_items':
           out.push(`Не знаю, какие это предметы: «${g.goal}» (${botsNum(n)}) — пришли скриншот задания, научу`);
           break;
@@ -320,6 +337,8 @@ class QuestAutopilot extends EventEmitter {
     return {
       storage: String(c.questStorage || ''),
       rewards: String(c.questRewards || ''),
+      farm: String(c.questFarm || ''),
+      pen: String(c.questPen || ''),
       rooms: parseMobHomes(c.questMobHomes),
       together: Math.max(1, Math.min(5, Number(c.questTogether) || 2)),
       pause: Math.max(1, Number(c.questPause) || 15),
@@ -538,6 +557,17 @@ class QuestAutopilot extends EventEmitter {
       waitMin = plan.waitMin;
       let changed = false; // новый уровень или новые задания — ещё проход
       let did = false; // в этом проходе что-то сдвинулось
+      // «Передайте пшеницу…» — сначала собрать урожай на ферме (принесёт в инвентаре, недостающее — со склада).
+      const crops = [...new Set(plan.deliver.flatMap((q) => q.items || []).filter((id) => CROP_WORDS[id]))];
+      if (crops.length && cfg.farm) {
+        const r = await this._cmd(b, cur, 'собираю урожай на ферме', `#урожай ${crops.map((id) => CROP_WORDS[id]).join(', ')} дом ${cfg.farm}`);
+        if (stopped(r)) return { progress, interrupted: true };
+        if (r.data && r.data.total > 0) did = true;
+        else if (r.code !== 'nothing') {
+          const p = problemOfFailure(r, npc);
+          if (p) problems.push(p);
+        }
+      }
       // Взять, купить, принести со склада, сдать, повысить уровень.
       if (plan.bring && cfg.storage) {
         const line = `#квесты принести ${cfg.storage}${cfg.rewards ? ` ${cfg.rewards}` : ''} у ${npc}`;
@@ -596,6 +626,26 @@ class QuestAutopilot extends EventEmitter {
         } else if (r.code === 'no_targets') {
           problems.push({ type: 'kill_none', npc, home });
         } else {
+          const p = problemOfFailure(r, npc);
+          if (p) problems.push(p);
+        }
+      }
+      // «Разведите…» — покормить пары в загоне, если он задан (корм — у бота).
+      for (const k of plan.breed) {
+        if (!k.mobs.length) {
+          problems.push({ type: 'cant', npc, title: k.title, goal: k.goal });
+          continue;
+        }
+        if (!cfg.pen) {
+          problems.push({ type: 'breed', npc, title: k.title, goal: k.goal, mobs: k.mobs });
+          continue;
+        }
+        const r = await this._cmd(b, cur, `развожу: ${mobName(k.mobs[0])}`, `#разведи ${mobName(k.mobs[0])} ${k.left} дом ${cfg.pen}`);
+        if (stopped(r)) return { progress, interrupted: true };
+        if (r.data && r.data.pairs > 0) did = true;
+        else if (r.code === 'no_food') problems.push({ type: 'no_food', npc, goal: k.goal, mobs: k.mobs });
+        else if (r.code === 'no_animals') problems.push({ type: 'no_animals', npc, goal: k.goal, mobs: k.mobs, home: cfg.pen });
+        else {
           const p = problemOfFailure(r, npc);
           if (p) problems.push(p);
         }

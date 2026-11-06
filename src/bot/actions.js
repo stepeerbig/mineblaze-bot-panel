@@ -611,6 +611,33 @@ function inject(bot, { random, now }) {
     });
   }
 
+  /**
+   * Посадить в клетку position (воздух над грядкой): семена или клубни (wheat_seeds, carrot…) в руку и нажать
+   * по верхней грани блока под клеткой — как человек. Ждёт, пока сервер покажет росток.
+   * @param {Vec3}   position
+   * @param {object} opts
+   * @param {string} opts.item  что сажать (имя предмета)
+   */
+  function plant(position, { item } = {}) {
+    const pos = new Vec3(Math.floor(position.x), Math.floor(position.y), Math.floor(position.z));
+    return run('посадить', async (signal) => {
+      const cell = blockAtOrThrow(pos);
+      if (!isAir(cell)) throw new ActionError(`клетка ${fmt(pos)} занята: ${cell.name}`);
+      const soilPos = pos.offset(0, -1, 0);
+      const soil = blockAtOrThrow(soilPos);
+      if (isAir(soil)) throw new ActionError(`под ${fmt(pos)} нет грядки`);
+      if (item) await equipItem(item, signal);
+      if (!bot.heldItem) throw new ActionError('в руке ничего нет');
+      const top = soil.shapes && soil.shapes.length ? Math.max(...soil.shapes.map((s) => s[4])) : 1;
+      const point = soilPos.offset(0.3 + 0.4 * random(), top, 0.3 + 0.4 * random());
+      const eye = eyePosition();
+      if (eye.distanceTo(point) > BLOCK_REACH) throw new ActionError(`грядка ${fmt(soilPos)} слишком далеко`);
+      await useOn({ position: soilPos, face: 1, point }, signal, { expectTarget: true });
+      if (!(await waitBlockChange(pos, (b) => b && !isAir(b), signal))) throw new ActionError(`сервер не дал посадить в ${fmt(pos)}`, 'rejected');
+      return { position: pos, item: bot.heldItem ? bot.heldItem.name : item };
+    });
+  }
+
   const entityBox = (entity) => {
     const w = (entity.width || 0.6) / 2;
     const p = entity.position;
@@ -837,6 +864,7 @@ function inject(bot, { random, now }) {
     walkTo,
     dig,
     place,
+    plant,
     activate,
     attack,
     canHit,
