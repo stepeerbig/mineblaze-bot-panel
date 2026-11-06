@@ -48,6 +48,13 @@ const MIN_MOVE_SQ = 2.0e-4 * 2.0e-4; // меньший сдвиг обычный
 const POSITION_REMINDER_TICKS = 20; // позицию без движения клиент всё равно присылает раз в 20 тиков
 const DEAD_TICKS = 20; // после смерти движение шлём ещё 20 тиков (как mineflayer)
 const ERROR_REPORT_MS = 10 * 1000; // ошибку внутри тика сообщаем не чаще, чем раз в 10 с
+// Полёт от сервера («Флай включен!» на спавне): висящий без дела бот через 3–5 с «приземляется» — как живой игрок
+// двойным пробелом. Иначе он висит, пока сам не пойдёт: его не сносит вода, не толкают другие (летящих игра не
+// толкает), а со стороны это выглядит странно.
+const HOVER_LAND_TICKS = 60;
+const HOVER_LAND_JITTER = 40;
+const PUSH_STRENGTH = 0.05; // Entity.push: насколько за тик расталкивают друг друга пересёкшиеся игроки
+const PLAYER_HALF_WIDTH = 0.3;
 
 // Поворот головы. Шаг мыши при чувствительности 100% (по умолчанию в игре) — 0,15°.
 const MOUSE_STEP = 0.15;
@@ -168,6 +175,8 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
   //  • после телепорта скорость нулевая — клиент висит на месте (не на земле), пока его не трогают;
   //  • если он стоял на земле или пошёл — «приземляется»: выключает полёт и сообщает серверу (abilities).
   let flying = false;
+  let hoverTicks = 0; // сколько тиков висит в полёте без дела
+  let landAfter = HOVER_LAND_TICKS; // через сколько — «приземлиться» (немного разное от раза к разу)
 
   // Взгляд в градусах игры, без сворачивания в круг (угол в пакетах меняется плавно, без скачков на 360°).
   // bot.entity.yaw/pitch — куда бот хочет смотреть (как в mineflayer), а здесь — куда он смотрит сейчас.
@@ -238,9 +247,12 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
       let hover = false;
       if (flying && !(bot.game && bot.game.gameMode === 'spectator')) {
         const wantsMove = controls.forward || controls.back || controls.left || controls.right || controls.jump || controls.sneak;
-        if (wantsMove || bot.entity.onGround) {
-          // «Приземлился» (или двойной пробел, чтобы пойти пешком): полёт выключен — сервер узнаёт первым.
+        hoverTicks += 1;
+        if (wantsMove || bot.entity.onGround || hoverTicks >= landAfter) {
+          // «Приземлился» (пошёл, стоял на земле или двойной пробел после пары секунд без дела): полёт выключен —
+          // сервер узнаёт первым, дальше обычная физика (вода сносит, игроки толкают).
           flying = false;
+          hoverTicks = 0;
           client.write('abilities', { flags: 0 });
         } else {
           hover = true;
@@ -252,6 +264,7 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
           bot.entity.velocity.set(0, 0, 0);
           bot.entity.onGround = false;
         } else {
+          pushFromPlayers();
           const state = new PlayerState(bot, controls);
           state.yaw = conv.fromNotchianYaw(current.yaw); // движение — по настоящему взгляду, а не по целевому
           state.pitch = conv.fromNotchianPitch(current.pitch);
@@ -598,7 +611,61 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
   // Сервер включил или выключил полёт (флаг 2 — «летит»).
   bot._client.on('abilities', (packet) => {
     flying = Boolean(packet && packet.flags & 2);
+    hoverTicks = 0;
+    landAfter = HOVER_LAND_TICKS + Math.floor(random() * HOVER_LAND_JITTER);
   });
+
+  // ---------- игроки толкают друг друга ----------
+
+  /** Правило столкновений команды (scoreboard team): 'always' | 'never' | 'pushOtherTeams' | 'pushOwnTeam'. */
+  function collisionRuleOf(team) {
+    const r = team ? team.collisionRule : undefined;
+    if (typeof r === 'number') return ['always', 'never', 'pushOtherTeams', 'pushOwnTeam'][r] || 'always';
+    const s = String(r || 'always').toLowerCase();
+    if (s === 'never') return 'never';
+    if (s === 'pushotherteams') return 'pushOtherTeams';
+    if (s === 'pushownteam') return 'pushOwnTeam';
+    return 'always';
+  }
+
+  /**
+   * Другие игроки, с которыми бот пересёкся, отталкивают его — как обычного клиента (в игре это делают чужие
+   * игроки своим тиком: Entity.push, EntitySelector.pushableBy — с правилами столкновений команд). Без этого боты,
+   * которых сервер поставил в одну точку (/tpa, /home), так и стояли друг в друге, а античит, который ждёт
+   * расталкивания, раз за разом откатывал их — со стороны это слышно как бег на месте.
+   */
+  function pushFromPlayers() {
+    const me = bot.entity;
+    if (!me || !me.position || !bot.entities) return;
+    const teams = bot.teamMap || {};
+    const myTeam = teams[bot.username];
+    const myRule = collisionRuleOf(myTeam);
+    if (myRule === 'never') return;
+    const myTop = me.position.y + (me.height || 1.8);
+    for (const other of Object.values(bot.entities)) {
+      if (!other || other === me || other.type !== 'player' || !other.position) continue;
+      const half = (other.width || 0.6) / 2;
+      const dx0 = me.position.x - other.position.x;
+      const dz0 = me.position.z - other.position.z;
+      // Пересекаются ли коробки (касание — нет).
+      if (Math.abs(dx0) >= PLAYER_HALF_WIDTH + half || Math.abs(dz0) >= PLAYER_HALF_WIDTH + half) continue;
+      if (other.position.y >= myTop || other.position.y + (other.height || 1.8) <= me.position.y) continue;
+      const info = bot.players && other.username ? bot.players[other.username] : null;
+      if (info && info.gamemode === 3) continue; // наблюдатель никого не толкает
+      const otherTeam = teams[other.username];
+      const otherRule = collisionRuleOf(otherTeam);
+      if (otherRule === 'never') continue;
+      const same = Boolean(myTeam && otherTeam && myTeam === otherTeam);
+      if ((myRule === 'pushOwnTeam' || otherRule === 'pushOwnTeam') && same) continue;
+      if ((myRule === 'pushOtherTeams' || otherRule === 'pushOtherTeams') && !same) continue;
+      let f = Math.max(Math.abs(dx0), Math.abs(dz0));
+      if (f < 0.01) continue; // ровно в одной точке игра тоже не толкает
+      f = Math.sqrt(f);
+      const g = Math.min(1, 1 / f);
+      me.velocity.x += (dx0 / f) * g * PUSH_STRENGTH;
+      me.velocity.z += (dz0 / f) * g * PUSH_STRENGTH;
+    }
+  }
 
   // Телепорт: сервер поставил бота в точку (в том числе откат античитом). Подтверждаем, как обычный клиент.
   bot._client.on('position', (packet) => {

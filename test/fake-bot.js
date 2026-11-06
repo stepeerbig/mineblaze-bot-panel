@@ -62,10 +62,12 @@ function makeWorld(registry) {
       const p = floor(pos);
       return cells.get(key(p)) || (p.y < 64 ? 'stone' : 'air');
     },
+    /** «water#3» — вода 3-го уровня (растекающаяся); без «#» — состояние по умолчанию. */
     blockAt(pos) {
       const p = floor(pos);
-      const info = registry.blocksByName[world.get(p)];
-      const block = Block.fromStateId(info.defaultState, 0);
+      const [name, state] = world.get(p).split('#');
+      const info = registry.blocksByName[name];
+      const block = Block.fromStateId(state === undefined ? info.defaultState : info.minStateId + Number(state), 0);
       block.position = p;
       return block;
     },

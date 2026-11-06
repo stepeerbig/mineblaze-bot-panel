@@ -301,6 +301,65 @@ test('физика: полёт от сервера — после телепор
   assert.ok(!take(bot).some((p) => p.name === 'abilities'));
 });
 
+test('физика: полёт от сервера без дела — через 3–5 с «приземляется» (двойной пробел), дальше обычная физика', () => {
+  const clock = fakeClock();
+  const bot = physicsBot({ clock }); // «случайность» 0,5 → приземлится через 60 + 20 тиков
+  bot.emit('login');
+  teleport(bot);
+  bot._client.emit('abilities', { flags: 6, flyingSpeed: 0.05, walkingSpeed: 0.1 });
+  take(bot);
+  clock.advance(3900);
+  assert.ok(!take(bot).some((p) => p.name === 'abilities'), 'первые секунды висит, как клиент');
+  clock.advance(200);
+  assert.deepEqual(take(bot).filter((p) => p.name === 'abilities').map((p) => p.params), [{ flags: 0 }]);
+  assert.equal(bot.serverView.flying, false);
+  clock.advance(500);
+  assert.equal(bot.entity.onGround, true, 'встал на землю');
+});
+
+test('физика: вода сносит бота по течению (после «приземления» из полёта от сервера тоже)', () => {
+  const clock = fakeClock();
+  const bot = physicsBot({ clock });
+  // Течёт на +x: исток слева, дальше уровни 1, 2, 3.
+  bot.world.set(new Vec3(-1, 64, 0), 'water');
+  bot.world.set(new Vec3(0, 64, 0), 'water#1');
+  bot.world.set(new Vec3(1, 64, 0), 'water#2');
+  bot.world.set(new Vec3(2, 64, 0), 'water#3');
+  bot.emit('login');
+  teleport(bot);
+  bot._client.emit('abilities', { flags: 6, flyingSpeed: 0.05, walkingSpeed: 0.1 });
+  clock.advance(5000); // висел, приземлился — и поплыл
+  assert.ok(bot.entity.position.x > 0.9, `снесло по течению: x = ${bot.entity.position.x.toFixed(3)}`);
+  assert.ok(Math.abs(bot.entity.position.z - 0.5) < 0.01, 'вбок не сносит');
+});
+
+test('физика: игроки, с которыми бот пересёкся, расталкивают его (как в игре); правила столкновений команд — тоже', () => {
+  const run = ({ dx, teams = null, gamemode = 0 }) => {
+    const clock = fakeClock();
+    const bot = physicsBot({ clock });
+    bot.username = 'Farm01';
+    bot.emit('login');
+    teleport(bot);
+    clock.advance(200);
+    bot.entities[7] = { id: 7, type: 'player', username: 'Farm02', position: new Vec3(0.5 + dx, 64, 0.5), width: 0.6, height: 1.8 };
+    bot.players = { Farm02: { username: 'Farm02', gamemode } };
+    if (teams) bot.teamMap = teams;
+    const x0 = bot.entity.position.x;
+    clock.advance(1000);
+    return bot.entity.position.x - x0;
+  };
+  const pushed = run({ dx: 0.2 });
+  assert.ok(pushed < -0.15, `отошёл от соседа (на −x): ${pushed.toFixed(3)}`);
+  assert.equal(run({ dx: 0 }), 0, 'ровно в одной точке игра не толкает');
+  assert.equal(run({ dx: 0.7 }), 0, 'не пересекаются — не толкает');
+  assert.equal(run({ dx: 0.2, gamemode: 3 }), 0, 'наблюдатель не толкает');
+  const never = { name: 'npc', collisionRule: 'never' };
+  assert.equal(run({ dx: 0.2, teams: { Farm02: never } }), 0, 'у соседа столкновения выключены (команда «never»)');
+  const own = { name: 'bots', collisionRule: 'pushOwnTeam' };
+  assert.equal(run({ dx: 0.2, teams: { Farm01: own, Farm02: own } }), 0, 'своя команда с «pushOwnTeam» не толкается');
+  assert.ok(run({ dx: 0.2, teams: { Farm01: { name: 'a', collisionRule: 1 } } }) === 0, 'правило числом (1 — never)');
+});
+
 test('физика: после подвисания догоняем не больше 10 тиков, потом снова ровно', () => {
   const clock = fakeClock();
   const bot = physicsBot({ clock });
