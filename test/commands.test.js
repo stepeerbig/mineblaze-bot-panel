@@ -1066,8 +1066,44 @@ test('команды: #разведи — пары взрослых (малыш�
 
   const pigs = await s.run('#разведи свиней', 60000);
   assert.equal(pigs.code, 'no_food');
-  assert.match([].concat(pigs.message).join('\n'), /Нет корма: свинья — carrot\/potato\/beetroot/);
+  assert.match([].concat(pigs.message).join('\n'), /Нет корма \(свинья\) — подойдёт: морковь \(carrot\), картофель \(potato\) или свёкла \(beetroot\)\. .*выброси рядом с ним \(Q\) или положи в сундук рядом/);
   assert.match((await s.run('#разведи драконов')).message, /кого разводить\?/);
+});
+
+test('команды: #разведи без корма в инвентаре — сам берёт: брошенный рядом (подбирает) или из сундука рядом', async () => {
+  const cow = (id, x, z) => ({ id, type: 'mob', name: 'cow', position: new Vec3(x, 64, z), width: 0.9, height: 1.4, metadata: {} });
+  // Сундук рядом с пшеницей (до 4 блоков) — корм оттуда.
+  const s = setup({ entities: [cow(601, 1.5, 1.5), cow(602, 2.5, 1.5)], storage: { '2,64,-2': { items: [[0, 'wheat', 64]] } } });
+  s.world.set(new Vec3(2, 64, -2), 'chest');
+  const fromChest = await s.run('#разведи коров', 120000);
+  assert.equal(fromChest.ok, true, [].concat(fromChest.message).join('\n'));
+  assert.equal([].concat(fromChest.message)[0], 'Корм: пшеница — взял из сундука рядом');
+  assert.equal(fromChest.data.pairs, 1);
+
+  // Пшеницу кинули на землю рядом — подойдёт и подберёт (сервер отдаёт, когда бот вплотную).
+  const t = setup({ entities: [cow(611, 1.5, 1.5), cow(612, 2.5, 1.5)] });
+  const drop = { id: 700, name: 'item', position: new Vec3(-2.5, 64, 0.5), getDroppedItem: () => ({ name: 'wheat' }) };
+  t.bot.entities[700] = drop;
+  t.bot.on('move', () => {
+    if (t.bot.entities[700] && t.bot.entity.position.distanceTo(drop.position) < 1) {
+      delete t.bot.entities[700];
+      t.bot.inventory.slots[40] = { name: 'wheat', count: 3, displayName: 'Wheat' };
+    }
+  });
+  const picked = await t.run('#разведи коров', 120000);
+  assert.equal(picked.ok, true, [].concat(picked.message).join('\n'));
+  assert.equal([].concat(picked.message)[0], 'Корм: пшеница — подобрал с земли');
+
+  // Коровы в загоне за забором: дойти не дал забор — дотягивается через него.
+  const u = setup({ inventory: [['wheat', 4]], entities: [cow(621, 4.8, 0.5), cow(622, 4.8, 0.9)] });
+  // Забор вдоль z: столбики, соединённые на север и юг, — сплошная стенка высотой 1,5.
+  const registry = require('prismarine-registry')(VERSION);
+  const fence = require('prismarine-block')(registry).fromProperties('oak_fence', { north: true, south: true, east: false, west: false, waterlogged: false }, 0);
+  for (const z of [-2, -1, 0, 1, 2, 3]) u.world.set(new Vec3(2, 64, z), `oak_fence#${fence.stateId - registry.blocksByName.oak_fence.minStateId}`);
+  const fenced = await u.run('#разведи коров', 120000);
+  assert.equal(fenced.ok, true, [].concat(fenced.message).join('\n'));
+  assert.equal(fenced.data.pairs, 1);
+  assert.ok(u.bot.entity.position.x < 2.4, `упёрся в забор и не прошёл: x = ${u.bot.entity.position.x.toFixed(2)}`);
 });
 
 test('команды: #добудь — открытая руда рядом; мало — лестницей вниз к лучшей высоте и туннелем, руда в стенах; кирка; где искать', async () => {

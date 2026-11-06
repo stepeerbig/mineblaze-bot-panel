@@ -2031,8 +2031,76 @@ const BREED_FOOD = {
   sniffer: ['torchflower_seeds'], armadillo: ['spider_eye'], axolotl: ['tropical_fish_bucket'],
 };
 const lastFed = new Map(); // id животного → когда покормили (не кормить, пока не прошло 5 мин)
-// Детёныш: у AgeableMob в 1.20.5+ — ячейка 16 метаданных «is_baby».
+// Детёныш: у AgeableMob в 1.20.5+ — ячейка 16 метаданных «baby» (minecraft-data 1.21.11: metadataKeys[16]).
 const isBaby = (e) => Boolean(e.metadata && e.metadata[16] === true);
+const FOOD_NAMES = {
+  wheat: 'пшеница', carrot: 'морковь', potato: 'картофель', beetroot: 'свёкла', wheat_seeds: 'семена пшеницы',
+  beetroot_seeds: 'семена свёклы', melon_seeds: 'семена арбуза', pumpkin_seeds: 'семена тыквы', golden_carrot: 'золотая морковь',
+  golden_apple: 'золотое яблоко', dandelion: 'одуванчик', hay_block: 'сено', cactus: 'кактус', bamboo: 'бамбук',
+  sweet_berries: 'сладкие ягоды', glow_berries: 'светящиеся ягоды', seagrass: 'морская трава', cod: 'треска', salmon: 'лосось',
+  slime_ball: 'слизь', warped_fungus: 'искажённый гриб', crimson_fungus: 'багровый гриб', torchflower_seeds: 'семена факельника',
+  spider_eye: 'паучий глаз', beef: 'говядина', porkchop: 'свинина',
+};
+/** «пшеница (wheat)» / «морковь (carrot), картофель (potato) или свёкла (beetroot)» — чем кормить вид. */
+function foodText(kind) {
+  const list = (BREED_FOOD[kind] || []).slice(0, 3).map((f) => `${FOOD_NAMES[f] || f} (${f})`);
+  return list.length > 1 ? `${list.slice(0, -1).join(', ')} или ${list[list.length - 1]}` : list[0] || '?';
+}
+/** Расстояние от глаз бота до ближайшей точки сущности (так считает досягаемость игра). */
+function reachTo(bot, e) {
+  const eye = bot.entity.position.offset(0, 1.62, 0);
+  const w = (e.width || 0.6) / 2;
+  const p = e.position;
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const q = new Vec3(clamp(eye.x, p.x - w, p.x + w), clamp(eye.y, p.y, p.y + (e.height || 1)), clamp(eye.z, p.z - w, p.z + w));
+  return eye.distanceTo(q);
+}
+
+/** Что за предмет лежит на земле (сущность «item»): имя или null. */
+function droppedName(e) {
+  try {
+    const it = typeof e.getDroppedItem === 'function' ? e.getDroppedItem() : e.droppedItem;
+    return it && it.name ? it.name : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Корм для вида kind: из инвентаря; нет — подобрать брошенный рядом (человек кинул боту, Q) или взять из сундука
+ * рядом (до 4 блоков, как #достань). → { food: имя | null, from: 'инвентарь' | 'подобрал' | 'сундук' }
+ */
+async function getFood(bot, kind, want) {
+  const foods = BREED_FOOD[kind] || [];
+  const inHand = () => foods.find((f) => hasItem(bot, f)) || null;
+  let food = inHand();
+  if (food) return { food, from: 'инвентарь' };
+  const me = bot.entity.position;
+  const drops = Object.values(bot.entities || {})
+    .filter((e) => isDrop(e) && e.position.distanceTo(me) <= 8 && foods.includes(droppedName(e)))
+    .sort((a, b) => a.position.distanceTo(me) - b.position.distanceTo(me));
+  for (const d of drops) {
+    try {
+      await bot.actions.walkTo(d.position.clone(), { range: 0.5 });
+      await bot.actions.wait(500); // сервер отдаёт предмет, когда игрок вплотную
+    } catch (err) {
+      if (isStopped(err)) throw err;
+    }
+    food = inHand();
+    if (food) return { food, from: 'подобрал' };
+  }
+  const chests = scanBlocks(bot, OPEN_RANGE + 1, (b) => isContainer(b.name)).filter((c) => c.dist <= OPEN_RANGE + 0.5);
+  if (chests.length) {
+    try {
+      await takeFromStorage(bot, [{ test: (it) => foods.includes(it.name), want: Math.max(2, want), got: 0 }]);
+    } catch (err) {
+      if (isStopped(err)) throw err;
+    }
+    food = inHand();
+    if (food) return { food, from: 'сундук' };
+  }
+  return { food: null, from: null };
+}
 
 /**
  * Покормить пары взрослых животных (kinds — виды), чтобы они размножились: не больше pairs пар. Корм — то, что есть
@@ -2042,15 +2110,17 @@ async function breed(bot, kinds, pairs, radius = BREED_RADIUS) {
   const byKind = new Map();
   const noFood = [];
   const few = [];
+  const got = []; // откуда взял корм: «пшеница — из сундука»
   let done = 0;
   let fed = 0;
   for (const kind of kinds) {
     if (done >= pairs) break;
-    const food = (BREED_FOOD[kind] || []).find((f) => hasItem(bot, f));
+    const { food, from } = await getFood(bot, kind, (pairs - done) * 2);
     if (!food) {
       noFood.push(kind);
       continue;
     }
+    if (from !== 'инвентарь') got.push(`${FOOD_NAMES[food] || food} — ${from === 'сундук' ? 'взял из сундука рядом' : 'подобрал с земли'}`);
     const now = Date.now();
     const me = bot.entity.position;
     const adults = Object.values(bot.entities || {})
@@ -2067,7 +2137,13 @@ async function breed(bot, kinds, pairs, radius = BREED_RADIUS) {
       for (const animal of [adults[i], adults[i + 1]]) {
         if (!bot.entities[animal.id]) continue;
         try {
-          if (bot.entity.position.distanceTo(animal.position) > 2.5) await bot.actions.walkTo(animal.position.clone(), { range: 1.8 });
+          if (reachTo(bot, animal) > 2.7) {
+            try {
+              await bot.actions.walkTo(animal.position.clone(), { range: 1.8 });
+            } catch (err) {
+              if (isStopped(err)) throw err; // упёрся в забор загона — дотянуться можно и через него
+            }
+          }
           await bot.actions.equip(food);
           await bot.actions.interact(animal);
           lastFed.set(animal.id, Date.now());
@@ -2083,7 +2159,7 @@ async function breed(bot, kinds, pairs, radius = BREED_RADIUS) {
       }
     }
   }
-  return { pairs: done, fed, byKind, noFood, few };
+  return { pairs: done, fed, byKind, noFood, few, got };
 }
 
 /** «#разведи коров», «#разведи кур 5 дом загон» — покормить пары взрослых животных (на всех — сколько есть пар). */
@@ -2096,11 +2172,16 @@ async function cmdBreed({ bot, args: allArgs, words = [] }) {
   if (!kinds.length) throw new CommandError(`кого разводить? Например: #разведи коров, #разведи кур 5 (знаю: коровы, овцы, свиньи, куры, кролики, козы, лошади…)`);
   if (home) await teleportBy(bot, `/home ${home}`);
   const r = await breed(bot, kinds, pairs);
-  const lines = [r.pairs
+  const lines = [];
+  if (r.got.length) lines.push(`Корм: ${r.got.join('; ')}`);
+  lines.push(r.pairs
     ? `Покормил пар: ${r.pairs} (${[...r.byKind.entries()].map(([k, n]) => `${mobName(k)} ×${n}`).join(', ')}) — малыши появятся через пару секунд`
-    : 'Никого не покормил'];
-  if (r.noFood.length) lines.push(`Нет корма: ${r.noFood.map((k) => `${mobName(k)} — ${BREED_FOOD[k].slice(0, 3).join('/')}`).join('; ')}`);
-  if (r.few.length) lines.push(`Мало взрослых рядом (или ещё не прошло 5 мин после прошлого раза): ${r.few.map(mobName).join(', ')}`);
+    : 'Никого не покормил');
+  for (const k of r.noFood) {
+    lines.push(`Нет корма (${mobName(k)}) — подойдёт: ${foodText(k)}. В инвентаре бота нет, рядом на земле нет, в сундуке рядом (до 4 блоков) нет. ` +
+      'Дай боту: выброси рядом с ним (Q) или положи в сундук рядом — он возьмёт сам');
+  }
+  if (r.few.length) lines.push(`Мало взрослых рядом (до ${BREED_RADIUS} блоков) или прошло меньше 5 мин после прошлого раза: ${r.few.map(mobName).join(', ')}`);
   return { ok: r.pairs > 0, code: r.pairs ? undefined : r.noFood.length ? 'no_food' : 'no_animals', message: lines, data: { pairs: r.pairs, fed: r.fed, noFood: r.noFood, few: r.few, home } };
 }
 

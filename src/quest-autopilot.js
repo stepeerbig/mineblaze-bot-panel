@@ -285,7 +285,7 @@ class QuestAutopilot extends EventEmitter {
       const n = nicks.length;
       switch (g.type) {
         case 'no_home':
-          out.push(`Нет дома «${g.home}» у ${botsOf(n)}: ${who(nicks)} — поставь каждому /sethome ${g.home} у сундука (бот должен стоять там)`);
+          out.push(`Нет дома «${g.home}» у ${botsOf(n)}: ${who(nicks)} — поставь каждому /sethome ${g.home} у сундука (бот должен стоять там; на MineBlaze у аккаунта один дом — всё у одной базы)`);
           break;
         case 'no_storage':
           out.push(`Задания «Передайте…» ждут у ${botsOf(n)}, а склад не задан — впиши «Дом склада» в настройках автопилота`);
