@@ -25,10 +25,11 @@ const run = (code, args = {}) => new Function(...Object.keys(args), code)(...Obj
 // Нижние границы секций от from (включая) до to (не включая).
 const sectionYs = (from, to) => Array.from({ length: (to - from) / 16 }, (_, k) => from + 16 * k);
 
-// Все четыре места из бандлов в одном фрагменте (как в минифицированном коде, но с другими именами).
+// Все места из бандлов в одном фрагменте (как в минифицированном коде, но с другими именами).
 const FULL = [
   'addColumn(t,e,i){for(let $=0;$<256;$+=16)this.dirty($)}removeColumn(t,e){for(let i_=0;i_<256;i_+=16)this.clean(i_)}',
   'on("position",({pos:P,addMesh:A})=>{if(P.y>0&&F$&&(C.target.set(P.x,P.y,P.z),F$=!1),A){}});',
+  'o.on("version",(t=>{if(!u.setVersion(t))return!1;let e;s=!0,u.listen(o),o.on("position",q)}));',
   'function setSectionDirty(e){const a=e.y,$i=w.getColumn();$i&&$i.sections[Math.floor(a/16)]?d[a]=1:post()}',
   'setInterval(()=>{const l=w.getColumn();if(l&&l.sections[Math.floor(n_/16)]){mesh()}});',
   'for(const _ in o){const g=get();if(g.position.y<0)continue;}',
@@ -38,7 +39,7 @@ const FULL = [
 // ---------- описание правок ----------
 
 test('правки бандлов: состав и формат описаний', () => {
-  assert.deepEqual(INDEX_PATCHES.map((p) => p.name), ['full-height-sections', 'third-person-camera-any-y']);
+  assert.deepEqual(INDEX_PATCHES.map((p) => p.name), ['full-height-sections', 'third-person-camera-any-y', 'expose-viewer']);
   assert.deepEqual(WORKER_PATCHES.map((p) => p.name), ['section-index-min-y', 'cull-below-world-bottom']);
   for (const p of ALL) {
     assert.match(p.description, /^[^\n]*[а-яё][^\n]*$/i, p.name); // одна строка по-русски
@@ -118,6 +119,24 @@ test('section-index-min-y: секция ищется от minY колонки, �
   }
 });
 
+test('expose-viewer: страница получает просмотрщик (рентген рисует на его сцене), вызов listen тот же', () => {
+  // Как в бандле: в обработчике 'version' — viewer.listen(socket).
+  const src = 'let e;s=!0,u.listen(o),o.on("position",q);return u;';
+  const { code, applied } = applyPatches(src, only('expose-viewer'));
+  assert.deepEqual(applied, ['expose-viewer']);
+  assert.equal(code, 'let e;s=!0,(window.__mbpViewer=u)["listen"](o),o.on("position",q);return u;');
+  const calls = [];
+  const u = { listen(sock) { calls.push([this, sock]); } };
+  const o = { on() {} };
+  const window = {};
+  run(code, { u, o, s: false, q: null, window });
+  assert.equal(window.__mbpViewer, u);
+  assert.deepEqual(calls, [[u, o]], 'listen вызван у просмотрщика с сокетом');
+  // Два вызова listen — это не тот бандл: правка пропускается.
+  const two = applyPatches('a.listen(b);c.listen(d);', only('expose-viewer'));
+  assert.deepEqual(two.skipped, [{ name: 'expose-viewer', found: 2, expected: 1 }]);
+});
+
 test('cull-below-world-bottom: грани отбрасываются только у соседей ниже дна мира', () => {
   // Как в мешере (renderLiquid и renderElement): if(neighbor.position.y<0)continue
   const src = 'const out=[];for(const g of list){if(g.position.y<0)continue;out.push(g.position.y)}' +
@@ -145,11 +164,11 @@ test('шаблон найден не столько раз, сколько ож�
 
 test('правки независимы: пропуск одной не мешает другим, порядок не важен', () => {
   // В index.js цикл один (нужно два) — пропускается только он, камера правится.
-  const index = 'for(let i=0;i<256;i+=16){}if(t.y>0&&s&&(h.target.set(t.x,t.y,t.z),s=!1),i){}';
+  const index = 'for(let i=0;i<256;i+=16){}if(t.y>0&&s&&(h.target.set(t.x,t.y,t.z),s=!1),i){}u.listen(o);';
   const r = patchIndexBundle(index);
-  assert.deepEqual(r.applied, ['third-person-camera-any-y']);
+  assert.deepEqual(r.applied, ['third-person-camera-any-y', 'expose-viewer']);
   assert.deepEqual(r.skipped, [{ name: 'full-height-sections', found: 1, expected: 2 }]);
-  assert.equal(r.code, 'for(let i=0;i<256;i+=16){}if(s&&(h.target.set(t.x,t.y,t.z),s=!1),i){}');
+  assert.equal(r.code, 'for(let i=0;i<256;i+=16){}if(s&&(h.target.set(t.x,t.y,t.z),s=!1),i){}(window.__mbpViewer=u)["listen"](o);');
   // В worker.js проверка соседа одна (нужно две) — пропускается только она.
   const worker = 'a&&a.sections[Math.floor(b/16)];c&&c.sections[Math.floor(d/16)];if(e.position.y<0)continue;';
   const w = patchWorkerBundle(worker);
@@ -157,7 +176,7 @@ test('правки независимы: пропуск одной не меша
   assert.deepEqual(w.skipped, [{ name: 'cull-below-world-bottom', found: 1, expected: 2 }]);
   assert.ok(w.code.endsWith('if(e.position.y<0)continue;'));
 
-  // Все четыре места сразу: любой порядок и поштучное применение дают один результат.
+  // Все места сразу: любой порядок и поштучное применение дают один результат.
   const forward = applyPatches(FULL, ALL);
   assert.deepEqual(forward.applied, ALL.map((p) => p.name));
   assert.deepEqual(forward.skipped, []);

@@ -14,6 +14,7 @@ const {
 } = require('./quests');
 const { isStorageWindow } = require('./window-clicks');
 const { moveStacks, countIn, itemsIn, storageSlots, playerSlots } = require('./chests');
+const { sanitizeXray, scanXray, findEntries, registryOf } = require('./xray');
 
 const MAX_WALK = 256; // за раз дальше не ходим: путь ищется по загруженному миру, дальше — по ходу
 const MAX_STEPS = 32; // «#вперёд N»: не больше
@@ -2402,6 +2403,72 @@ async function cmdMine({ bot, args: allArgs, words = [] }) {
   };
 }
 
+// ---------- рентген: что из списка (руды, спавнеры…) есть в загруженных чанках вокруг ----------
+
+const XRAY_TOP = 10; // строк с координатами, когда спрашивают про один блок
+
+/**
+ * «#рентген» — что из списка рентгена (настройки панели, «Экран бота» → G) есть вокруг и где ближайшее;
+ * «#рентген алмазы» — до 10 ближайших с координатами; «… радиус 4» (или просто число) — радиус в чанках.
+ */
+async function cmdXray({ bot, args, words = [] }) {
+  const settings = sanitizeXray(bot.panelConfig && bot.panelConfig.xray);
+  let radius;
+  const rest = [];
+  for (let i = 0; i < words.length; i += 1) {
+    if (/^(?:радиус|radius|r)$/.test(words[i]) && /^\d+$/.test(args[i + 1] || '')) {
+      radius = parseInt(args[i + 1], 10);
+      i += 1;
+    } else if (/^\d+$/.test(words[i]) && radius === undefined) {
+      radius = parseInt(words[i], 10);
+    } else {
+      rest.push(words[i]);
+    }
+  }
+  let cfg = settings;
+  let asked = null;
+  if (rest.length) {
+    asked = findEntries(settings, rest, registryOf(bot));
+    if (!asked.length) {
+      throw new CommandError(`что искать? Например: #рентген алмазы, #рентген спавнер, #рентген diamond_ore. В списке: ${settings.blocks.map((b) => b.label.toLowerCase()).join(', ')}, лава`);
+    }
+    cfg = { ...settings, blocks: asked.filter((e) => e.name !== 'lava').map((e) => ({ ...e, on: true })), lava: asked.some((e) => e.name === 'lava') };
+  }
+  const r = await scanXray(bot, cfg, radius === undefined ? {} : { radius });
+  const side = r.radius * 2 + 1;
+  const where = `радиус ${r.radius} ${plural(r.radius, 'чанк', 'чанка', 'чанков')}, ${side}×${side}`;
+  const p = bot.entity.position;
+  const distTo = (x, y, z) => Math.round(Math.hypot(x + 0.5 - p.x, y + 0.5 - p.y, z + 0.5 - p.z));
+  const found = r.groups.filter((g) => g.count);
+  const lines = [];
+  if (!found.length) {
+    lines.push(`Рентген (${where}): ${asked ? asked.map((e) => e.label).join(', ') : 'ничего из списка'} — не нашёл`);
+    lines.push('Смотрит загруженные чанки вокруг бота. Если на сервере анти-X-ray, руда в толще камня спрятана — видна только открытая (в пещерах)');
+  } else if (asked) {
+    for (const g of found) {
+      lines.push(`Рентген: ${g.label} ×${g.count}${r.truncated ? '+' : ''} (${where}), ближние:`);
+      for (let i = 0; i < Math.min(XRAY_TOP, g.positions.length / 3); i += 1) {
+        const [x, y, z] = g.positions.slice(i * 3, i * 3 + 3);
+        lines.push(`  ${x} ${y} ${z} — ${distTo(x, y, z)} бл.`);
+      }
+    }
+  } else {
+    lines.push(`Рентген (${where}): найдено ${r.total}${r.truncated ? '+' : ''}`);
+    for (const g of found) lines.push(`${g.label} ×${g.count} — ближайший ${g.nearest.x} ${g.nearest.y} ${g.nearest.z} (${Math.round(g.nearest.dist)} бл.)`);
+    const none = r.groups.filter((g) => !g.count).map((g) => g.label.toLowerCase());
+    if (none.length) lines.push(`Нет: ${none.join(', ')}`);
+  }
+  return {
+    ok: true,
+    message: lines,
+    data: {
+      radius: r.radius,
+      total: r.total,
+      groups: r.groups.map((g) => ({ key: g.key, label: g.label, count: g.count, nearest: g.nearest, positions: g.positions.slice(0, XRAY_TOP * 3) })),
+    },
+  };
+}
+
 // ---------- пинг ----------
 
 const PING_SAMPLES = 3;
@@ -2594,6 +2661,16 @@ const COMMANDS = [
       'на свою высоту — где нужно, «столбом» (блок под себя); руду и блоки у воды и лавы, под гравием не трогает; нужна подходящая кирка; ' +
       'не нашёл — скажет, где искать',
     run: cmdMine,
+  },
+  {
+    name: 'рентген',
+    aliases: ['xray', 'иксрей', 'рентгент'],
+    usage: ['#рентген', '#рентген алмазы', '#рентген спавнер радиус 4'],
+    about: 'рентген, как мод Advanced XRay: что из списка (руды, спавнеры…) есть в загруженных чанках вокруг бота — сколько и где ближайшее; ' +
+      'с названием — до 10 ближайших с координатами; радиус — в чанках (0–8, по умолчанию из настроек). Список, цвета и подсветку сквозь ' +
+      'стены настраивают в «Экране бота»: клавиша G — меню, \\ — включить',
+    observe: true,
+    run: cmdXray,
   },
   {
     name: 'разведи',

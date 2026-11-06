@@ -5,7 +5,7 @@
 // (в main.js — utilityProcess.fork), поэтому всё это проверяется обычными тестами. Процессов несколько,
 // кто чем занят — решает src/fleet.js.
 //
-// События: log, chat, state, link, msa, want-connect, viewer-mode — от ботов процесса (в payload.bot — чей);
+// События: log, chat, state, link, msa, want-connect, viewer-mode, viewer-xray — от ботов процесса (в payload.bot — чей);
 // crash { code, restarting }; restarted; output { stream, line } — то, что процесс печатает сам.
 
 const EventEmitter = require('events');
@@ -17,7 +17,7 @@ const DEFAULT_TIMINGS = Object.freeze({
   crashWindow: 60 * 1000,
 });
 const MAX_CRASHES = 3; // столько аварий за минуту — и больше не перезапускаем: что-то сломано всерьёз
-const EVENTS = new Set(['log', 'chat', 'state', 'link', 'msa', 'ping', 'want-connect', 'viewer-mode']);
+const EVENTS = new Set(['log', 'chat', 'state', 'link', 'msa', 'ping', 'want-connect', 'viewer-mode', 'viewer-xray']);
 
 class BotClient extends EventEmitter {
   /**

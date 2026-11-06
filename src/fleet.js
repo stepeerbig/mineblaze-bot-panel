@@ -9,7 +9,7 @@
 //
 // Бот — по нику: номер (bot) = ник маленькими буквами. События (у событий бота — bot и nick):
 //   log { bot, nick, time, level, text } (bot null — сама панель или процесс); chat; state { bot, nick, state };
-//   link; msa; list — список ботов поменялся; summary { total, online, … }; viewer-mode; output { worker, … }.
+//   link; msa; list — список ботов поменялся; summary { total, online, … }; viewer-mode; viewer-xray; output { worker, … }.
 
 const EventEmitter = require('events');
 const { BotClient } = require('./bot-client');
@@ -481,6 +481,7 @@ class Fleet extends EventEmitter {
     });
     client.on('want-connect', (p) => this._enqueue(p && p.bot));
     client.on('viewer-mode', (mode) => this.emit('viewer-mode', mode));
+    client.on('viewer-xray', (settings) => this.emit('viewer-xray', settings));
     client.on('output', (o) => this.emit('output', { worker: index, ...o }));
     client.on('crash', ({ code, restarting }) => this._onCrash(index, code, restarting));
     client.on('restarted', () => this._onRestarted(index));

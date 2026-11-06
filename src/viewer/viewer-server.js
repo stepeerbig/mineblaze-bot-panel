@@ -14,6 +14,7 @@ const { Server } = require('socket.io');
 const { Vec3 } = require('vec3');
 const { pickViewerVersion, createStateTranslator, fixChunkJson } = require('./block-translator');
 const { patchIndexBundle, patchWorkerBundle } = require('./bundle-patches');
+const { sanitizeXray, createXrayTracker, registryOf } = require('../bot/xray');
 
 const VIEWER_DIR = path.dirname(require.resolve('prismarine-viewer/package.json'));
 const DEFAULT_PUBLIC_DIR = path.join(VIEWER_DIR, 'public');
@@ -117,6 +118,7 @@ class ViewSession {
     this.listeners = {};
     this.queue = [];
     this.server._sessions.delete(this);
+    this.server._xrayUpdate(); // окно закрыли — рентгену искать не для кого
   }
 
   entityInfo(e) {
@@ -242,8 +244,13 @@ class ViewSession {
 }
 
 class ViewerServer extends EventEmitter {
-  constructor({ mode = 'first', viewDistance = 6, log = () => {}, publicDir = DEFAULT_PUBLIC_DIR, pageDir = path.join(__dirname, 'page') } = {}) {
+  constructor({ mode = 'first', viewDistance = 6, log = () => {}, publicDir = DEFAULT_PUBLIC_DIR, pageDir = path.join(__dirname, 'page'), xray = null } = {}) {
     super();
+    // Рентген (src/bot/xray.js): настройки — из панели (setXray) или из меню окна (событие 'xray' — запомнить).
+    this._xray = sanitizeXray(xray);
+    this._xrayTracker = null;
+    this._xrayResult = null;
+    this._xrayRev = 1; // меняется с каждым новым результатом или настройками — окно перечитывает
     this._mode = normalizeMode(mode);
     this.viewDistance = Math.max(2, Math.min(16, Number(viewDistance) || 6));
     this._log = typeof log === 'function' ? log : () => {};
@@ -367,6 +374,31 @@ class ViewerServer extends EventEmitter {
       this.setMode(mode);
       return res.json(this.getState());
     });
+    // Рентген: настройки (список блоков, цвета, радиус, лава), найденное, имена блоков для «Добавить», и что бот
+    // держит в руке или на что смотрит.
+    router.get('/xray', (req, res) => {
+      noStore(res);
+      res.json({ settings: this._xray, rev: this._xrayRev });
+    });
+    router.post('/xray', express.json({ limit: '32kb' }), (req, res) => {
+      noStore(res);
+      const settings = req.body && req.body.settings;
+      if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return res.status(400).json({ error: 'settings' });
+      const saved = this.setXray(settings, { fromPage: true });
+      return res.json({ settings: saved, rev: this._xrayRev });
+    });
+    router.get('/xray/result', (req, res) => {
+      noStore(res);
+      res.json({ rev: this._xrayRev, enabled: this._xray.enabled, result: this._xrayResult });
+    });
+    router.get('/xray/blocks', (req, res) => {
+      noStore(res);
+      res.json({ blocks: this._blockNames() });
+    });
+    router.get('/xray/pick', (req, res) => {
+      noStore(res);
+      res.json(this._xrayPick());
+    });
     return router;
   }
 
@@ -414,6 +446,7 @@ class ViewerServer extends EventEmitter {
     this._bot = null;
     this._view = null;
     for (const session of [...this._sessions]) session.stop();
+    this._xrayUpdate();
     const io = this._io;
     const server = this._http;
     this._io = null;
@@ -482,7 +515,104 @@ class ViewerServer extends EventEmitter {
       viewerVersion: online && this._view ? this._view.viewerVersion : null,
       botVersion: online && bot.version ? String(bot.version) : null,
       unsupported: online && !this._view,
+      xray: { enabled: this._xray.enabled, overlay: this._xray.overlay, radius: this._xray.radius, rev: this._xrayRev },
     };
+  }
+
+  // ---------- рентген ----------
+
+  get xray() {
+    return this._xray;
+  }
+
+  /**
+   * Новые настройки рентгена. fromPage — поменяли в меню окна: событие 'xray' (панель их запомнит). Те же самые
+   * (панель прислала свои же обратно) — ничего не делаем.
+   */
+  setXray(settings, { fromPage = false } = {}) {
+    const next = sanitizeXray(settings);
+    if (JSON.stringify(next) === JSON.stringify(this._xray)) return this._xray;
+    this._xray = next;
+    this._xrayStop();
+    this._xrayRev += 1; // окно перечитает и настройки, и найденное
+    this._xrayUpdate();
+    if (fromPage) this.emit('xray', next);
+    return next;
+  }
+
+  /** Искать, только когда рентген включён, бот в мире и окно открыто (хоть одна страница на связи). */
+  _xrayUpdate() {
+    const bot = this._bot;
+    const want = this._xray.enabled && Boolean(bot && bot.entity && this._view) && this._sessions.size > 0;
+    if (!want) {
+      this._xrayStop();
+      return;
+    }
+    if (this._xrayTracker) return;
+    try {
+      this._xrayTracker = createXrayTracker({
+        bot,
+        getSettings: () => this._xray,
+        onResult: (result) => {
+          if (this._bot !== bot) return;
+          this._xrayResult = result;
+          this._xrayRev += 1;
+        },
+        log: (level, text) => this._warnOnce(`xray:${text}`, level, text),
+      });
+    } catch (err) {
+      this._warnOnce('xray', 'warn', `рентген не запустился: ${err && err.message ? err.message : err}`);
+    }
+  }
+
+  _xrayStop() {
+    let changed = false;
+    if (this._xrayTracker) {
+      this._xrayTracker.stop();
+      this._xrayTracker = null;
+      changed = true;
+    }
+    if (this._xrayResult) {
+      this._xrayResult = null;
+      changed = true;
+    }
+    if (changed) this._xrayRev += 1;
+  }
+
+  /** Блоки версии бота для «Добавить блок»: [[имя, название в игре]], по названию. */
+  _blockNames() {
+    let registry;
+    try {
+      registry = registryOf(this._bot || { version: '1.21.11' });
+    } catch (_) {
+      return [];
+    }
+    return registry.blocksArray
+      .filter((b) => b && b.name && !/^(?:cave_|void_)?air$/.test(b.name))
+      .map((b) => [b.name, b.displayName || b.name])
+      .sort((a, b) => a[1].localeCompare(b[1]));
+  }
+
+  /** Что бот держит в руке (если это блок) и на какой блок смотрит. */
+  _xrayPick() {
+    const bot = this._bot;
+    if (!bot || !bot.entity) return { hand: null, look: null };
+    let registry = null;
+    try {
+      registry = registryOf(bot);
+    } catch (_) {
+      return { hand: null, look: null };
+    }
+    const held = bot.heldItem && registry.blocksByName[bot.heldItem.name] ? bot.heldItem.name : null;
+    let look = null;
+    try {
+      const block = typeof bot.blockAtCursor === 'function' ? bot.blockAtCursor(32)
+        : bot.actions && typeof bot.actions.lookedAtBlock === 'function' ? (bot.actions.lookedAtBlock() || {}).block : null;
+      if (block && block.name && !/^(?:cave_|void_)?air$/.test(block.name)) look = block.name;
+    } catch (_) {
+      look = null;
+    }
+    return { hand: held, look };
   }
 
   // ---------- внутреннее ----------
@@ -516,7 +646,9 @@ class ViewerServer extends EventEmitter {
       this._warnOnce('session:start', 'warn', `не удалось начать показ: ${err.message}`);
       session.stop();
       socket.disconnect(true);
+      return;
     }
+    this._xrayUpdate();
   }
 
   _dropSessions() {

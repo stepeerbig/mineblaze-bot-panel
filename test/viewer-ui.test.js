@@ -134,23 +134,55 @@ test('ui.css: слой интерфейса не перехватывает мы
 // ---------- страница в поддельном DOM ----------
 
 // Выполняет ui.js как в окне: поддельные элементы из index.html, часы, таймеры и сервер панели.
-function openPage({ pathname = '/token/', canvas = true, server = {} } = {}) {
-  const nodes = {};
-  for (const [, id] of read('index.html').matchAll(/\sid="([^"]+)"/g)) {
-    nodes[id] = {
+function openPage({ pathname = '/token/', canvas = true, server = {}, xray = null, scene = null } = {}) {
+  const page = {};
+  // Поддельный элемент: то, чем пользуется ui.js (текст с детьми, классы, события любого вида, фокус).
+  const makeNode = (tag = 'div') => {
+    let text = '';
+    const classes = new Set();
+    const node = {
+      tag,
       hidden: false,
-      textContent: '',
       disabled: false,
+      readOnly: false,
+      checked: false,
+      value: '',
+      title: '',
+      className: '',
       dataset: {},
       attrs: {},
+      style: {},
       handlers: [],
+      on: {},
+      children: [],
+      classes,
+      get textContent() { return text + this.children.map((c) => c.textContent).join(''); },
+      set textContent(v) { text = String(v); this.children = []; },
+      classList: { toggle: (n, on) => (on ? classes.add(n) : classes.delete(n)), add: (n) => classes.add(n), remove: (n) => classes.delete(n) },
       setAttribute(name, value) { this.attrs[name] = String(value); },
-      addEventListener(type, fn) { if (type === 'click') this.handlers.push(fn); },
-      click() { for (const fn of this.handlers) fn(); },
+      addEventListener(type, fn) {
+        (this.on[type] = this.on[type] || []).push(fn);
+        if (type === 'click') this.handlers.push(fn);
+      },
+      click(ev = {}) { for (const fn of this.on.click || []) fn({ shiftKey: false, ...ev }); },
+      fire(type, ev = {}) { for (const fn of this.on[type] || []) fn(ev); },
+      appendChild(c) {
+        if (c.tag === '#fragment') this.children.push(...c.children);
+        else this.children.push(c);
+        return c;
+      },
+      append(...cs) { for (const c of cs) this.appendChild(c); },
+      focus() { page.focused = this; },
+      getContext: () => null,
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 136, height: 136 }),
+      setPointerCapture() {},
     };
-  }
+    return node;
+  };
+  const nodes = {};
+  for (const [, id] of read('index.html').matchAll(/\sid="([^"]+)"/g)) nodes[id] = makeNode();
 
-  const page = {
+  Object.assign(page, {
     nodes,
     now: 1000,
     reloads: 0,
@@ -158,8 +190,13 @@ function openPage({ pathname = '/token/', canvas = true, server = {} } = {}) {
     requests: [],
     down: false, // панель не отвечает
     server: { online: false, generation: 1, mode: 'first', ...server },
-  };
+    xray, // настройки рентгена на «панели»
+    xrayResult: { rev: 1, enabled: false, result: null },
+    pick: { hand: null, look: null },
+    blocks: [['diamond_ore', 'Diamond Ore'], ['gold_ore', 'Gold Ore'], ['spawner', 'Spawner']],
+  });
   const timers = new Map();
+  const docHandlers = {};
   let seq = 0;
   const classes = new Set();
   const document = {
@@ -167,6 +204,11 @@ function openPage({ pathname = '/token/', canvas = true, server = {} } = {}) {
     body: { classList: { toggle: (name, on) => (on ? classes.add(name) : classes.delete(name)) } },
     getElementById: (id) => nodes[id] || null,
     querySelector: (selector) => (selector === 'canvas' && canvas ? {} : null),
+    createElement: (tag) => makeNode(tag),
+    createDocumentFragment: () => makeNode('#fragment'),
+    addEventListener: (type, fn) => {
+      docHandlers[type] = fn;
+    },
   };
   const json = (status, body) => ({ ok: status === 200, status, json: async () => JSON.parse(JSON.stringify(body)) });
 
@@ -195,12 +237,42 @@ function openPage({ pathname = '/token/', canvas = true, server = {} } = {}) {
         if (mode !== page.server.mode) page.server = { ...page.server, mode, generation: page.server.generation + 1 };
         return json(200, page.server);
       }
+      if (url === 'xray' && page.xray) {
+        if (options.method === 'POST') {
+          page.xray = JSON.parse(options.body).settings;
+          const x = page.server.xray || {};
+          page.server = { ...page.server, xray: { ...x, enabled: page.xray.enabled, radius: page.xray.radius, overlay: page.xray.overlay, rev: (x.rev || 0) + 1 } };
+        }
+        return json(200, { settings: page.xray });
+      }
+      if (url === 'xray/result') return json(200, page.xrayResult);
+      if (url === 'xray/pick') return json(200, page.pick);
+      if (url === 'xray/blocks') return json(200, { blocks: page.blocks });
       return json(404, {});
     },
   };
+  if (scene) {
+    // Просмотрщик и THREE, как их видит страница после правки бандла expose-viewer.
+    sandbox.__mbpViewer = { scene };
+    sandbox.THREE = {
+      BufferGeometry: class { setAttribute(name, attr) { this[name] = attr; } dispose() { this.disposed = true; } },
+      BufferAttribute: class { constructor(array, size) { Object.assign(this, { array, size }); } },
+      LineBasicMaterial: class { constructor(opts) { Object.assign(this, opts); } dispose() { this.disposed = true; } },
+      LineSegments: class { constructor(geometry, material) { Object.assign(this, { kind: 'lines', geometry, material }); } },
+      BoxGeometry: class { constructor(...size) { this.size = size; } dispose() { this.disposed = true; } },
+      MeshBasicMaterial: class { constructor(opts) { Object.assign(this, opts); } dispose() { this.disposed = true; } },
+      Matrix4: class { makeTranslation(x, y, z) { this.t = [x, y, z]; return this; } },
+      InstancedMesh: class {
+        constructor(geometry, material, count) { Object.assign(this, { kind: 'fill', geometry, material, count, at: [], instanceMatrix: {} }); }
+        setMatrixAt(i, m) { this.at[i] = [...m.t]; }
+      },
+    };
+  }
 
   page.document = document;
   page.classes = classes;
+  // Нажать клавишу в окне (как событие keydown на document).
+  page.key = (code, extra = {}) => docHandlers.keydown && docHandlers.keydown({ code, key: '', target: null, preventDefault() {}, ...extra });
   // Прокрутить часы на ms, выполняя созревшие таймеры по порядку.
   page.advance = async (ms) => {
     const end = page.now + ms;
@@ -346,4 +418,171 @@ test('страница: без WebGL и адрес без «/» на конце'
   const noSlash = openPage({ pathname: '/token' });
   assert.equal(noSlash.replaced, '/token/');
   assert.equal(noSlash.requests.length, 0);
+});
+
+// ---------- рентген ----------
+
+test('рентген: цвета, круг, контуры блоков, радиус и надпись', () => {
+  assert.deepEqual(ui.colorParts('#4aedd9'), { r: 74, g: 237, b: 217, a: 255 });
+  assert.deepEqual(ui.colorParts('#ff000080'), { r: 255, g: 0, b: 0, a: 128 });
+  assert.deepEqual(ui.colorParts('нет'), { r: 255, g: 255, b: 255, a: 255 });
+  assert.equal(ui.colorHex({ r: 74, g: 237, b: 217, a: 255 }), '#4aedd9ff');
+  assert.equal(ui.colorHex({ r: 300, g: -5, b: 12.4 }), '#ff000cff');
+  assert.equal(ui.cssColor('#ff000080'), 'rgba(255, 0, 0, 0.502)');
+  assert.deepEqual(ui.hsvToRgb(0, 1, 1), { r: 255, g: 0, b: 0 });
+  assert.deepEqual(ui.hsvToRgb(240, 1, 1), { r: 0, g: 0, b: 255 });
+  assert.deepEqual(ui.hsvToRgb(-120, 1, 1), { r: 0, g: 0, b: 255 });
+  assert.deepEqual(ui.hsvToRgb(77, 0, 1), { r: 255, g: 255, b: 255 }); // середина круга — белый
+
+  // 12 рёбер куба на блок, все точки — на его углах (чуть внутрь), каждое ребро — вдоль одной оси.
+  const edges = ui.boxEdges([10, -60, 3, 0, 0, 0]);
+  assert.equal(edges.length, 144);
+  for (let i = 0; i < 72; i += 3) {
+    assert.ok([10.002, 10.998].some((v) => Math.abs(edges[i] - v) < 1e-4), `x ${edges[i]}`);
+    assert.ok([-59.998, -59.002].some((v) => Math.abs(edges[i + 1] - v) < 1e-4), `y ${edges[i + 1]}`);
+  }
+  for (let e = 0; e < 12; e += 1) {
+    const a = edges.slice(e * 6, e * 6 + 3);
+    const b = edges.slice(e * 6 + 3, e * 6 + 6);
+    assert.equal([0, 1, 2].filter((k) => Math.abs(a[k] - b[k]) > 0.5).length, 1);
+  }
+  assert.equal(ui.boxEdges([]).length, 0);
+
+  assert.equal(ui.radiusText(0), '0 чанков (1×1)');
+  assert.equal(ui.radiusText(1), '1 чанк (3×3)');
+  assert.equal(ui.radiusText(3), '3 чанка (7×7)');
+  assert.equal(ui.radiusText(8), '8 чанков (17×17)');
+
+  const on = { enabled: true, overlay: true };
+  assert.equal(ui.xrayBadgeText(null, null), null);
+  assert.equal(ui.xrayBadgeText({ enabled: true, overlay: false }, null), null); // надпись выключена
+  assert.equal(ui.xrayBadgeText(on, null), 'Рентген включён · ищу…');
+  assert.equal(ui.xrayBadgeText(on, { enabled: true, result: { total: 12, truncated: true } }), 'Рентген включён · найдено 12+');
+  assert.equal(ui.entryMatches({ label: 'Алмазы', name: 'diamond_ore' }, 'алм'), true);
+  assert.equal(ui.entryMatches({ label: 'Золото Незера', name: 'nether_gold_ore' }, 'gold ore'), true);
+  assert.equal(ui.entryMatches({ label: 'Уголь', name: 'coal_ore' }, 'железо'), false);
+  assert.deepEqual([...ui.countsByKey({ enabled: true, result: { groups: [{ key: 'iron_ore', count: 3 }] } })], [['iron_ore', 3]]);
+  assert.equal(ui.countsByKey({ enabled: false, result: null }).size, 0);
+});
+
+test('страница: рентген — кнопка и клавиша \\, надпись, контуры на сцене, меню G: вкл/выкл блока, цвет, «что в руке»', async () => {
+  const settings = {
+    enabled: false,
+    radius: 2,
+    lava: false,
+    overlay: true,
+    blocks: [
+      { name: 'diamond_ore', label: 'Алмазы', color: '#4aedd9ff', on: true, same: true },
+      { name: 'coal_ore', label: 'Уголь', color: '#7a7a7aff', on: false, same: true },
+    ],
+  };
+  const added = [];
+  const removed = [];
+  const scene = { add: (o) => added.push(o), remove: (o) => removed.push(o) };
+  const page = openPage({ server: { online: true, xray: { enabled: false, overlay: true, radius: 2, rev: 1 } }, xray: settings, scene });
+  const n = page.nodes;
+  const posts = () => page.requests.filter((r) => r.url === 'xray' && r.method === 'POST').map((r) => JSON.parse(r.body).settings);
+  await page.advance(0);
+  assert.ok(page.requests.some((r) => r.url === 'xray/result') && page.requests.some((r) => r.url === 'xray'));
+  assert.equal(n.btnXray.disabled, false);
+  assert.equal(n.btnXray.attrs['aria-pressed'], 'false');
+  assert.equal(n.xrayBadge.hidden, true);
+  assert.equal(n.xrayTip.hidden, false); // подсказка о клавишах — пока не закрыли
+
+  // «\» — включить; в поле ввода — нет.
+  page.key('Backslash', { target: { tagName: 'INPUT' } });
+  await page.advance(0);
+  assert.equal(posts().length, 0);
+  page.key('Backslash');
+  await page.advance(0);
+  assert.equal(posts().length, 1);
+  assert.equal(posts()[0].enabled, true);
+  assert.equal(n.btnXray.attrs['aria-pressed'], 'true');
+  assert.equal(n.xrayTip.hidden, true);
+
+  // Панель нашла блоки — надпись и контуры сквозь стены (без проверки глубины), цвет строки.
+  page.xrayResult = {
+    rev: 5,
+    enabled: true,
+    result: { total: 2, truncated: false, groups: [{ key: 'diamond_ore', label: 'Алмазы', color: '#4aedd980', count: 2, positions: [1, -58, 2, 3, -58, 2] }] },
+  };
+  page.server = { ...page.server, xray: { enabled: true, overlay: true, radius: 2, rev: 5 } };
+  await page.advance(500);
+  assert.equal(n.xrayBadge.hidden, false);
+  assert.equal(n.xrayBadge.textContent, 'Рентген включён · найдено 2');
+  assert.deepEqual(added.map((o) => o.kind), ['fill', 'lines']);
+  const [fill, lines] = added;
+  assert.equal(fill.count, 2);
+  assert.deepEqual(fill.at, [[1.5, -57.5, 2.5], [3.5, -57.5, 2.5]], 'заливка — по центрам блоков');
+  assert.equal(fill.material.depthTest, false);
+  assert.ok(fill.material.opacity < lines.material.opacity && fill.renderOrder < lines.renderOrder);
+  assert.equal(lines.geometry.position.array.length, 144);
+  assert.equal(lines.material.depthTest, false);
+  assert.equal(lines.material.color, 0x4aedd9);
+  assert.ok(Math.abs(lines.material.opacity - 128 / 255) < 1e-9 && lines.material.transparent);
+  assert.equal(lines.material.transparent, true, 'и непрозрачный цвет — в «прозрачном» проходе, после мира');
+  assert.equal(lines.renderOrder, 1000);
+
+  // G — меню: строки списка с образцом цвета, найдено у алмазов; клик по углю — включить его.
+  page.key('KeyG');
+  await page.advance(0);
+  assert.equal(n.xrayMenu.hidden, false);
+  assert.equal(n.xrayBadge.hidden, true, 'под меню надпись не нужна');
+  assert.equal(n.xmList.children.length, 2);
+  const [diamond, coal] = n.xmList.children.map((li) => li.children[0]);
+  assert.equal(diamond.attrs['aria-pressed'], 'true');
+  assert.match(diamond.textContent, /Алмазыdiamond_ore2/);
+  assert.equal(diamond.children[0].children[0].style.background, 'rgba(74, 237, 217, 1)');
+  assert.match(coal.textContent, /выкл/);
+  coal.click();
+  await page.advance(0);
+  assert.deepEqual(posts().at(-1).blocks.map((b) => b.on), [true, true]);
+
+  // ✎ у алмазов: название и цвет меняются, блок — нет; красный на максимум — сохранить.
+  n.xmList.children[0].children[1].click();
+  await page.advance(0);
+  assert.equal(n.xmEdit.hidden, false);
+  assert.equal(n.xmMain.hidden, true);
+  assert.equal(n.xmName.readOnly, true);
+  assert.equal(n.xmLabel.value, 'Алмазы');
+  assert.equal(n.xmDelete.hidden, false);
+  n.xmR.value = '255';
+  n.xmR.fire('input');
+  assert.equal(n.xmRv.textContent, '255');
+  n.xmLabel.value = 'Алмазики';
+  n.xmSave.click();
+  await page.advance(0);
+  const saved = posts().at(-1).blocks[0];
+  assert.deepEqual([saved.name, saved.label, saved.color], ['diamond_ore', 'Алмазики', '#ffedd9ff']);
+  assert.equal(n.xmEdit.hidden, true);
+
+  // «Что в руке»: золотая руда — редактор нового блока с игровым названием; сохранить — в списке три.
+  page.pick = { hand: 'gold_ore', look: null };
+  n.xmHand.click();
+  await page.advance(0);
+  assert.equal(n.xmEdit.hidden, false);
+  assert.equal(n.xmName.value, 'gold_ore');
+  assert.equal(n.xmLabel.value, 'Gold Ore');
+  assert.equal(n.xmDelete.hidden, true);
+  n.xmSave.click();
+  await page.advance(0);
+  assert.deepEqual(posts().at(-1).blocks.map((b) => b.name), ['diamond_ore', 'coal_ore', 'gold_ore']);
+
+  // «На что смотрит» — ни на что: понятное сообщение; Esc — закрыть меню.
+  n.xmLook.click();
+  await page.advance(0);
+  assert.equal(n.xmMsg.textContent, 'Бот ни на что не смотрит (ближе 32 блоков)');
+  page.key('Escape', { key: 'Escape' });
+  await page.advance(0);
+  assert.equal(n.xrayMenu.hidden, true);
+
+  // Выключили — контуры убраны со сцены.
+  n.btnXray.click();
+  page.xrayResult = { rev: 9, enabled: false, result: null };
+  page.server = { ...page.server, xray: { enabled: false, overlay: true, radius: 2, rev: 9 } };
+  await page.advance(500);
+  assert.equal(posts().at(-1).enabled, false);
+  assert.ok(removed.includes(lines) && lines.geometry.disposed && lines.material.disposed);
+  assert.ok(removed.includes(fill) && fill.geometry.disposed && fill.material.disposed);
+  assert.equal(n.xrayBadge.hidden, true);
 });

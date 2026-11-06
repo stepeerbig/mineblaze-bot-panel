@@ -604,6 +604,11 @@ function createFleet() {
     Object.assign(config, sanitize({ viewerMode: mode }));
     saveConfig();
   });
+  // Рентген (список блоков, цвета, радиус) меняют в меню окна экрана — запоминаем и раздаём всем процессам.
+  f.on('viewer-xray', (settings) => {
+    Object.assign(config, sanitize({ xray: settings }));
+    saveConfig();
+  });
   // То, что процессы ботов печатают сами (предупреждения mineflayer и т.п.), — в отдельный лог.
   f.on('output', ({ worker, stream, line }) => appendLog('process', Date.now(), `#${worker + 1} ${stream === 'stderr' ? 'ERR ' : ''}${line}`));
   // Упал процесс, где был бот экрана, — окно экрана закрываем (после перезапуска можно открыть снова).

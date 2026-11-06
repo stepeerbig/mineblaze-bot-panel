@@ -495,6 +495,7 @@ class BotManager extends EventEmitter {
       onState: (on) => this.godMemory.set(godKey, on),
     });
     bot.guard = s.guard;
+    bot.panelConfig = this.config; // живые настройки панели — командам (#рентген берёт отсюда список блоков)
     // Команды серверу из команд боту (#квесты принести пишет /home и /warp ah): та же очередь, что у чата панели,
     // и охрана с режимом бога видят их так же.
     bot.sendCommand = (cmd) => (alive() && s.loggedIn && !s.stopping ? this._send(s, cmd) : false);

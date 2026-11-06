@@ -9,7 +9,7 @@
 // События отсюда: { event, payload }; у событий бота в payload есть bot — его номер (ник маленькими буквами):
 //   log, chat, state { bot, state }, link, msa, ping { bot, ping } — пинг, как его считает сервер,
 //   want-connect { bot } — просится в общую очередь входа;
-//   viewer-mode — режим экрана переключили в его окне.
+//   viewer-mode — режим экрана переключили в его окне; viewer-xray — там же поменяли рентген (настройки целиком).
 
 const path = require('path');
 
@@ -116,10 +116,12 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
     if (!viewer) {
       const created = makeViewer({
         mode,
+        xray: shared.xray,
         log: (level, text) => log(level, `Экран бота: ${text}`, viewerBot),
       });
-      // Режим переключают в самом окне экрана — главный процесс запомнит его до следующего раза.
+      // Режим и рентген меняют в самом окне экрана — главный процесс запомнит их до следующего раза.
       created.on('mode', (value) => emit('viewer-mode', value));
+      created.on('xray', (settings) => emit('viewer-xray', settings));
       created.on('error', (err) => log('error', `Экран бота: ${err && err.message ? err.message : err}`, viewerBot));
       viewer = created;
     }
@@ -159,6 +161,7 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
       requireReady();
       Object.assign(shared, cfg);
       for (const entry of bots.values()) refresh(entry);
+      if (viewer && cfg && cfg.xray && typeof viewer.setXray === 'function') viewer.setXray(cfg.xray); // те же — ничего
       return true;
     },
     /** Какие боты живут в этом процессе: [{ bot, username, password }]. Новые — создать, лишние — убрать. */

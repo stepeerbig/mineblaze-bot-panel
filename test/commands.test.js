@@ -1251,3 +1251,35 @@ test('команды: неизвестная — подсказка; #помощ
   assert.equal(offline.ok, true, 'справка — даже когда бот не в мире');
   assert.equal((await runCommand(null, '#где')).code, 'not_ready');
 });
+
+test('команды: #рентген — что из списка есть в чанках вокруг и где ближайшее; одно — с координатами; радиус; лава; непонятное', async () => {
+  const s = setup();
+  s.bot.panelConfig = { xray: { radius: 1 } }; // список — по умолчанию
+  for (const [x, y, z, name] of [
+    [3, 50, 2, 'diamond_ore'], [-5, -40, 6, 'deepslate_diamond_ore'], [10, 60, 10, 'iron_ore'],
+    [20, 30, 20, 'spawner'], [40, 10, 0, 'emerald_ore'], [2, 62, 2, 'lava'],
+  ]) s.world.set(new Vec3(x, y, z), name);
+  const text = (r) => [].concat(r.message).join('\n');
+
+  const all = await s.run('#рентген');
+  assert.equal(all.ok, true);
+  const lines = [].concat(all.message);
+  assert.equal(lines[0], 'Рентген (радиус 1 чанк, 3×3): найдено 4');
+  assert.equal(lines[1], 'Алмазы ×2 — ближайший 3 50 2 (14 бл.)');
+  assert.ok(lines.includes('Железо ×1 — ближайший 10 60 10 (15 бл.)'), text(all));
+  assert.ok(lines.includes('Спавнер ×1 — ближайший 20 30 20 (44 бл.)'), text(all));
+  assert.match(lines.at(-1), /^Нет: изумруды, древние обломки, золото, /);
+  assert.equal(all.data.total, 4);
+
+  const one = await s.run('#рентген алмазы');
+  assert.deepEqual([].concat(one.message), ['Рентген: Алмазы ×2 (радиус 1 чанк, 3×3), ближние:', '  3 50 2 — 14 бл.', '  -5 -40 6 — 104 бл.']);
+  assert.match(text(await s.run('#рентген изумруды радиус 3')), /^Рентген: Изумруды ×1 \(радиус 3 чанка, 7×7\), ближние:\n {2}40 10 0 — /);
+  assert.match(text(await s.run('#рентген лава')), /^Рентген: Лава ×1 /);
+  assert.match(text(await s.run('#рентген 0')), /^Рентген \(радиус 0 чанков, 1×1\): найдено 2/); // алмаз и железо — в чанке бота
+
+  const none = setup();
+  const empty = await none.run('#рентген');
+  assert.equal(empty.ok, true);
+  assert.match(text(empty), /^Рентген \(радиус 2 чанка, 5×5\): ничего из списка — не нашёл\n.*анти-X-ray/);
+  assert.match((await none.run('#рентген пирожки')).message, /что искать\? Например: #рентген алмазы/);
+});

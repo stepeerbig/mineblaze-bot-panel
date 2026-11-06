@@ -391,3 +391,85 @@ test('close() можно звать много раз, после него start
   assert.strictEqual((await fetch(`${url2}state`)).status, 200);
   await server.close();
 });
+
+test('рентген: настройки (POST — событие xray, те же от панели — тишина), поиск только с окном, руду выкопали — найдено заново', async () => {
+  const ctx = await startServer({ xray: { enabled: true, radius: 1 } });
+  const bot = makeBot();
+  bot.heldItem = { name: 'gold_ore' };
+  bot.blockAtCursor = () => ({ name: 'stone' });
+  ctx.server.setBot(bot);
+  const get = async (p) => (await fetch(`${ctx.url}${p}`)).json();
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const until = async (check) => {
+    for (let i = 0; i < 100; i++) {
+      const v = await check();
+      if (v) return v;
+      await sleep(20);
+    }
+    throw new Error('не дождался');
+  };
+  const events = [];
+  ctx.server.on('xray', (s) => events.push(s));
+  let socket = null;
+  try {
+    const s0 = await get('xray');
+    assert.strictEqual(s0.settings.enabled, true);
+    assert.strictEqual(s0.settings.radius, 1);
+    assert.ok(s0.settings.blocks.some((b) => b.name === 'diamond_ore'), 'список по умолчанию');
+    assert.strictEqual((await get('xray/result')).result, null, 'окно не открыто — не ищет');
+
+    socket = connect(ctx);
+    await waitFor(socket, 'version');
+    // Глубинная алмазная руда (-5 -20 -5) — в строке «Алмазы» (вместе с deepslate_…).
+    const first = await until(async () => {
+      const r = await get('xray/result');
+      return r.result ? r : null;
+    });
+    const diamonds = first.result.groups.find((g) => g.key === 'diamond_ore');
+    assert.deepEqual([diamonds.count, diamonds.positions], [1, [-5, -20, -5]]);
+    assert.strictEqual(diamonds.label, 'Алмазы');
+    assert.strictEqual(ctx.server.getState().xray.rev, first.rev);
+    assert.deepEqual(ctx.server.getState().xray, { enabled: true, overlay: true, radius: 1, rev: first.rev });
+
+    // Руду выкопали — ищет заново, её больше нет.
+    const at = new Vec3(-5, -20, -5);
+    const old = bot.world.getBlock(at);
+    bot.world.setBlockStateId(at, 0);
+    bot.emit('blockUpdate', old, bot.world.getBlock(at));
+    const after = await until(async () => {
+      const r = await get('xray/result');
+      return r.rev !== first.rev && r.result ? r : null;
+    });
+    assert.strictEqual(after.result.groups.find((g) => g.key === 'diamond_ore').count, 0);
+
+    // Поменяли в меню окна — событие xray (панель запомнит); те же от панели — без события.
+    const res = await fetch(`${ctx.url}xray`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ settings: { ...s0.settings, lava: true, blocks: [{ name: 'Minecraft:Spawner', label: '  Спавнер ', color: '#C34BFF' }] } }),
+    });
+    const saved = (await res.json()).settings;
+    assert.deepEqual(saved.blocks, [{ name: 'spawner', label: 'Спавнер', color: '#c34bffff', on: true, same: true }]);
+    assert.strictEqual(saved.lava, true);
+    assert.strictEqual(events.length, 1);
+    assert.deepEqual(events[0], saved);
+    ctx.server.setXray(saved);
+    assert.strictEqual(events.length, 1);
+    for (const body of ['{"settings":[1]}', '{"x":1}', 'не json']) {
+      const bad = await fetch(`${ctx.url}xray`, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+      assert.strictEqual(bad.status, 400, body);
+    }
+
+    // Имена блоков для «Добавить блок» (без воздуха) и что бот держит, на что смотрит.
+    const { blocks } = await get('xray/blocks');
+    assert.ok(blocks.some(([n, title]) => n === 'diamond_ore' && title === 'Diamond Ore'));
+    assert.ok(!blocks.some(([n]) => /air$/.test(n)));
+    assert.deepEqual(await get('xray/pick'), { hand: 'gold_ore', look: 'stone' });
+    bot.heldItem = { name: 'stick' };
+    assert.deepEqual(await get('xray/pick'), { hand: null, look: 'stone' });
+  } finally {
+    if (socket) socket.close();
+    await ctx.server.close();
+  }
+  assert.strictEqual(listenerTotal(bot), 0, 'слежка рентгена снята вместе с окном');
+});

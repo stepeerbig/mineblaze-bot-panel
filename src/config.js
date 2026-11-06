@@ -1,5 +1,7 @@
 'use strict';
 
+const { DEFAULT_XRAY, sanitizeXray } = require('./bot/xray');
+
 const DEFAULT_CONFIG = Object.freeze({
   host: 'mineblaze.net',
   port: 25565,
@@ -38,6 +40,8 @@ const DEFAULT_CONFIG = Object.freeze({
   questMine: '', // дом шахты: «Передайте редстоун…» — сначала добыть руду оттуда (#добудь)
   questTogether: 2, // ботов делают задания одновременно
   questPause: 15, // минут между проверками одного бота
+  // Рентген (src/bot/xray.js): какие блоки подсвечивать в «Экране бота» и искать #рентген — цвета, радиус, лава.
+  xray: DEFAULT_XRAY,
 });
 
 const MAX_WHITELIST_LENGTH = 5000;
@@ -144,6 +148,7 @@ function sanitize(src) {
     const n = src[key] === undefined ? undefined : int(src[key], min, max);
     if (n !== undefined) out[key] = n;
   }
+  if (src.xray && typeof src.xray === 'object') out.xray = sanitizeXray(src.xray);
   return out;
 }
 

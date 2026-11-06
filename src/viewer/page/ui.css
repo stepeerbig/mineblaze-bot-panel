@@ -237,6 +237,241 @@ button:focus-visible {
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ---------- рентген ---------- */
+
+.xray-toggle { display: inline-flex; align-items: center; gap: 7px; }
+
+.xray-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--cobble);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .15);
+}
+
+.xray-toggle[aria-pressed="true"] { color: var(--chalk); border-color: #2b7a55; }
+.xray-toggle[aria-pressed="true"] .xray-dot { background: var(--emerald); box-shadow: 0 0 6px var(--emerald); }
+
+/* Надпись «Рентген включён» — справа под кнопками, как у мода в углу экрана */
+.xray-badge {
+  position: absolute;
+  top: 60px;
+  right: 12px;
+  padding: 5px 10px;
+  color: var(--emerald);
+  font: 600 12px var(--ui);
+}
+
+.xray-badge .muted { color: var(--dust); font-weight: 400; }
+
+.xray-tip {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 6px 6px 12px;
+  color: var(--dust);
+  font-size: 12px;
+  pointer-events: auto;
+}
+
+kbd {
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 5px;
+  border: 1px solid var(--cobble);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--slate);
+  color: var(--chalk);
+  font: 600 11.5px var(--mono);
+  text-align: center;
+}
+
+/* Меню рентгена — панель справа поверх мира */
+.xray-menu {
+  position: absolute;
+  top: 60px;
+  right: 12px;
+  bottom: 12px;
+  width: 360px;
+  max-width: calc(100% - 24px);
+  display: flex;
+  flex-direction: column;
+  background: rgba(28, 30, 34, .95);
+  border: 1px solid var(--cobble);
+  border-radius: 10px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, .45);
+  pointer-events: auto;
+  user-select: text;
+}
+
+.xm-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 10px 8px 14px;
+  border-bottom: 1px solid var(--cobble);
+}
+
+.xm-title { font: 600 14px var(--ui); }
+
+.xm-x {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dust);
+  font: 18px/1 var(--ui);
+  cursor: pointer;
+}
+
+.xm-x:hover { background: var(--cobble); color: var(--chalk); }
+
+.xm-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px 14px;
+  overflow-y: auto;
+}
+
+.xm-sub { font: 600 13px var(--ui); }
+
+.xm-input {
+  width: 100%;
+  height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--cobble);
+  border-radius: 6px;
+  background: var(--deepslate);
+  color: var(--chalk);
+  font: 13px var(--ui);
+}
+
+.xm-input:focus { outline: 2px solid var(--lapis); outline-offset: -1px; }
+.xm-input[readonly] { color: var(--dust); }
+
+.xm-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--cobble);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.xm-item { display: flex; border-top: 1px solid var(--cobble); }
+.xm-item:first-child { border-top: 0; }
+
+.xm-entry {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--chalk);
+  font: 13px var(--ui);
+  text-align: left;
+  cursor: pointer;
+}
+
+.xm-entry:hover, .xm-edit:hover { background: rgba(255, 255, 255, .05); }
+.xm-entry[aria-pressed="false"] { color: var(--dust); }
+.xm-entry[aria-pressed="false"] .xm-sw { opacity: .35; }
+
+.xm-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.xm-name small { margin-left: 6px; color: var(--dust); font: 11px var(--mono); }
+.xm-count { color: var(--dust); font: 12px var(--mono); font-variant-numeric: tabular-nums; }
+.xm-entry[aria-pressed="true"] .xm-count.found { color: var(--emerald); }
+
+.xm-edit {
+  width: 34px;
+  border: 0;
+  border-left: 1px solid var(--cobble);
+  background: transparent;
+  color: var(--dust);
+  cursor: pointer;
+}
+
+/* Образец цвета: шахматка под ним показывает прозрачность */
+.xm-sw, .xm-preview span {
+  display: inline-block;
+  flex: none;
+  border: 1px solid rgba(255, 255, 255, .25);
+  border-radius: 4px;
+  background-color: #fff;
+  background-image:
+    linear-gradient(45deg, #bbb 25%, transparent 25%, transparent 75%, #bbb 75%),
+    linear-gradient(45deg, #bbb 25%, transparent 25%, transparent 75%, #bbb 75%);
+  background-size: 8px 8px;
+  background-position: 0 0, 4px 4px;
+  overflow: hidden;
+}
+
+.xm-sw { width: 18px; height: 18px; }
+.xm-sw i, .xm-preview i { display: block; width: 100%; height: 100%; }
+
+.xm-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.xm-grow { flex: 1; }
+
+.xm-btn {
+  height: 30px;
+  padding: 0 11px;
+  border: 1px solid var(--cobble);
+  border-radius: 6px;
+  background: var(--slate);
+  color: var(--chalk);
+  font: 600 12px var(--ui);
+  cursor: pointer;
+}
+
+.xm-btn:hover:not(:disabled) { background: var(--cobble); }
+.xm-btn .ico { display: inline-block; margin-right: 4px; vertical-align: -2px; fill: currentColor; }
+.xm-primary { background: #2b7a55; border-color: #2b7a55; }
+.xm-primary:hover:not(:disabled) { background: #33935f; }
+.xm-danger { color: var(--redstone); }
+
+.xm-field { display: flex; flex-direction: column; gap: 4px; color: var(--dust); font-size: 12px; }
+.xm-field b { color: var(--chalk); font-weight: 600; }
+
+.xm-check { display: inline-flex; align-items: center; gap: 6px; color: var(--chalk); font-size: 12.5px; cursor: pointer; }
+
+input[type="range"] { width: 100%; accent-color: var(--emerald); }
+input[type="checkbox"] { accent-color: var(--emerald); }
+
+.xm-color { display: flex; gap: 12px; align-items: flex-start; }
+
+.xm-wheel {
+  flex: none;
+  width: 136px;
+  height: 136px;
+  border-radius: 50%;
+  cursor: crosshair;
+}
+
+.xm-sliders { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; color: var(--dust); font-size: 11.5px; }
+.xm-sliders b { color: var(--chalk); font: 600 11.5px var(--mono); }
+.xm-preview span { width: 100%; height: 22px; margin-top: 4px; }
+
+.xm-help { color: var(--dust); font-size: 12px; }
+.xm-help summary { color: var(--chalk); cursor: pointer; }
+.xm-help p { margin: 6px 0 0; line-height: 1.45; }
+
+.xm-msg { min-height: 16px; color: var(--gold); font-size: 12px; }
+.xm-msg.ok { color: var(--emerald); }
+
+.xm-actions { margin-top: 2px; }
+
 @media (prefers-reduced-motion: reduce) {
   .curtain[data-kind="loading"] .card::before { animation: none; }
 }

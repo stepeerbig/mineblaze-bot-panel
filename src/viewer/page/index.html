@@ -46,6 +46,10 @@
       </div>
 
       <div class="tools">
+        <button id="btnXray" class="tool-btn chip xray-toggle" type="button" aria-pressed="false" title="Рентген: блоки из списка — сквозь стены (клавиша \)">
+          <span class="xray-dot" aria-hidden="true"></span>Рентген
+        </button>
+        <button id="btnXrayMenu" class="tool-btn chip" type="button" aria-expanded="false" aria-controls="xrayMenu" title="Что подсвечивать и каким цветом (клавиша G)">Список</button>
         <div class="seg chip" role="group" aria-label="Вид камеры">
           <button id="modeFirst" class="seg-btn" type="button" aria-pressed="true">Глазами бота</button>
           <button id="modeThird" class="seg-btn" type="button" aria-pressed="false">Со стороны</button>
@@ -53,6 +57,76 @@
         <button id="btnReload" class="tool-btn chip" type="button" title="Перезагрузить вид и навести камеру на бота">↻ Обновить</button>
       </div>
     </div>
+
+    <!-- Рентген: надпись, подсказка о клавишах, меню списка блоков -->
+    <div id="xrayBadge" class="xray-badge chip" role="status" hidden></div>
+    <div id="xrayTip" class="xray-tip chip" hidden>
+      <span>Рентген: <kbd>\</kbd> — включить, <kbd>G</kbd> — список блоков</span>
+      <button id="xrayTipClose" class="xm-x" type="button" title="Понятно">×</button>
+    </div>
+
+    <aside id="xrayMenu" class="xray-menu" role="dialog" aria-labelledby="xmTitle" hidden>
+      <header class="xm-head">
+        <div id="xmTitle" class="xm-title">Рентген</div>
+        <button id="xmClose" class="xm-x" type="button" title="Закрыть (Esc или G)">×</button>
+      </header>
+
+      <div id="xmMain" class="xm-body">
+        <input id="xmSearch" class="xm-input" type="search" placeholder="Поиск" autocomplete="off" spellcheck="false">
+        <ul id="xmList" class="xm-list" aria-label="Блоки рентгена"></ul>
+        <div class="xm-row">
+          <button id="xmAdd" class="xm-btn" type="button">+ Добавить блок</button>
+          <button id="xmHand" class="xm-btn" type="button" title="Добавить блок, который бот держит в руке">Что в руке</button>
+          <button id="xmLook" class="xm-btn" type="button" title="Добавить блок, на который смотрит бот">На что смотрит</button>
+        </div>
+        <label class="xm-field">
+          <span>Радиус: <b id="xmRadiusText"></b></span>
+          <input id="xmRadius" type="range" min="0" max="8" step="1">
+        </label>
+        <div class="xm-row">
+          <label class="xm-check"><input id="xmLava" type="checkbox"> Лава</label>
+          <label class="xm-check"><input id="xmOverlay" type="checkbox"> Надпись «Рентген включён»</label>
+        </div>
+        <details class="xm-help">
+          <summary>Помощь</summary>
+          <p>Нажми на блок в списке — включить или выключить его. Изменить название, цвет или удалить — <b>✎</b> или Shift+клик.</p>
+          <p>Ищет в загруженных чанках вокруг бота: радиус — сколько чанков в каждую сторону (2 → 5×5). Больше радиус — дольше поиск и больше контуров (показываются до 4000 ближних).</p>
+          <p>Видно только то, что прислал сервер: если на сервере анти-X-ray, руда в толще камня спрятана — видна открытая (в пещерах). То же в чате панели: <b>#рентген</b>, <b>#рентген алмазы</b>.</p>
+        </details>
+        <div id="xmMsg" class="xm-msg" role="status" aria-live="polite"></div>
+      </div>
+
+      <div id="xmEdit" class="xm-body" hidden>
+        <div id="xmEditTitle" class="xm-sub">Изменить блок</div>
+        <label class="xm-field"><span>Название</span><input id="xmLabel" class="xm-input" maxlength="40" autocomplete="off"></label>
+        <label class="xm-field">
+          <span>Блок (имя в игре)</span>
+          <input id="xmName" class="xm-input" list="xmNames" placeholder="например, diamond_ore" autocomplete="off" spellcheck="false">
+          <datalist id="xmNames"></datalist>
+        </label>
+        <div class="xm-color">
+          <canvas id="xmWheel" class="xm-wheel" width="136" height="136" title="Цвет — нажми на круг"></canvas>
+          <div class="xm-sliders">
+            <label>Красный: <b id="xmRv"></b><input id="xmR" type="range" min="0" max="255"></label>
+            <label>Зелёный: <b id="xmGv"></b><input id="xmG" type="range" min="0" max="255"></label>
+            <label>Синий: <b id="xmBv"></b><input id="xmB" type="range" min="0" max="255"></label>
+            <label>Непрозрачность: <b id="xmAv"></b><input id="xmA" type="range" min="0" max="255"></label>
+            <div class="xm-preview"><span id="xmSwatch"></span></div>
+          </div>
+        </div>
+        <label class="xm-check"><input id="xmSame" type="checkbox"> и глубинный вариант (deepslate_…)</label>
+        <div class="xm-row xm-actions">
+          <button id="xmDelete" class="xm-btn xm-danger" type="button" title="Убрать из списка">
+            <svg class="ico" width="12" height="14" viewBox="0 0 12 14" aria-hidden="true"><path d="M4 0h4v1h4v2H0V1h4zM1 4h10l-1 10H2zM4 6v6h1V6zm3 0v6h1V6z"/></svg>
+            Удалить
+          </button>
+          <span class="xm-grow"></span>
+          <button id="xmCancel" class="xm-btn" type="button">Отмена</button>
+          <button id="xmSave" class="xm-btn xm-primary" type="button">Сохранить</button>
+        </div>
+        <div id="xmEditMsg" class="xm-msg" role="status" aria-live="polite"></div>
+      </div>
+    </aside>
   </div>
 
   <script src="index.js"></script>

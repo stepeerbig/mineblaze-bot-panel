@@ -282,6 +282,7 @@ async function runScenario(manager, cmd) {
       '#копай впереди',
       '#открой',
       '#рядом',
+      '#рентген',
       '#сущности',
       '#иди к Farmer',
       '#нажми Farmer',
@@ -365,6 +366,10 @@ async function runMineCheck(manager, cmd) {
     `give ${BOT_NAME} minecraft:iron_pickaxe`,
   ]) cmd(c);
   await wait(3000);
+  // Рентген по настоящим чанкам сервера: спрятанные руды должен видеть (с координатами).
+  bot.panelConfig = { xray: { radius: 1 } };
+  const x = await runCommand(bot, '#рентген железо');
+  console.log(`  [добыча] #рентген железо → ${[].concat(x.message).join(' | ')}`);
   const started = Date.now();
   const r = await runCommand(bot, '#добудь железо 2');
   console.log(`  [добыча] #добудь железо 2 → ${r.ok ? 'да' : 'НЕТ'} (${((Date.now() - started) / 1000).toFixed(1)} с): ${[].concat(r.message).join(' | ')}`);
@@ -586,6 +591,8 @@ function runBot(host, port, version, cmd) {
       authCacheDir: path.join(os.tmpdir(), 'mineblaze-stand-auth'),
       journalDir: JOURNAL_DIR,
       compat: COMPAT,
+      // Проверки бывают по несколько минут (добыча): журнал — за всё время, чтобы разобрать любой откат.
+      journalLimits: { keepMs: 10 * 60 * 1000, maxEntries: 400000 },
     });
     const result = { online: false, onlineMs: 0, kick: null, problem: null, stats: null };
     let onlineAt = 0;

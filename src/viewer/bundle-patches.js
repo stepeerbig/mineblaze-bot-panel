@@ -32,6 +32,14 @@ const INDEX_PATCHES = [
     replacement: (m, pos, first, controls) => `if(${first}&&(${controls}.target.set(${pos}.x,${pos}.y,${pos}.z)`,
     expected: 1,
   },
+  {
+    name: 'expose-viewer',
+    description: 'Странице окна — доступ к 3D-сцене (window.__mbpViewer): рентген рисует контуры блоков сквозь стены',
+    // Обработчик 'version': viewer.listen(socket). Замена без «.listen(» — повторно не применится.
+    pattern: /([\w$]+)\.listen\(([\w$]+)\)/g,
+    replacement: (m, viewer, socket) => `(window.__mbpViewer=${viewer})["listen"](${socket})`,
+    expected: 1,
+  },
 ];
 
 const WORKER_PATCHES = [
