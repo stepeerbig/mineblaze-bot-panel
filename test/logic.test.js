@@ -497,7 +497,6 @@ test('вход: пароль с пробелом («пароль пароль»)
   goOnline(bots[0]);
   serverSays(bots[0], '| Авторизируйтесь » /login [пароль]');
   assert.deepEqual(bots[0].sent, ['/login Secr3t'], 'MineBlaze ждёт одно слово: на два отвечает «Авторизируйтесь»');
-  assert.ok(lines(logs).some((l) => /^warn:Пароль записан с пробелом/.test(l)), lines(logs).join('\n'));
   assert.ok(!JSON.stringify(logs).includes('Secr3t'), 'пароль нигде не виден');
   serverSays(bots[0], '| Вы успешно авторизовались');
   assert.ok(lines(logs).includes('ok:Автовход: сервер принял пароль'));
@@ -517,6 +516,48 @@ test('вход: пароль с пробелом («пароль пароль»)
   await sleep(20);
   assert.equal(b.mgr.state, 'offline');
   assert.equal(b.mgr.wantRun, false, 'не переподключается');
+});
+
+test('вход: в поле пароля — команда целиком или несколько слов: только пароль, слова по очереди на «Пароль указан неверно», подошедшее — помнит', async () => {
+  // «/login пароль» вписано целиком — уходит только пароль.
+  const c = setup({ loginPassword: '/login Secr3t' });
+  c.mgr.start();
+  goOnline(c.bots[0]);
+  serverSays(c.bots[0], '| Авторизируйтесь » /login [пароль]');
+  assert.deepEqual(c.bots[0].sent, ['/login Secr3t']);
+  assert.ok(lines(c.logs).some((l) => /^warn:В поле пароля вписана команда целиком/.test(l)));
+  c.mgr.shutdown();
+
+  // Два разных слова, пароль — второе (так было у пользователя 7 ноября: первое — «неверно», руками — входит).
+  const { mgr, bots, logs } = setup({ loginPassword: 'Old1 New2', autoReconnect: true }, { commandGap: 0 });
+  mgr.start();
+  goOnline(bots[0]);
+  serverSays(bots[0], '| Авторизируйтесь » /login [пароль]');
+  serverSays(bots[0], '| Пароль указан неверно');
+  serverSays(bots[0], '| Вы успешно авторизовались');
+  assert.deepEqual(bots[0].sent, ['/login Old1', '/login New2']);
+  const t = lines(logs);
+  assert.ok(t.some((l) => /^warn:Автовход: 1-е слово из поля пароля сервер не принял \(«Пароль указан неверно»\) — пробую 2-е/.test(l)), t.join('\n'));
+  assert.ok(t.some((l) => /^warn:Автовход: подошло 2-е слово из поля пароля\. Оставь в поле только его/.test(l)), t.join('\n'));
+  assert.ok(!JSON.stringify(logs).includes('New2') && !JSON.stringify(logs).includes('Old1'), 'пароль нигде не виден');
+  // Переподключение — сразу второе слово.
+  bots[0].emit('end', 'socketClosed');
+  await sleep(1100);
+  goOnline(bots[1]);
+  serverSays(bots[1], '| Авторизируйтесь » /login [пароль]');
+  assert.deepEqual(bots[1].sent, ['/login New2']);
+  mgr.shutdown();
+
+  // Ни одно слово не подошло — стоп с понятной причиной.
+  const w = setup({ loginPassword: 'a1 b2', autoReconnect: true });
+  w.mgr.start();
+  goOnline(w.bots[0]);
+  serverSays(w.bots[0], '| Авторизируйтесь » /login [пароль]');
+  serverSays(w.bots[0], '| Пароль указан неверно');
+  serverSays(w.bots[0], '| Пароль указан неверно');
+  assert.ok(lines(w.logs).some((l) => /^error:Автовход не прошёл: сервер ответил «Пароль указан неверно» на все слова из поля пароля \(2\)/.test(l)), lines(w.logs).join('\n'));
+  await sleep(20);
+  assert.equal(w.mgr.wantRun, false);
 });
 
 test('вход: не зарегистрирован — /reg по подсказке сервера; лимит регистраций с IP — понятная причина и стоп', async () => {

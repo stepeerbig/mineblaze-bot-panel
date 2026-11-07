@@ -36,7 +36,8 @@ const SETBACK_WARN_EVERY_MS = 30 * 1000;
 const AUTH_LOGIN_RE = /(?:авториз(?:ир)?уйтесь|необходимо\s+авториз|please,?\s+log\s*in|\/l(?:ogin)?\s+[<[(]\s*(?:пароль|password))/i;
 const AUTH_REGISTER_RE = /(?:зарегистрируйтесь|необходимо\s+зарегистр|please,?\s+register|\/reg(?:ister)?\s+[<[(]\s*(?:пароль|password))/i;
 const AUTH_OK_RE = /(?:успешно\s+(?:авториз|зарегистр|вошли)|уже\s+авториз|successfully\s+(?:logged|registered|authenticated)|logged\s+in\s+successfully|already\s+logged\s+in)/i;
-const AUTH_WRONG_RE = /(?:неверный\s+пароль|неправильный\s+пароль|wrong\s+password|incorrect\s+password|invalid\s+password)/i;
+// MineBlaze: «Пароль указан неверно».
+const AUTH_WRONG_RE = /(?:пароль\s+указан\s+неверно|неверно\s+указан\s+пароль|пароль\s+неверный|неверный\s+пароль|неправильный\s+пароль|wrong\s+password|incorrect\s+password|invalid\s+password)/i;
 const AUTH_REG_LIMIT_RE = /(?:лимит\s+регистраций|превысили\s+лимит|максимальное\s+(?:число|количество)\s+(?:аккаунтов|регистраций)|too\s+many\s+(?:accounts|registrations)|max(?:imum)?\s+(?:number\s+of\s+)?registrations)/i;
 const AUTH_MAX_TRIES = 3; // столько раз подряд сервер снова просит войти — пароль не подходит, бросаем
 // Проверка «я не робот» (MineBlaze: «Пожалуйста подтвердите, что вы не робот - кликните мышкой по ссылке и нажмите
@@ -472,7 +473,11 @@ class BotManager extends EventEmitter {
       lastSentAt: 0,
       // Вход с паролем (см. _onAuthMessage): done — вошёл (или вход не нужен), failed — бросили; sent — что
       // отправили последним ('login' | 'register'), pending — просьба пришла до появления в мире.
-      auth: { done: false, confirmed: false, doneAt: 0, failed: false, tries: 0, sent: null, sentAt: 0, pending: null, template: '', noted: new Set() },
+      auth: {
+        done: false, confirmed: false, doneAt: 0, failed: false, tries: 0, sent: null, sentAt: 0, pending: null, template: '', noted: new Set(),
+        // Какое слово из поля пароля пробовать: в прошлый раз подошло — сразу его (пока пароль в настройках тот же).
+        cand: this.goodPassword && this.goodPassword.raw === String(cfg.loginPassword || '') ? this.goodPassword.cand : 0,
+      },
       authTimer: null,
       joinStarted: false, // команды после входа уже пошли
       ready: false, // готов к делам (событие 'ready')
@@ -948,12 +953,20 @@ class BotManager extends EventEmitter {
   // ---------- вход с паролем ----------
 
   /**
-   * Пароль для /login и /reg — одно слово: на «/login слово слово» MineBlaze отвечает «Авторизируйтесь » /login
-   * [пароль]» и через пару минут молча отключает. Записано несколько (например, «пароль пароль», как для
-   * /register) — первое.
+   * Варианты пароля из поля. Пароль для /login и /reg — одно слово: на «/login слово слово» MineBlaze отвечает
+   * «Авторизируйтесь » /login [пароль]», а через пару минут молча отключает. Поэтому: в поле вписана команда целиком
+   * («/login пароль», «/reg пароль пароль») — команду отбрасываем; слов несколько — пробуем по очереди (без повторов):
+   * на «Пароль указан неверно» — следующее. Подошедшее помним до смены пароля (переподключения — сразу с него).
    */
+  _passwordWords() {
+    let words = String(this.config.loginPassword || '').trim().split(/\s+/).filter(Boolean);
+    const command = words.length > 1 && words[0].startsWith('/');
+    if (command) words = words.slice(1);
+    return { words: [...new Set(words)], command };
+  }
+
   _passwordWord() {
-    return String(this.config.loginPassword || '').trim().split(/\s+/).filter(Boolean)[0] || '';
+    return this._passwordWords().words[0] || '';
   }
 
   /** Бот впервые появился в мире: без пароля — сразу команды после входа; с паролем — ждём, что скажет сервер. */
@@ -1002,6 +1015,14 @@ class BotManager extends EventEmitter {
         this.log('ok', was === 'register' ? 'Регистрация: аккаунт зарегистрирован, вход выполнен'
           : was === 'login' ? 'Автовход: сервер принял пароль' : 'Вход: бот уже авторизован — /login не нужен');
       }
+      if (was === 'login') {
+        this.goodPassword = { raw: String(this.config.loginPassword || ''), cand: a.cand }; // переподключения — сразу с него
+        if (this._passwordWords().words.length > 1 && !this.passwordHinted) {
+          this.passwordHinted = true;
+          this.log('warn', `Автовход: подошло ${a.cand + 1}-е слово из поля пароля. Оставь в поле только его (общий пароль — в «Автовход», ` +
+            'свой — у бота в «Боты», ник:пароль): лишние слова сервер считает неверными попытками входа');
+        }
+      }
       if (s.spawned) this._startJoinCommands(s);
       return;
     }
@@ -1011,8 +1032,20 @@ class BotManager extends EventEmitter {
       return;
     }
     if (AUTH_WRONG_RE.test(text)) {
-      this._authFail(s, `Автовход не прошёл: «${text.replace(/^[|\s]+/, '').slice(0, 120)}» — проверь пароль: общий в «Автовход» ` +
-        'или у бота в «Боты» (ник:пароль). Бот остановлен, чтобы не заходить по кругу');
+      if (a.sent !== 'login') return; // человек сам ошибся в /login — не наше дело
+      const said = text.replace(/^[|\s]+/, '').slice(0, 100);
+      const { words } = this._passwordWords();
+      if (a.cand + 1 < words.length) {
+        a.cand += 1; // следующее слово из поля
+        a.tries = 0;
+        a.sentAt = 0; // ответ на прошлую пришёл — можно сразу
+        this.log('warn', `Автовход: ${a.cand}-е слово из поля пароля сервер не принял («${said}») — пробую ${a.cand + 1}-е`);
+        this._authSend(s, 'login');
+        return;
+      }
+      this._authFail(s, `Автовход не прошёл: сервер ответил «${said}»${words.length > 1 ? ` на все слова из поля пароля (${words.length})` : ''}. ` +
+        'Впиши в поле только сам пароль — одним словом, как вводишь его после /login: общий в «Автовход» или у бота в «Боты» (ник:пароль). ' +
+        'Бот остановлен, чтобы не заходить по кругу');
       return;
     }
     const kind = AUTH_REGISTER_RE.test(text) ? 'register' : AUTH_LOGIN_RE.test(text) ? 'login' : null;
@@ -1035,7 +1068,8 @@ class BotManager extends EventEmitter {
   /** Ответить серверу: /login или /reg (первым словом пароля). Сразу после прошлой — ждём ответа на неё. */
   _authSend(s, kind) {
     const a = s.auth;
-    const word = this._passwordWord();
+    const { words, command } = this._passwordWords();
+    const word = words[Math.min(a.cand, words.length - 1)] || '';
     if (!word) {
       if (!a.noted.has('nopass')) {
         a.noted.add('nopass');
@@ -1054,10 +1088,14 @@ class BotManager extends EventEmitter {
         'пароль не подошёл? Проверь его: общий в «Автовход» или у бота в «Боты» (ник:пароль). Бот остановлен, чтобы не заходить по кругу');
       return;
     }
-    if (!a.noted.has('words') && String(this.config.loginPassword || '').trim().split(/\s+/).length > 1) {
+    if (command && !a.noted.has('command')) {
+      a.noted.add('command');
+      this.log('warn', 'В поле пароля вписана команда целиком («/login …») — отправляю только пароль. Лучше оставить в поле один пароль');
+    }
+    if (words.length > 1 && !a.noted.has('words')) {
       a.noted.add('words');
-      this.log('warn', 'Пароль записан с пробелом (несколько слов) — для входа отправляю только первое слово. Не войдёт — ' +
-        'проверь пароль: общий в «Автовход» или у бота в «Боты» (ник:пароль)');
+      this.log('warn', `В поле пароля несколько слов (${words.length}), а пароль — одно слово: пробую их по очереди ` +
+        '(сервер ответит «неверно» — следующее). Лучше оставить в поле только сам пароль');
     }
     a.tries += 1;
     a.sent = kind;
