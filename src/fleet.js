@@ -25,12 +25,19 @@ const DEFAULT_TIMINGS = Object.freeze({
   captchaHoldMs: 90 * 1000,
   // Сервер заблокировал IP («заблокирован на 10 минут»): новые входы ждут конца блокировки и ещё столько.
   ipBlockExtraMs: 15 * 1000,
+  // Столько входов подряд повисли (сервер принял подключение и не пускает) — сервер перестал пускать новых с нашего
+  // IP (на MineBlaze 8.11: после 16 в сети повисли 21 подряд). Очередь не долбит его, а ждёт и пробует одного бота:
+  // повис — ждёт вдвое дольше (до hungMaxHoldMs), вошёл — дальше как обычно.
+  hungStreak: 3,
+  hungHoldMs: 2 * 60 * 1000,
+  hungMaxHoldMs: 10 * 60 * 1000,
 });
 const STOP_RE = /^#\s*(?:стоп|stop|хватит|стой)(?:\s|$)/i;
 const REPLY_LINES = 6; // строк ответа сервера на «/…» — каждому боту
 const errText = (err) => (err && err.message ? err.message : String(err));
 const RUNNING = (state) => state && state !== 'offline';
 const IN_GAME = (b) => b.state === 'online' || b.state === 'connected';
+const waitText = (ms) => (ms < 60 * 1000 ? `${Math.max(1, Math.round(ms / 1000))} с` : `${Math.round(ms / 60000)} мин`);
 
 class Fleet extends EventEmitter {
   /**
@@ -57,6 +64,9 @@ class Fleet extends EventEmitter {
     this._lastAdmitAt = -Infinity;
     this._ipBlockUntil = 0; // до какого времени сервер не пускает с нашего IP (кик «IP адрес заблокирован»)
     this._batch = null; // последний «Старт»: кого запустили — чтобы, когда все войдут (или нет), сказать итог
+    // Повисшие входы подряд: streak; сервер перестал пускать — holdMs > 0: очередь ждёт до holdUntil, потом пускает
+    // одного (probe) и ждёт, чем кончится его вход.
+    this._hung = { streak: 0, holdMs: 0, holdUntil: 0, probe: null };
     this._queueTimer = null;
     this._summaryPending = false;
     this._closed = false;
@@ -153,7 +163,7 @@ class Fleet extends EventEmitter {
     if (startedIds.length > 1) {
       const ids = new Set(this._batch ? this._batch.ids : []);
       for (const id of startedIds) ids.add(id);
-      this._batch = { ids };
+      this._batch = { ids, stopped: this._batch ? this._batch.stopped : 0 };
       this._checkBatch();
     }
     return started;
@@ -162,9 +172,11 @@ class Fleet extends EventEmitter {
   /** Остановить ботов (по номерам; без них — всех). Возвращает, скольких. */
   async stop(ids = null) {
     if (!ids) this.cancelTurn(); // «Стоп всех» останавливает и очередь
-    // Остановленных итог входа не ждёт (человек сам их остановил).
+    // Остановленных итог входа не ждёт (человек сам их остановил), но скажет, сколько их.
     if (!ids) this._batch = null;
-    else if (this._batch) for (const id of ids) this._batch.ids.delete(String(id).toLowerCase());
+    else if (this._batch) {
+      for (const id of ids) if (this._batch.ids.delete(String(id).toLowerCase())) this._batch.stopped += 1;
+    }
     const list = this._pick(ids).filter((b) => RUNNING(b.state));
     const stopping = new Set(list.map((b) => b.bot));
     this.queue = this.queue.filter((id) => !stopping.has(id));
@@ -438,6 +450,8 @@ class Fleet extends EventEmitter {
         }, hold);
         return;
       }
+      // Сервер перестал пускать: пробный вход ещё идёт — ждём, чем кончится (_onState / _onLoginHung снова позовут).
+      if (this._hung.holdMs && this._hung.probe) return;
       const gap = this._gapMs();
       const wait = this._lastAdmitAt + gap - Date.now();
       if (wait > 0 && wait <= gap) {
@@ -449,6 +463,7 @@ class Fleet extends EventEmitter {
       }
       this.queue.shift();
       this._lastAdmitAt = Date.now();
+      if (this._hung.holdMs) this._hung.probe = id;
       const w = this.workers[b.worker];
       if (w && w.client && w.client.child) {
         w.client.request('admit', { bot: id }).catch((err) => this._log('error', `Не удалось начать вход: ${errText(err)}`, id));
@@ -536,6 +551,7 @@ class Fleet extends EventEmitter {
     client.on('captcha', (c) => this._onCaptcha(c));
     client.on('captcha-done', (c) => this._onCaptchaDone(c && c.bot));
     client.on('ip-block', (p) => this._onIpBlock(p));
+    client.on('login-hung', (p) => this._onLoginHung(p));
     client.on('msa', (d) => this._emitBot('msa', d));
     client.on('ping', (p) => {
       const b = p && this.bots.get(p.bot);
@@ -593,7 +609,46 @@ class Fleet extends EventEmitter {
   /** Сколько ещё очередь входа стоит: проверка «я не робот» или блокировка IP (0 — не стоит). */
   _holdLeft() {
     const ip = this._ipBlockUntil ? this._ipBlockUntil + this.timings.ipBlockExtraMs - Date.now() : 0;
-    return Math.max(this._captchaHoldLeft(), ip, 0);
+    const hung = this._hung.holdMs && !this._hung.probe ? this._hung.holdUntil - Date.now() : 0;
+    return Math.max(this._captchaHoldLeft(), ip, hung, 0);
+  }
+
+  /** Вход повис (BotManager, 'login-hung'). Несколько подряд — сервер перестал пускать: очередь ждёт и пробует одного. */
+  _onLoginHung(p) {
+    const b = p && this.bots.get(p.bot);
+    if (!b) return;
+    const h = this._hung;
+    h.streak += 1;
+    const online = this._inGame().length;
+    if (h.probe === b.bot) {
+      h.probe = null;
+      h.holdMs = Math.min(h.holdMs * 2, this.timings.hungMaxHoldMs);
+      h.holdUntil = Date.now() + h.holdMs;
+      this._log('warn', `Пробный вход (${b.nick}) тоже повис — сервер всё ещё не пускает новых (в сети ${online}); ` +
+        `следующая проба через ${waitText(h.holdMs)}`);
+    } else if (!h.holdMs && h.streak >= this.timings.hungStreak) {
+      h.holdMs = this.timings.hungHoldMs;
+      h.holdUntil = Date.now() + h.holdMs;
+      this._log('warn', `Сервер перестал пускать новых ботов: ${h.streak} входа подряд повисли (принимает подключение и ` +
+        `молчит), в сети ${online}. Похоже на предел ботов с одного IP у MineBlaze — долбить его входами не буду: очередь ` +
+        `ждёт ${waitText(h.holdMs)} и пробует одного; пустит — пойдёт дальше. Боты в сети остаются в игре`);
+    }
+    clearTimeout(this._queueTimer);
+    this._queueTimer = null;
+    this._pump();
+  }
+
+  /** Бот вошёл (новый вход): повисшие — не подряд; если сервер «не пускал» — снова пускает. */
+  _onLoggedIn(b) {
+    const h = this._hung;
+    const was = h.holdMs > 0;
+    this._hung = { streak: 0, holdMs: 0, holdUntil: 0, probe: null };
+    if (was) {
+      this._log('ok', `Сервер снова пускает: ${b.nick} вошёл (в сети ${this._inGame().length}) — очередь входа идёт дальше`);
+      clearTimeout(this._queueTimer);
+      this._queueTimer = null;
+      this._pump();
+    }
   }
 
   /** Все из последнего «Старт» вошли или окончательно не вошли — итог одной строкой (кто не вошёл и почему). */
@@ -605,13 +660,17 @@ class Fleet extends EventEmitter {
     this._batch = null;
     const inGame = list.filter(IN_GAME);
     const out = list.filter((b) => !IN_GAME(b));
+    const stopped = batch.stopped ? `; остановлены вручную: ${batch.stopped}` : '';
     if (!out.length) {
-      this._log('ok', `Вход окончен: в сети все ${list.length} из ${list.length}`);
+      this._log('ok', batch.stopped
+        ? `Вход окончен: в сети ${inGame.length} из ${list.length + batch.stopped}${stopped}`
+        : `Вход окончен: в сети все ${list.length} из ${list.length}`);
       return;
     }
     const shown = out.slice(0, 8).map((b) => `${b.nick}${b.lastProblem ? ` (${b.lastProblem.replace(/^Не удалось подключиться: /, '').slice(0, 90)})` : ''}`);
     const more = out.length > shown.length ? `; и ещё ${out.length - shown.length}` : '';
-    this._log('warn', `Вход окончен: в сети ${inGame.length} из ${list.length}. Не вошли (${out.length}): ${shown.join('; ')}${more}`);
+    this._log('warn', `Вход окончен: в сети ${inGame.length} из ${list.length + batch.stopped}${stopped}. ` +
+      `Не вошли (${out.length}): ${shown.join('; ')}${more}`);
   }
 
   /** Сколько ещё очередь входа ждёт проверку «я не робот» (0 — не ждёт). */
@@ -639,8 +698,15 @@ class Fleet extends EventEmitter {
   _onState(id, state) {
     const b = this.bots.get(id);
     if (!b || !state || b.state === state) return;
+    const wasIn = IN_GAME(b);
     b.state = state;
     if (!IN_GAME(b)) b.ready = false;
+    if (IN_GAME(b) && !wasIn) this._onLoggedIn(b);
+    // Пробный вход кончился не «повис» (обрыв, остановили) — проба не удалась, ждём следующую.
+    if (this._hung.probe === id && (state === 'offline' || state === 'reconnecting' || state === 'queued')) {
+      this._hung.probe = null;
+      this._hung.holdUntil = Date.now() + this._hung.holdMs;
+    }
     if (state === 'offline' || state === 'reconnecting') this._onCaptchaDone(id); // проверку он уже не ждёт
     if (state === 'offline') b.ping = null;
     this.emit('state', { bot: id, nick: b.nick, state });

@@ -8,7 +8,7 @@ const assert = require('node:assert');
 const path = require('node:path');
 
 const { Fleet } = require(path.join(__dirname, '..', 'src', 'fleet.js'));
-const { inMemory, flush } = require('./fake-host');
+const { inMemory, flush, hangs } = require('./fake-host');
 
 const accounts = (n, prefix = 'Farm') => Array.from({ length: n }, (_, i) => ({ username: `${prefix}${String(i + 1).padStart(2, '0')}`, password: i % 2 ? `p${i}` : '' }));
 
@@ -238,6 +238,45 @@ test('флот: «IP заблокирован» — очередь входа ж
   events.length = 0;
   await fleet.start();
   assert.ok(await waitFor(() => events.some(([n, p]) => n === 'log' && p.text === 'Вход окончен: в сети все 3 из 3'), 3000));
+  await fleet.shutdown();
+});
+
+test('флот: входы виснут подряд — сервер перестал пускать: очередь ждёт, пробует по одному, пустил — дальше', async () => {
+  const { fleet, events } = makeFleet({ perProcess: 3, gapMs: 10, timings: { hungStreak: 2, hungHoldMs: 200, hungMaxHoldMs: 400 } });
+  const logs = () => events.filter(([n]) => n === 'log').map(([, p]) => p.text);
+  hangs.clear();
+  for (const n of ['Farm03', 'Farm04', 'Farm05', 'Farm06']) hangs.add(n);
+  fleet.setAccounts(accounts(6));
+  try {
+    await fleet.start();
+    assert.ok(await waitFor(() => logs().some((t) => /^Сервер перестал пускать новых ботов: 2 входа подряд повисли/.test(t)), 3000),
+      logs().join(' | '));
+    assert.ok(logs().some((t) => /в сети 2\. Похоже на предел ботов с одного IP/.test(t)));
+    // Пока ждёт — никого не пускает: повисших за 150 мс не прибавилось.
+    const admitsAt = () => events.filter(([n, p]) => n === 'state' && p.state === 'connecting').length;
+    const before = admitsAt();
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(admitsAt(), before, 'во время паузы новых входов нет');
+    // Проба тоже повисла — пауза вдвое дольше.
+    assert.ok(await waitFor(() => logs().some((t) => /^Пробный вход \(Farm\d\d\) тоже повис/.test(t)), 3000), logs().join(' | '));
+    // Сервер снова пускает — очередь идёт дальше, все входят.
+    hangs.clear();
+    assert.ok(await waitFor(() => logs().some((t) => /^Сервер снова пускает: Farm\d\d вошёл/.test(t)), 3000), logs().join(' | '));
+    assert.ok(await waitFor(() => fleet.summary().online === 6, 3000), JSON.stringify(fleet.summary()));
+    assert.ok(await waitFor(() => logs().includes('Вход окончен: в сети все 6 из 6')));
+  } finally {
+    hangs.clear();
+    await fleet.shutdown();
+  }
+});
+
+test('флот: итог входа — сколько остановлено вручную', async () => {
+  const { fleet, events } = makeFleet({ perProcess: 3, gapMs: 80 });
+  fleet.setAccounts(accounts(4));
+  await fleet.start();
+  await fleet.stop(['Farm03', 'Farm04']); // ещё ждали очереди
+  assert.ok(await waitFor(() => events.some(([n, p]) => n === 'log' && p.text === 'Вход окончен: в сети 2 из 4; остановлены вручную: 2')),
+    events.filter(([n]) => n === 'log').map(([, p]) => p.text).join(' | '));
   await fleet.shutdown();
 });
 

@@ -196,6 +196,7 @@ function ipBlockMinutes(text) {
  *   'captcha-done' { time }          проверку прошли (или бот её больше не ждёт: отключился)
  *   'ping'  мс | null   пинг бота, как его считает сервер (он же — в Tab у игроков); null — бот не в сети
  *   'ip-block' { time, until, minutes }  кик «IP адрес заблокирован»: до until входить бессмысленно (IP общий)
+ *   'login-hung' { time, stage, bytes }  вход повис (сервер принял подключение и не пускает дальше)
  */
 
 class BotManager extends EventEmitter {
@@ -911,6 +912,8 @@ class BotManager extends EventEmitter {
     const bytes = socketBytes(client);
     const detail = stage ? ` — ${stage}${bytes !== null ? `; получено байт: ${bytes}` : ''}` : '';
     this.log('error', `Не удалось подключиться: ${why}${detail}`);
+    // Флоту: несколько повисших подряд — сервер перестал пускать новых с этого IP (очередь подождёт).
+    this.emit('login-hung', { time: Date.now(), stage: s.stage || '', bytes });
     if (s.journal && stage) {
       s.journal.mark(`Вход повис: ${stage}; ${pipelineInfo(client)}`);
       this._saveJournal(s, `вход повис: ${stage}`);

@@ -11,6 +11,9 @@ const path = require('node:path');
 const { createBotHost } = require(path.join(__dirname, '..', 'src', 'bot-host.js'));
 
 /** Менеджер одного бота: как BotManager, но без сети. С очередью входа — ждёт admit() в 'queued'. */
+// Ники, которых «сервер» не пускает (вход виснет) — для проверки «сервер перестал пускать новых» (test/fleet.test.js).
+const hangs = new Set();
+
 class FakeManager extends EventEmitter {
   constructor(opts) {
     super();
@@ -45,6 +48,19 @@ class FakeManager extends EventEmitter {
     if (this.state !== 'queued') return false;
     this.calls.push('admit');
     this.admittedAt = Date.now();
+    // Сервер «не пускает» этот ник: вход виснет, как у настоящего — 'login-hung', потом повтор через очередь.
+    if (hangs.has(this.opts.config.username)) {
+      this._set('connecting');
+      setTimeout(() => {
+        if (this.state !== 'connecting') return;
+        this.emit('login-hung', { time: Date.now(), stage: 'login', bytes: 0 });
+        this._set('reconnecting');
+        setTimeout(() => {
+          if (this.state === 'reconnecting') this._queue();
+        }, 5);
+      }, 20);
+      return true;
+    }
     this._online();
     return true;
   }
@@ -191,4 +207,4 @@ function inMemory({ silent = false } = {}) {
 
 const flush = (ms = 20) => new Promise((r) => setTimeout(r, ms));
 
-module.exports = { FakeManager, FakeViewer, inMemory, flush };
+module.exports = { FakeManager, FakeViewer, inMemory, flush, hangs };
