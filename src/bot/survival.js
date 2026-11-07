@@ -31,6 +31,26 @@ const FOOD_GOOD = [
   'pumpkin_pie', 'bread', 'baked_potato', 'cooked_cod', 'cooked_rabbit', 'mushroom_stew', 'beetroot_soup', 'cookie', 'dried_kelp',
 ];
 const FOOD_LOW = ['apple', 'carrot', 'melon_slice', 'sweet_berries', 'glow_berries', 'beetroot', 'potato', 'beef', 'porkchop', 'mutton', 'rabbit', 'salmon', 'cod', 'chicken'];
+// Не еда для бота: травит, голодит или телепортирует. Вёдра с рыбой — тоже не еда. Золотые яблоки — на крайний случай.
+const FOOD_BAD = new Set(['rotten_flesh', 'spider_eye', 'poisonous_potato', 'pufferfish', 'suspicious_stew', 'chorus_fruit', 'chicken']);
+const FOOD_LAST = ['golden_apple', 'enchanted_golden_apple'];
+
+/** Годится ли предмет в еду (любая еда игры, кроме вредной и вёдер). */
+function isFood(name, registry = null) {
+  const n = String(name || '');
+  if (!n || FOOD_BAD.has(n) || n.endsWith('_bucket')) return false;
+  if (FOOD_GOOD.includes(n) || FOOD_LOW.includes(n) || FOOD_LAST.includes(n)) return true;
+  return Boolean(registry && registry.foodsByName && registry.foodsByName[n]);
+}
+
+/** Насколько хороша еда (меньше — лучше): хорошая, прочая еда, плоды и сырое (для заданий), золотые яблоки. */
+function foodRank(name) {
+  const good = FOOD_GOOD.indexOf(name);
+  if (good >= 0) return good;
+  if (FOOD_LAST.includes(name)) return 300;
+  if (FOOD_LOW.includes(name)) return 200 + FOOD_LOW.indexOf(name);
+  return 100;
+}
 const EAT_AT = 14; // сытость (из 20) — пора поесть
 const EAT_LOW = 6; // совсем голоден — годится и то, что для заданий
 
@@ -78,7 +98,11 @@ function pickFood(bot) {
     const name = list.find((n) => hasItem(bot, n));
     if (name) return name;
   }
-  return null;
+  // Прочая еда (пироги, супы, мёд…) — любая, кроме вредной; золотые яблоки — когда совсем голоден.
+  const other = inventoryItems(bot).map((it) => it.name)
+    .filter((n) => isFood(n, bot.registry) && !FOOD_LOW.includes(n) && (food <= EAT_LOW || !FOOD_LAST.includes(n)))
+    .sort((a, b) => foodRank(a) - foodRank(b));
+  return other[0] || null;
 }
 
 /** Пора поесть: сытость низкая (или мало здоровья, а восстановиться нечем) и есть что. */
@@ -368,6 +392,6 @@ function createGuard(bot) {
 }
 
 module.exports = {
-  HOSTILE, RANGED, FOOD_GOOD, FOOD_LOW, EAT_AT, cooldownFor, bestWeapon, pickFood, needsFood, fusing, threats, defend,
+  HOSTILE, RANGED, FOOD_GOOD, FOOD_LOW, FOOD_BAD, EAT_AT, isFood, foodRank, cooldownFor, bestWeapon, pickFood, needsFood, fusing, threats, defend,
   eatIfHungry, prepareShield, createGuard,
 };

@@ -121,3 +121,22 @@ test('враги: только видимые и рядом (стрелки — 
   for (const y of [64, 65, 66]) for (let z = -2; z <= 2; z += 1) world.set(new Vec3(3, y, z), 'stone');
   assert.deepEqual(threats(bot).map((e) => e.id), [1, 3]);
 });
+
+test('еда: любая еда игры (мёд, пирог), кроме вредной (гнилая плоть, паучий глаз); золотое яблоко — только когда совсем голоден', () => {
+  const { isFood } = require(path.join(__dirname, '..', 'src', 'bot', 'survival.js'));
+  const registry = require('prismarine-registry')(VERSION);
+  const bot = { registry, inventory: { slots: [] }, food: 12 };
+  bot.inventory.slots[36] = { name: 'rotten_flesh', count: 10 };
+  bot.inventory.slots[37] = { name: 'spider_eye', count: 3 };
+  assert.equal(pickFood(bot), null, 'вредное не ест');
+  bot.inventory.slots[38] = { name: 'golden_apple', count: 1 };
+  assert.equal(pickFood(bot), null, 'золотое яблоко — не на перекус');
+  bot.food = 4;
+  assert.equal(pickFood(bot), 'golden_apple', 'совсем голоден — годится');
+  bot.food = 12;
+  bot.inventory.slots[39] = { name: 'honey_bottle', count: 2 };
+  assert.equal(pickFood(bot), 'honey_bottle');
+  assert.equal(isFood('cod_bucket', registry), false);
+  assert.equal(isFood('pumpkin_pie', registry), true);
+  assert.equal(isFood('chorus_fruit', registry), false);
+});

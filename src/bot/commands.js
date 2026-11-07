@@ -15,7 +15,7 @@ const {
 const { isStorageWindow } = require('./window-clicks');
 const { moveStacks, countIn, itemsIn, storageSlots, playerSlots } = require('./chests');
 const { sanitizeXray, scanXray, findEntries, registryOf } = require('./xray');
-const { createGuard, prepareShield, cooldownFor, eatIfHungry } = require('./survival');
+const { createGuard, prepareShield, cooldownFor, eatIfHungry, isFood, foodRank } = require('./survival');
 
 const MAX_WALK = 256; // за раз дальше не ходим: путь ищется по загруженному миру, дальше — по ходу
 const MAX_STEPS = 32; // «#вперёд N»: не больше
@@ -1141,7 +1141,26 @@ async function buyForQuests(bot, npc) {
 
 const NPC_WARP = '/warp ah'; // где стоят NPC с заданиями (ТЗ)
 const TELEPORT_WAIT_MS = 8000;
-const MAX_STORAGE_CHESTS = 12;
+const MAX_STORAGE_CHESTS = 24;
+// Склад у дома: сундуки до стольких блоков от точки /home (к дальним бот подходит). Было 4 — бот открывал
+// один-два ближних сундука и говорил «кирки нет», хотя она лежала в соседнем (7 ноября).
+const STORAGE_RANGE = 12;
+
+/** Сундуки склада вокруг бота, от ближнего; половинки большого сундука — один раз. */
+function storageChests(bot) {
+  const out = [];
+  const seen = new Set();
+  const key = (p) => `${p.x},${p.y},${p.z}`;
+  for (const c of scanBlocks(bot, STORAGE_RANGE, (b) => isContainer(b.name))) {
+    if (c.dist > STORAGE_RANGE + 0.5 || seen.has(key(c.pos))) continue;
+    seen.add(key(c.pos));
+    const partner = chestPartner(c.block, c.pos);
+    if (partner) seen.add(key(partner));
+    out.push(c);
+    if (out.length >= MAX_STORAGE_CHESTS) break;
+  }
+  return out;
+}
 const HOME_NAME_RE = /^[\p{L}\p{N}_-]{1,32}$/u;
 const lastHomes = new Map(); // ник бота → { storage, rewards }: «#квесты принести» без слов — как в прошлый раз
 
@@ -1213,8 +1232,8 @@ function chestPartner(block, pos) {
  * ([{ test, want, got }], got растёт). Возвращает { taken: имя → сколько, full }.
  */
 async function takeFromStorage(bot, needs) {
-  const chests = scanBlocks(bot, OPEN_RANGE + 1, (b) => isContainer(b.name)).filter((c) => c.dist <= OPEN_RANGE + 0.5).slice(0, MAX_STORAGE_CHESTS);
-  if (!chests.length) throw new CommandError(`у дома нет сундуков (до ${OPEN_RANGE} блоков от места, куда переносит /home)`);
+  const chests = storageChests(bot);
+  if (!chests.length) throw new CommandError(`у дома нет сундуков (до ${STORAGE_RANGE} блоков от места, куда переносит /home)`);
   const taken = new Map();
   const seen = new Set();
   const key = (p) => `${p.x},${p.y},${p.z}`;
@@ -1243,6 +1262,177 @@ async function takeFromStorage(bot, needs) {
     }
   }
   return { taken, full };
+}
+
+// ---------- снаряжение со склада ----------
+
+const FOOD_WANT = 45; // еды с собой (штук)
+const ARMOR_TIERS = ['netherite', 'diamond', 'iron', 'chainmail', 'golden', 'leather'];
+const GEAR_TOOL_TIERS = ['netherite', 'diamond', 'iron', 'stone', 'golden', 'wooden'];
+// Что входит в снаряжение: броня на 4 места, меч, кирка, щит во вторую руку. rank — меньше = лучше, null — не то.
+const GEAR = [
+  { key: 'head', wear: 'head', slot: 5, label: 'шлем', rank: (n) => (n === 'turtle_helmet' ? 2.5 : armorRank(n, 'helmet')) },
+  { key: 'torso', wear: 'torso', slot: 6, label: 'нагрудник', rank: (n) => armorRank(n, 'chestplate') },
+  { key: 'legs', wear: 'legs', slot: 7, label: 'поножи', rank: (n) => armorRank(n, 'leggings') },
+  { key: 'feet', wear: 'feet', slot: 8, label: 'ботинки', rank: (n) => armorRank(n, 'boots') },
+  { key: 'sword', label: 'меч', rank: (n) => toolRank(n, 'sword') },
+  { key: 'pickaxe', label: 'кирка', rank: (n) => toolRank(n, 'pickaxe') },
+  { key: 'shield', wear: 'off-hand', slot: 45, label: 'щит', rank: (n) => (n === 'shield' ? 0 : null) },
+];
+
+function armorRank(name, piece) {
+  const m = String(name || '').match(/^([a-z]+)_([a-z]+)$/);
+  if (!m || m[2] !== piece) return null;
+  const i = ARMOR_TIERS.indexOf(m[1]);
+  return i < 0 ? null : i;
+}
+
+function toolRank(name, tool) {
+  const m = String(name || '').match(/^([a-z]+)_([a-z]+)$/);
+  if (!m || m[2] !== tool) return null;
+  const i = GEAR_TOOL_TIERS.indexOf(m[1]);
+  return i < 0 ? null : i;
+}
+
+/** Лучшее своё по каждому месту снаряжения: { key → { item, rank } } (надетое — тоже). */
+function ownGear(bot) {
+  const slots = bot.inventory && bot.inventory.slots ? bot.inventory.slots : [];
+  const out = {};
+  for (const g of GEAR) {
+    for (let i = 5; i <= 45; i += 1) {
+      const it = slots[i];
+      const r = it ? g.rank(it.name) : null;
+      if (r !== null && (!out[g.key] || r < out[g.key].rank)) out[g.key] = { item: it, rank: r, slot: i };
+    }
+  }
+  return out;
+}
+
+const foodCount = (bot) => inventoryItems(bot).filter((it) => isFood(it.name, bot.registry)).reduce((n, it) => n + (it.count || 1), 0);
+
+/** Нужно ли боту за снаряжением: нет брони совсем, мало еды или нет щита. */
+function gearMissing(bot) {
+  const own = ownGear(bot);
+  return !['head', 'torso', 'legs', 'feet'].some((k) => own[k]) || !own.shield || foodCount(bot) < 10;
+}
+
+/**
+ * Собрать снаряжение со склада вокруг бота: броня на 4 места, меч, кирка, щит, еда (FOOD_WANT штук). Сначала
+ * осмотреть все сундуки (до STORAGE_RANGE блоков), потом взять лучшее по каждому месту (незерит → алмаз → железо…),
+ * из какого сундука бы оно ни было; чего нет в одном — ищет в остальных. Броню надевает, щит — во вторую руку.
+ * → { lines, data: { took, wore, missing, food, chests } }
+ */
+async function gearUp(bot, { pickTier = 0 } = {}) {
+  const chests = storageChests(bot);
+  if (!chests.length) throw new CommandError(`рядом нет сундуков склада (до ${STORAGE_RANGE} блоков)`);
+  const own = ownGear(bot);
+  // 1. Осмотр: что где лежит.
+  const found = []; // { chest, name, count, rank?, key? }
+  let opened = 0;
+  for (const c of chests) {
+    let chest;
+    try {
+      chest = await openStorage(bot, c.pos);
+    } catch (err) {
+      if (isFatal(err)) throw err;
+      continue; // чужой или не открылся — следующий
+    }
+    opened += 1;
+    try {
+      const [start, end] = storageSlots(chest.window);
+      for (let i = start; i < end; i += 1) {
+        const it = chest.window.slots[i];
+        if (it) found.push({ chest: c, name: it.name, count: it.count || 1 });
+      }
+    } finally {
+      await closeAfter(bot);
+    }
+  }
+  if (!opened) throw new CommandError('ни один сундук склада не открылся');
+  // 2. Что брать: по каждому месту — лучшее из найденного, если оно лучше своего; еда — до FOOD_WANT.
+  const plan = new Map(); // сундук → [{ name, want, key }]
+  const add = (chest, entry) => {
+    if (!plan.has(chest)) plan.set(chest, []);
+    plan.get(chest).push(entry);
+  };
+  const missing = [];
+  for (const g of GEAR) {
+    let best = null;
+    for (const f of found) {
+      const r = g.rank(f.name);
+      if (r === null || (g.key === 'pickaxe' && PICK_TIERS[f.name] < pickTier)) continue;
+      if (!best || r < best.rank) best = { ...f, rank: r };
+    }
+    const mine = own[g.key];
+    if (best && (!mine || best.rank < mine.rank)) add(best.chest, { name: best.name, want: 1, key: g.key });
+    else if (!best && !mine) missing.push(g.label);
+  }
+  let foodNeed = Math.max(0, FOOD_WANT - foodCount(bot));
+  const foods = found.filter((f) => isFood(f.name, bot.registry)).sort((a, b) => foodRank(a.name) - foodRank(b.name) || a.count - b.count);
+  for (const f of foods) {
+    if (foodNeed <= 0) break;
+    add(f.chest, { name: f.name, want: Math.min(f.count, foodNeed), key: 'food' });
+    foodNeed -= Math.min(f.count, foodNeed);
+  }
+  // 3. Взять: только те сундуки, где лежит выбранное.
+  const took = new Map();
+  let full = false;
+  for (const [c, entries] of plan) {
+    if (full) break;
+    let chest;
+    try {
+      chest = await openStorage(bot, c.pos);
+    } catch (err) {
+      if (isFatal(err)) throw err;
+      continue;
+    }
+    try {
+      const w = chest.window;
+      for (const e of entries) {
+        const r = await moveStacks(bot, w, storageSlots(w), playerSlots(w), (it) => it.name === e.name, e.want);
+        for (const [name, n] of r.moved) took.set(name, (took.get(name) || 0) + n);
+        if (r.full) {
+          full = true;
+          break;
+        }
+      }
+    } finally {
+      await closeAfter(bot);
+    }
+  }
+  // 4. Надеть лучшее: броня, щит во вторую руку.
+  const wore = [];
+  const now = ownGear(bot);
+  for (const g of GEAR.filter((x) => x.wear)) {
+    const best = now[g.key];
+    if (!best || best.slot === g.slot) continue;
+    try {
+      await bot.actions.equipTo(best.item, g.wear);
+      wore.push(best.item.name);
+    } catch (err) {
+      if (isFatal(err)) throw err;
+    }
+  }
+  const food = foodCount(bot);
+  const lines = [];
+  lines.push(`Снаряжение: сундуков осмотрел ${opened}${took.size ? `, взял ${countsText(took)}` : ', брать нечего — у бота уже лучшее'}`);
+  if (wore.length) lines.push(`Надел: ${wore.join(', ')}`);
+  lines.push(`Еда: ${food} из ${FOOD_WANT}${food < FOOD_WANT ? ' — на складе больше нет' : ''}`);
+  if (missing.length) lines.push(`Не нашлось ни у бота, ни в сундуках: ${missing.join(', ')}`);
+  if (full) lines.push('Инвентарь полон — взял не всё');
+  return { lines, data: { took: countsData(took), wore, missing, food, chests: opened, full } };
+}
+
+async function cmdGear({ bot, args, words }) {
+  const { home } = homeArg(args, words, '#снаряжение дом база');
+  const base = home || String((bot.panelConfig && bot.panelConfig.questStorage) || '').trim();
+  const lines = [];
+  if (base) {
+    await teleportBy(bot, `/home ${base}`);
+    lines.push(`/home ${base}`);
+  }
+  const r = await gearUp(bot);
+  return { ok: !r.data.missing.length, code: r.data.missing.length ? 'incomplete' : undefined, message: [...lines, ...r.lines], data: { home: base || null, ...r.data } };
 }
 
 /**
@@ -2558,25 +2748,24 @@ async function cmdMine({ bot, args: allArgs, words = [] }) {
   const dim = () => (bot.game && bot.game.dimension ? String(bot.game.dimension) : '');
   if (ore.nether && dim() && !/nether/.test(dim())) throw new CommandError(`«${ore.name}» — только в Незере (${ore.where}); бот сейчас не там`);
   const lines = [];
-  // 1. Кирка: своя или с общего дома.
+  // 1. Снаряжение: нет кирки (или брони, щита, мало еды) — на общий дом, там лучшее из сундуков (#снаряжение).
   let pick = pickFor(bot, ore);
-  if (!pick) {
-    const base = home || String((bot.panelConfig && bot.panelConfig.questStorage) || '').trim();
-    if (!base) {
-      throw noPickaxe(`нет кирки для «${ore.name}» (нужна не хуже: ${TIER_NAMES[ore.tier]}) — дай боту кирку или укажи общий дом, где в сундуке лежат кирки: «Дом склада» в настройках автопилота или #добудь ${text} дом база`);
-    }
+  const base = home || String((bot.panelConfig && bot.panelConfig.questStorage) || '').trim();
+  if (!pick && !base) {
+    throw noPickaxe(`нет кирки для «${ore.name}» (нужна не хуже: ${TIER_NAMES[ore.tier]}) — дай боту кирку или укажи общий дом, где в сундуке лежат кирки: «Дом склада» в настройках автопилота или #добудь ${text} дом база`);
+  }
+  if (base && (!pick || gearMissing(bot))) {
     await teleportBy(bot, `/home ${base}`);
-    const test = (it) => PICK_TIERS[it.name] !== undefined && PICK_TIERS[it.name] >= ore.tier;
     let why = '';
     try {
-      await takeFromStorage(bot, [{ test, want: 1, got: 0 }]);
+      const g = await gearUp(bot, { pickTier: ore.tier });
+      lines.push(`Общий дом «${base}»: ${g.lines[0].replace(/^Снаряжение: /, '')}`, ...g.lines.slice(1));
     } catch (err) {
       if (isFatal(err)) throw err;
       why = `: ${err.message}`;
     }
     pick = pickFor(bot, ore);
     if (!pick) throw noPickaxe(`на общем доме «${base}» нет кирки не хуже: ${TIER_NAMES[ore.tier]}${why || ' (в сундуках рядом)'} — положи туда кирки`);
-    lines.push(`Кирка: ${pick} — взял на общем доме «${base}»`);
   }
   // 2. Где копать: случайное место (/rtp) — там можно ломать; или прямо здесь.
   if (!here) {
@@ -2910,12 +3099,22 @@ const COMMANDS = [
     aliases: ['добыть', 'шахта', 'mine'],
     usage: ['#добудь железо', '#добудь алмазы 5', '#добудь уголь 64 дом база', '#добудь лазурит здесь'],
     about: 'добыть руду (уголь, медь, железо, лазурит, золото, редстоун, алмазы, изумруды; в Незере — кварц, золото, древние обломки): ' +
-      'нет подходящей кирки — берёт её в сундуке на общем доме («дом X» или «Дом склада» из настроек), потом /rtp и копает там ' +
+      'нет подходящей кирки, брони, щита или еды — идёт на общий дом («дом X» или «Дом склада» из настроек) и берёт там лучшее ' +
+      '(как #снаряжение), потом /rtp и копает там ' +
       '(«здесь» — на месте); находит руду в чанках вокруг и прокапывается прямо к ней — вперёд, под себя, ступеньками, сначала жила; ' +
       'рядом нет — вглубь к лучшей высоте (железо Y≈16, алмазы и редстоун Y≈−58…), там ходами вбок (открылась руда у хода — сразу к ней); ' +
       'потом обратно на свою высоту (где нужно — «столбом»); за работой ест (хлеб, мясо из инвентаря) и отбивается от мобов мечом, ' +
       'от крипера — щитом во второй руке; у воды, лавы, под гравием не копает; где копать нельзя — скажет сразу; не нашёл — скажет, где искать',
     run: cmdMine,
+  },
+  {
+    name: 'снаряжение',
+    aliases: ['снарядись', 'экипировка', 'экипируйся', 'gear'],
+    usage: ['#снаряжение', '#снаряжение дом база'],
+    about: `собрать снаряжение со склада: /home (дом X или «Дом склада» из настроек; без них — сундуки рядом), осмотреть все сундуки ` +
+      `до ${STORAGE_RANGE} блоков и взять лучшее, где бы оно ни лежало: броня на 4 места, меч, кирка (незерит → алмаз → железо…), ` +
+      `щит во вторую руку, еда — до ${FOOD_WANT} штук (любая, кроме вредной); броню надевает сам; чего нет нигде — скажет`,
+    run: cmdGear,
   },
   {
     name: 'рентген',

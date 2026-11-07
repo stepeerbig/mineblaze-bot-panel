@@ -46,13 +46,14 @@ const BOT_NAME = 'StandBot';
 const HELPER_NAME = 'Helper'; // второй игрок в сценарии — для команд по нику
 
 const ARGS = process.argv.slice(2);
-const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--no-clicks', '--scenario', '--clicks', '--fight', '--mine', '--survive', '--electron']);
+const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--no-clicks', '--scenario', '--clicks', '--fight', '--mine', '--survive', '--gear', '--electron']);
 const SCENARIO = ARGS.includes('--scenario');
 const CLICKS = ARGS.includes('--clicks');
 const FIGHT = ARGS.includes('--fight');
 const MINE = ARGS.includes('--mine');
 const SURVIVE = ARGS.includes('--survive');
-const ANY_CHECK = SCENARIO || CLICKS || FIGHT || MINE || SURVIVE;
+const GEAR = ARGS.includes('--gear');
+const ANY_CHECK = SCENARIO || CLICKS || FIGHT || MINE || SURVIVE || GEAR;
 const ELECTRON_ARG = ARGS.find((a) => a === '--electron' || a.startsWith('--electron='));
 const ELECTRON = Boolean(ELECTRON_ARG);
 const ELECTRON_EXE = ELECTRON_ARG && ELECTRON_ARG.includes('=') ? ELECTRON_ARG.slice(ELECTRON_ARG.indexOf('=') + 1).replace(/^"|"$/g, '') : '';
@@ -460,6 +461,56 @@ async function runSurviveCheck(manager, cmd) {
   return problems.length ? problems.join(', ') : 0;
 }
 
+/**
+ * Проверка снаряжения (--gear): в трёх сундуках (один — дальше 4 блоков) незеритовая броня с зачарованиями,
+ * алмазная и железная похуже, кирки, мечи, щит, еда и вредная еда. #снаряжение должен надеть лучшее, щит — во вторую
+ * руку, взять незеритовые кирку и меч и еды не меньше 45; сервер (Paper) должен принять клики, Grim — промолчать.
+ */
+async function runGearCheck(manager, cmd) {
+  if (!cmd) throw new Error('для этой проверки сервер должна запускать сама проверка: закрой окно тестового сервера и запусти снова');
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  await wait(2000);
+  const bot = manager.getBot();
+  if (!bot || !bot.actions) throw new Error('у бота нет безопасных действий (они работают только со своей физикой)');
+  const o = bot.entity.position.floored();
+  const at = (dx, dy, dz) => `${o.x + dx} ${o.y + dy} ${o.z + dz}`;
+  const item = (slot, id, count = 1, extra = '') => `{Slot:${slot}b,id:"minecraft:${id}",count:${count}${extra}}`;
+  const ench = (list) => `,components:{"minecraft:enchantments":{${list}}}`;
+  for (const c of [
+    'kill @e[type=item]',
+    `fill ${at(-9, 0, -9)} ${at(9, 3, 9)} minecraft:air`,
+    `fill ${at(-9, -1, -9)} ${at(9, -1, 9)} minecraft:stone`,
+    `clear ${BOT_NAME}`,
+    `setblock ${at(2, 0, -2)} minecraft:chest{Items:[${[item(0, 'iron_helmet'), item(1, 'bread', 20), item(2, 'stone_pickaxe'), item(3, 'iron_boots')].join(',')}]}`,
+    `setblock ${at(-2, 0, 3)} minecraft:chest{Items:[${[item(0, 'diamond_helmet'), item(1, 'diamond_leggings'), item(2, 'rotten_flesh', 10)].join(',')}]}`,
+    `setblock ${at(7, 0, 4)} minecraft:chest{Items:[${[
+      item(0, 'netherite_chestplate', 1, ench('"minecraft:protection":4,"minecraft:unbreaking":3')),
+      item(1, 'netherite_pickaxe', 1, ench('"minecraft:efficiency":5')),
+      item(2, 'netherite_sword', 1, ench('"minecraft:sharpness":5')),
+      item(3, 'netherite_boots'),
+      item(4, 'shield'),
+      item(5, 'cooked_beef', 40),
+    ].join(',')}]}`,
+  ]) cmd(c);
+  await wait(2500);
+  const started = Date.now();
+  const r = await runCommand(bot, '#снаряжение');
+  const text = [].concat(r.message).join(' | ');
+  console.log(`  [снаряжение] #снаряжение → ${r.ok ? 'да' : 'НЕТ'} (${((Date.now() - started) / 1000).toFixed(1)} с): ${text}`);
+  const slots = bot.inventory.slots;
+  const nameAt = (i) => (slots[i] ? slots[i].name : '—');
+  console.log(`  [снаряжение] надето: ${[5, 6, 7, 8].map(nameAt).join(', ')}; вторая рука: ${nameAt(45)}`);
+  const problems = [];
+  const want = { 5: 'diamond_helmet', 6: 'netherite_chestplate', 7: 'diamond_leggings', 8: 'netherite_boots', 45: 'shield' };
+  for (const [i, name] of Object.entries(want)) if (nameAt(Number(i)) !== name) problems.push(`в ячейке ${i} ${nameAt(Number(i))}, а не ${name}`);
+  const inv = slots.slice(9, 45).filter(Boolean);
+  for (const name of ['netherite_pickaxe', 'netherite_sword']) if (!inv.some((it) => it.name === name)) problems.push(`нет ${name}`);
+  if (inv.some((it) => it.name === 'rotten_flesh')) problems.push('взял гнилую плоть');
+  const food = inv.filter((it) => ['cooked_beef', 'bread'].includes(it.name)).reduce((n, it) => n + it.count, 0);
+  if (food < 45) problems.push(`еды ${food} (< 45)`);
+  return problems.length ? problems.join(', ') : 0;
+}
+
 // Предметы для проверки кликов: как в меню NPC на MineBlaze (название с цветом, описание из нескольких строк)
 // и другие частые компоненты. [что проверяем, предмет для команды /item].
 const CLICK_ITEMS = [
@@ -720,6 +771,7 @@ function runBot(host, port, version, cmd) {
           const check = SCENARIO ? { what: 'сценарий', start: 'готовлю площадку и действую…', done: 'Сценарий закончен', run: runScenario, why: (f) => `не выполнено команд — ${f}` }
             : CLICKS ? { what: 'клики', start: 'проверяю клики в меню…', done: 'Клики проверены', run: runClickCheck, why: (f) => `неудачных проверок — ${f}` }
               : MINE ? { what: 'добыча', start: 'прячу руду в камне…', done: 'Добыча окончена', run: runMineCheck, why: () => 'добыл не всё, тронул руду у воды или не вернулся на свою высоту' }
+                : GEAR ? { what: 'снаряжение', start: 'раскладываю по сундукам незерит, броню, щит, еду…', done: 'Снаряжение собрано', run: runGearCheck, why: (f) => `не вышло: ${f}` }
                 : SURVIVE ? { what: 'выживание', start: 'прячу алмазы, зову мобов…', done: 'Добыча с мобами окончена', run: runSurviveCheck, why: (f) => `не вышло: ${f}` }
                   : { what: 'бой', start: 'готовлю загон и пауков…', done: 'Бой окончен', run: runFightCheck, why: () => 'убил не всех пауков' };
           console.log(`Бот в мире: ${check.start}`);

@@ -1485,14 +1485,29 @@ function inject(bot, { random, now }) {
 
   /** Положить предмет во вторую руку (щит): переносом в инвентаре, стоя на месте, с паузами, как человек. */
   function equipOffhand(name) {
-    return run('во вторую руку', async (signal) => {
+    return equipTo(name, 'off-hand');
+  }
+
+  // Ячейки инвентаря игрока, куда надевается: броня 5–8, вторая рука 45 (как у mineflayer: head, torso, legs, feet).
+  const WEAR_SLOTS = { head: 5, torso: 6, legs: 7, feet: 8, 'off-hand': 45 };
+  const WEAR_NAMES = { head: 'на голову', torso: 'на тело', legs: 'на ноги', feet: 'на ноги (ботинки)', 'off-hand': 'во вторую руку' };
+
+  /**
+   * Надеть предмет (броню — head / torso / legs / feet) или положить во вторую руку ('off-hand'): переносом в инвентаре,
+   * стоя на месте, с паузами, как человек. Уже там — ничего. item — имя или сам предмет (из нескольких одинаковых).
+   */
+  function equipTo(item, dest) {
+    return run(WEAR_NAMES[dest] || 'надеть', async (signal) => {
+      const at = WEAR_SLOTS[dest];
+      if (at === undefined) throw new ActionError(`некуда надеть: ${dest}`);
       const slots = bot.inventory ? bot.inventory.slots : [];
-      if (slots[45] && slots[45].name === name) return { already: true };
-      const item = slots.find((it, i) => it && it.name === name && i !== 45);
-      if (!item) throw new ActionError(`нет предмета ${name}`);
+      const name = typeof item === 'string' ? item : item && item.name;
+      if (slots[at] && (slots[at] === item || (typeof item === 'string' && slots[at].name === name))) return { already: true };
+      const it = typeof item === 'string' ? slots.find((x, i) => x && x.name === name && i !== at) : slots.includes(item) ? item : null;
+      if (!it) throw new ActionError(`нет предмета ${name}`);
       await standStill(signal);
       await waitTicks(3 + Math.floor(random() * 4), signal);
-      await bot.equip(item, 'off-hand');
+      await bot.equip(it, dest);
       await waitTicks(2 + Math.floor(random() * 3), signal);
       return { already: false };
     });
@@ -1712,6 +1727,7 @@ function inject(bot, { random, now }) {
     canHit,
     eat,
     equipOffhand,
+    equipTo,
     shield,
     interrupt: interruptActions,
     interact,

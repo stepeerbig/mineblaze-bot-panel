@@ -1442,6 +1442,42 @@ test('команды: #добудь при анти-X-ray — ненастоящ
   assert.match(text, /Похоже, на сервере анти-X-ray: 2 раз дошёл до руды — а там камень/);
 });
 
+test('команды: #снаряжение — все сундуки склада (и дальше 4 блоков), лучшее по каждому месту, незерит, щит, еда 45, броню надевает', async () => {
+  const s = setup({
+    inventory: [['iron_sword', 1]],
+    storage: {
+      '2,64,-2': { items: [[0, 'iron_helmet', 1], [1, 'bread', 20], [2, 'stone_pickaxe', 1], [3, 'leather_boots', 1]] },
+      // Дальний сундук (7 блоков): лучшее — здесь.
+      '7,64,3': { items: [[0, 'netherite_chestplate', 1], [1, 'diamond_helmet', 1], [2, 'netherite_pickaxe', 1], [3, 'shield', 1], [4, 'cooked_beef', 40], [5, 'rotten_flesh', 10], [6, 'netherite_sword', 1]] },
+    },
+  });
+  s.world.set(new Vec3(2, 64, -2), 'chest');
+  s.world.set(new Vec3(7, 64, 3), 'chest');
+  const WEAR = { head: 5, torso: 6, legs: 7, feet: 8, 'off-hand': 45 };
+  s.bot.equip = async (item, dest) => { // как mineflayer: надеть / во вторую руку
+    const slots = s.bot.inventory.slots;
+    const from = slots.indexOf(item);
+    const old = slots[WEAR[dest]] || null;
+    slots[WEAR[dest]] = item;
+    slots[from] = old;
+  };
+  const r = await s.run('#снаряжение', 900000);
+  const text = [].concat(r.message).join('\n');
+  const slots = s.bot.inventory.slots;
+  assert.equal(slots[5] && slots[5].name, 'diamond_helmet', `${text}`);
+  assert.equal(slots[6] && slots[6].name, 'netherite_chestplate');
+  assert.equal(slots[8] && slots[8].name, 'leather_boots', 'лучше нет — и кожаные годятся');
+  assert.equal(slots[45] && slots[45].name, 'shield', 'щит во второй руке');
+  const has = (name) => slots.slice(9, 45).some((it) => it && it.name === name);
+  assert.ok(has('netherite_pickaxe') && has('netherite_sword'), 'незеритовые кирка и меч');
+  assert.ok(!has('stone_pickaxe') && !has('iron_helmet'), 'хуже — не брал');
+  assert.ok(!has('rotten_flesh'), 'вредную еду не брал');
+  assert.ok(r.data.food >= 45, `еды ${r.data.food}`);
+  assert.equal(r.data.chests, 2);
+  assert.match(text, /Не нашлось ни у бота, ни в сундуках: поножи/);
+  assert.equal(r.ok, false, 'поножей нет — комплект неполный');
+});
+
 test('команды: #добудь без кирки — /home на общий дом, кирка из сундука, потом /rtp и добыча там', async () => {
   const s = setup({ inventory: [['cobblestone', 16]], storage: { '2,64,-2': { items: [[0, 'stone_pickaxe', 1], [1, 'iron_pickaxe', 1]] } } });
   s.world.set(new Vec3(2, 64, -2), 'chest');
@@ -1461,7 +1497,7 @@ test('команды: #добудь без кирки — /home на общий 
   const text = [].concat(r.message).join('\n');
   assert.equal(r.ok, true, text);
   assert.deepEqual(sent, ['/home база', '/rtp']);
-  assert.match(text, /^Кирка: (?:iron|stone)_pickaxe — взял на общем доме «база»$/m);
+  assert.match(text, /^Общий дом «база»: сундуков осмотрел 1, взял iron_pickaxe×1$/m, 'из двух кирок — лучшая');
   assert.match(text, /^\/rtp: копаю у 100 64 0$/m);
   assert.equal(r.data.mined, 1);
   assert.notEqual(s.world.get(new Vec3(104, 58, 3)), 'iron_ore');
