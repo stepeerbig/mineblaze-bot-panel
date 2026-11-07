@@ -177,7 +177,49 @@ function inject(bot, { random, now }) {
         bot.emit('error', err);
       }
     }
+    stepSeen(); // конец тика клиента: сущности сдвигаются к позициям с сервера — уже после ударов этого тика
   });
+
+  // Чужие сущности — там, где их видит игра. Клиент переносит сущность к новой позиции с сервера не сразу, а за
+  // 3 тика (InterpolationHandler: каждый тик — 1/3, потом 1/2, потом остаток пути). Прицел и дальность удара у игрока —
+  // по этой позиции, Grim проверяет удар по ней же. По самой свежей позиции с сервера подходящий зомби на 0,1–0,4
+  // блока ближе: удар «с 2,9» у Grim был 3,05 (стенд, Reach).
+  const seen = new Map(); // номер сущности → { pos: где видна, target: последняя с сервера, steps }
+  const LERP_STEPS = 3;
+  const SNAP_DISTANCE = 64; // дальше — игра переносит сразу
+  const trackEntity = (e) => {
+    if (e && e.position && e !== bot.entity) seen.set(e.id, { pos: e.position.clone(), target: e.position.clone(), steps: 0 });
+  };
+  bot.on('entitySpawn', trackEntity);
+  bot.on('entityMoved', (e) => {
+    if (!e || !e.position || e === bot.entity) return;
+    const s = seen.get(e.id);
+    if (!s) return trackEntity(e); // появилась до нас — откуда идёт, неизвестно
+    if (s.target.equals(e.position)) return; // только повернулась
+    s.target = e.position.clone();
+    if (s.pos.distanceTo(s.target) > SNAP_DISTANCE) {
+      s.pos = s.target.clone();
+      s.steps = 0;
+    } else {
+      s.steps = LERP_STEPS;
+    }
+  });
+  bot.on('entityGone', (e) => {
+    if (e) seen.delete(e.id);
+  });
+  function stepSeen() {
+    for (const s of seen.values()) {
+      if (s.steps <= 0) continue;
+      const k = 1 / s.steps;
+      s.pos = new Vec3(s.pos.x + (s.target.x - s.pos.x) * k, s.pos.y + (s.target.y - s.pos.y) * k, s.pos.z + (s.target.z - s.pos.z) * k);
+      s.steps -= 1;
+    }
+  }
+  /** Где сущность сейчас у клиента игры: для прицела, дальности и луча (её позицию меняли без события — та, что есть). */
+  const seenPosition = (entity) => {
+    const s = entity && entity.position ? seen.get(entity.id) : null;
+    return s && s.target.equals(entity.position) ? s.pos : entity.position;
+  };
 
   // Новый мир или сервер — у клиента новый счётчик sequence; всё, что бот делал, прерывается.
   const interrupt = (why) => () => {
@@ -1256,12 +1298,13 @@ function inject(bot, { random, now }) {
     });
   }
 
+  // Коробка и точка прицела — там, где сущность видна в игре (seenPosition), а не по самой свежей позиции с сервера.
   const entityBox = (entity) => {
     const w = (entity.width || 0.6) / 2;
-    const p = entity.position;
+    const p = seenPosition(entity);
     return [p.x - w, p.y, p.z - w, p.x + w, p.y + (entity.height || 1.8), p.z + w];
   };
-  const aimPoint = (entity) => entity.position.offset(0, (entity.height || 1.8) * 0.7, 0);
+  const aimPoint = (entity) => seenPosition(entity).offset(0, (entity.height || 1.8) * 0.7, 0);
 
   /** Блок на пути взгляда до сущности (на расстоянии t по лучу dir) — стена между ботом и целью. */
   function wallBefore(eye, dir, t) {
@@ -1463,7 +1506,9 @@ function inject(bot, { random, now }) {
     return run('щит', async (signal) => {
       const off = bot.inventory && bot.inventory.slots ? bot.inventory.slots[45] : null;
       if (!off || off.name !== 'shield') throw new ActionError('во второй руке нет щита');
-      await standStill(signal);
+      // Не ждать полной остановки (крипер шипит 1,5 с): кнопки отпущены — бот докатывается по инерции, а она с
+      // поднятым щитом та же (замедление щита — только для нажатых кнопок), так что античиту нечего заметить.
+      releaseControls();
       const facing = () => (target && target.position ? anglesTo(eyePosition(), target.position.offset(0, (target.height || 1.7) * 0.6, 0)) : null);
       const a = facing();
       if (a) await settleLook(a.yaw, a.pitch, signal);
@@ -1508,17 +1553,13 @@ function inject(bot, { random, now }) {
   function interact(entity) {
     return run('нажать на сущность', async (signal) => {
       if (!entity || !entity.position) throw new ActionError('не на что нажимать');
-      const boxOf = () => {
-        const w = (entity.width || 0.6) / 2;
-        const p = entity.position;
-        return [p.x - w, p.y, p.z - w, p.x + w, p.y + (entity.height || 1.8), p.z + w];
-      };
+      const boxOf = () => entityBox(entity);
       await standStill(signal);
       for (let i = 0; i < LOOK_TIMEOUT_TICKS; i += 1) {
         if (bot.entities && !bot.entities[entity.id]) throw new ActionError('сущность пропала');
         const eye = eyePosition();
         if (eye.distanceTo(closestPointOnBox(boxOf(), eye)) > ENTITY_REACH) throw new ActionError('слишком далеко — подойди ближе');
-        const a = anglesTo(eye, entity.position.offset(0, (entity.height || 1.8) * 0.6, 0));
+        const a = anglesTo(eye, seenPosition(entity).offset(0, (entity.height || 1.8) * 0.6, 0));
         bot.look(a.yaw, a.pitch, true);
         if (bot.serverView.lookSettled && ticks() - lastUseTick >= USE_DELAY_TICKS) {
           const done = await inTick(() => {
@@ -1526,7 +1567,7 @@ function inject(bot, { random, now }) {
             const dir = currentLook();
             const t = rayBox(from, dir, boxOf());
             if (t === null || t > ENTITY_REACH) return false;
-            const hit = from.plus(dir.scaled(t)).minus(entity.position);
+            const hit = from.plus(dir.scaled(t)).minus(seenPosition(entity)); // точка — от сущности, какой её видит игра
             const sneaking = Boolean(bot.getControlState('sneak'));
             bot._client.write('use_entity', { target: entity.id, mouse: 2, x: hit.x, y: hit.y, z: hit.z, hand: 0, sneaking });
             bot._client.write('use_entity', { target: entity.id, mouse: 0, hand: 0, sneaking });
@@ -1680,6 +1721,8 @@ function inject(bot, { random, now }) {
     wait,
     chat,
     stop,
+    /** Часы действий (мс): настоящие, в тестах — подменённые; по ним же считают паузы те, кто зовёт действия. */
+    now,
     lookedAtBlock: () => (bot.serverView ? lookedAtBlock() : null),
     get busy() {
       return entries.size > 0;

@@ -454,6 +454,9 @@ async function runSurviveCheck(manager, cmd) {
   if (!/Отбился от мобов/.test(text)) problems.push('не отбился от мобов');
   if (!/Поел/.test(text)) problems.push('не поел');
   if (!(bot.health > 0)) problems.push('погиб');
+  // Щит бот кладёт во вторую руку сам в начале добычи (зомби рядом — не помеха): без него от крипера только отходит.
+  const off = bot.inventory && bot.inventory.slots ? bot.inventory.slots[45] : null;
+  if (!off || off.name !== 'shield') problems.push('щит так и не во второй руке');
   return problems.length ? problems.join(', ') : 0;
 }
 

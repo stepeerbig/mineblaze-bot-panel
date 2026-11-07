@@ -49,6 +49,12 @@ function cooldownFor(item) {
   return 10;
 }
 
+/**
+ * Время (мс) — по часам действий бота: паузы («ждать 2 с, потом подойти») должны идти вместе с тиками бота.
+ * В тестах часы подменены: по настоящим (Date.now) на быстром компьютере 2 с — это тысячи «тиков» теста.
+ */
+const nowOf = (bot) => (bot.actions && typeof bot.actions.now === 'function' ? bot.actions.now() : Date.now());
+
 const inventoryItems = (bot) => (bot.inventory && bot.inventory.slots ? bot.inventory.slots.filter(Boolean) : []);
 const hasItem = (bot, name) => inventoryItems(bot).some((it) => it.name === name);
 const hasCustomName = (e) => {
@@ -114,7 +120,7 @@ function threats(bot, ignore = new Map()) {
   if (!bot.entity || !bot.entity.position) return [];
   const me = bot.entity.position;
   const eye = me.offset(0, 1.62, 0);
-  const now = Date.now();
+  const now = nowOf(bot);
   const out = [];
   for (const e of Object.values(bot.entities || {})) {
     if (!e || e === bot.entity || !e.position || !HOSTILE.has(e.name) || hasCustomName(e)) continue;
@@ -152,7 +158,7 @@ async function stepBack(bot, creeper) {
  * кого достать с места — бить; стрелка или далёкого — подойти. Врагов нет 1,5 с — всё. → { kills, blocked }
  */
 async function defend(bot, { ignore = new Map(), maxMs = 60000 } = {}) {
-  const started = Date.now();
+  const started = nowOf(bot);
   const weapon = bestWeapon(bot);
   if (weapon && (!bot.heldItem || bot.heldItem.name !== weapon)) await bot.actions.equip(weapon);
   const hitAt = new Map();
@@ -161,7 +167,7 @@ async function defend(bot, { ignore = new Map(), maxMs = 60000 } = {}) {
   const killed = [];
   // Отбился — умер тот, кого бот бил недавно (добил ли он сам или, скажем, взрыв крипера рядом).
   const onDead = (e) => {
-    if (!e || !hitAt.has(e.id) || Date.now() - hitAt.get(e.id) > KILL_WINDOW_MS) return;
+    if (!e || !hitAt.has(e.id) || nowOf(bot) - hitAt.get(e.id) > KILL_WINDOW_MS) return;
     hitAt.delete(e.id);
     kills += 1;
     killed.push(e.name);
@@ -191,7 +197,7 @@ async function defend(bot, { ignore = new Map(), maxMs = 60000 } = {}) {
     }
   };
   try {
-    while (Date.now() - started < maxMs) {
+    while (nowOf(bot) - started < maxMs) {
       // Опаснее всего — крипер, который подошёл или шипит: он первым, даже если ближе зомби. Крипер подальше —
       // не цель (к нему не идём: взорвётся рядом), пока бьём остальных.
       const list = threats(bot, ignore);
@@ -222,7 +228,7 @@ async function defend(bot, { ignore = new Map(), maxMs = 60000 } = {}) {
           continue;
         }
         if (bot.actions.canHit(t)) {
-          hitAt.set(t.id, Date.now());
+          hitAt.set(t.id, nowOf(bot));
           try {
             await bot.actions.attack(t, { cooldownTicks: cooldownFor(bot.heldItem) });
           } catch (err) {
@@ -234,11 +240,11 @@ async function defend(bot, { ignore = new Map(), maxMs = 60000 } = {}) {
         continue;
       }
       if (bot.actions.canHit(t)) {
-        hitAt.set(t.id, Date.now());
+        hitAt.set(t.id, nowOf(bot));
         waitingFor.delete(t.id); // подошёл — ждать его снова, если отлетит от удара
         try {
           await interruptibly(() => bot.actions.attack(t, { cooldownTicks: cooldownFor(bot.heldItem) }));
-          hitAt.set(t.id, Date.now());
+          hitAt.set(t.id, nowOf(bot));
         } catch (err) {
           if (isStop(err)) throw err;
         }
@@ -247,16 +253,17 @@ async function defend(bot, { ignore = new Map(), maxMs = 60000 } = {}) {
       // Не достать с места. Зомби, паук и прочие идут к боту сами — ждать, повернувшись к нему (навстречу не идём:
       // так он бьёт первым); не идёт 2 с — подойти. Стрелок сам не подойдёт — к нему сразу. Подходить — короткими
       // рывками (потом снова оглядеться: вдруг крипер); не выходит подойти — не отвлекаться на него какое-то время.
-      const since = waitingFor.get(t.id) || Date.now();
+      const now = nowOf(bot);
+      const since = waitingFor.has(t.id) ? waitingFor.get(t.id) : now;
       waitingFor.set(t.id, since);
-      if (RANGED.has(t.name) || Date.now() - since > APPROACH_AFTER_MS) {
+      if (RANGED.has(t.name) || now - since > APPROACH_AFTER_MS) {
         try {
           if (d <= 8) await interruptibly(() => bot.actions.walkTo(t.position.clone(), { range: 1.8, timeoutMs: 800 }));
           else await interruptibly(() => bot.actions.goTo(t.position.clone(), { range: 2, vertical: 2, maxDistance: 16 }));
         } catch (err) {
           if (isStop(err)) throw err;
           if (err && err.code !== 'threat' && err.code !== 'timeout') {
-            ignore.set(t.id, Date.now() + IGNORE_MS);
+            ignore.set(t.id, nowOf(bot) + IGNORE_MS);
             waitingFor.delete(t.id);
           }
         }
@@ -311,7 +318,7 @@ function createGuard(bot) {
   const stats = { kills: 0, killed: [], ate: 0, fights: 0, blocked: 0, hungry: false };
   const wants = () => {
     if (threats(bot, ignore).length) return 'threat';
-    if (needsFood(bot) && Date.now() - eatFailedAt > 30000) return 'food';
+    if (needsFood(bot) && nowOf(bot) - eatFailedAt > 30000) return 'food';
     if (typeof bot.food === 'number' && bot.food <= EAT_LOW && !pickFood(bot)) stats.hungry = true;
     return null;
   };
@@ -350,7 +357,7 @@ function createGuard(bot) {
           } else if (await eatIfHungry(bot)) {
             stats.ate += 1;
           } else {
-            eatFailedAt = Date.now();
+            eatFailedAt = nowOf(bot);
           }
         }
       } finally {

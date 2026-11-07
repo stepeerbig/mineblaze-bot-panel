@@ -149,6 +149,34 @@ test('удар: моб ходит (голова его ведёт и не «вс
   assert.equal(hits.length, 1, 'ударил');
 });
 
+test('удар: моб подходит — дальность по тому, где он виден в игре (3 тика догоняет позицию с сервера), а не по свежей', async () => {
+  const { clock, bot } = setup();
+  // Глаза бота — на z 0,5; до зомби (полширины 0,3) — z − 0,8. В 3,8 блока не достать; сервер шлёт: подошёл на
+  // 1,2 — свежая позиция уже в 2,6 блока, а в игре он ещё там и доходит за 3 тика (3,4 → 3,0 → 2,6).
+  const zombie = { id: 802, type: 'hostile', name: 'zombie', position: new Vec3(0.5, 64, 4.6), width: 0.6, height: 1.95 };
+  bot.entities[802] = zombie;
+  bot.emit('entitySpawn', zombie);
+  assert.equal(bot.actions.canHit(zombie), false, 'далеко');
+  zombie.position = new Vec3(0.5, 64, 3.4);
+  bot.emit('entityMoved', zombie);
+  let ticks = 0;
+  while (!bot.actions.canHit(zombie) && ticks < 10) {
+    clock.advance(50);
+    ticks += 1;
+  }
+  assert.equal(ticks, 3, 'достаёт, когда и в игре дошёл: через 3 тика, не сразу');
+  take(bot);
+  const res = await runFor(clock, bot.actions.attack(zombie));
+  assert.ifError(res.error);
+  assert.equal(take(bot).filter((p) => p.name === 'use_entity' && p.params.mouse === 1).length, 1, 'ударил');
+
+  // Только поворот (entityMoved без смены места) — не сбивает; позицию поменяли без события — берётся она.
+  bot.emit('entityMoved', zombie);
+  assert.equal(bot.actions.canHit(zombie), true);
+  zombie.position = new Vec3(0.5, 64, 6);
+  assert.equal(bot.actions.canHit(zombie), false);
+});
+
 test('еда: в руку, правая кнопка (use_item с тем взглядом, что в пакетах) и держать, пока сервер не засчитает', async () => {
   const { clock, bot } = setup();
   bot.inventory.slots[37] = { name: 'bread', count: 3 };

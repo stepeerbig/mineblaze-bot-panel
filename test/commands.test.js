@@ -1201,6 +1201,37 @@ test('команды: #добудь — подошёл зомби: бросае�
   assert.equal(s.bot.heldItem && s.bot.heldItem.name, 'iron_pickaxe', 'после боя и еды снова кирка');
 });
 
+test('команды: #добудь — зомби рядом с самого начала: щит всё равно сначала во вторую руку, потом бой и добыча', async () => {
+  const s = setup({ inventory: [['iron_pickaxe', 1], ['iron_sword', 1], ['shield', 1], ['cobblestone', 32]] });
+  s.world.set(new Vec3(6, 58, 0), 'iron_ore');
+  // Как mineflayer: перенести предмет во вторую руку (ячейка 45).
+  const moved = [];
+  s.bot.equip = async (item, dest) => {
+    const from = s.bot.inventory.slots.indexOf(item);
+    assert.equal(dest, 'off-hand');
+    s.bot.inventory.slots[45] = item;
+    s.bot.inventory.slots[from] = null;
+    moved.push(item.name);
+  };
+  const zombie = { id: 621, type: 'hostile', name: 'zombie', position: new Vec3(0.5, 64, 2.5), width: 0.6, height: 1.95, hp: 2 };
+  s.bot.entities[zombie.id] = zombie;
+  const write = s.bot._client.write;
+  s.bot._client.write = (name, params) => {
+    write(name, params);
+    if (name === 'use_entity' && params.mouse === 1 && params.target === zombie.id && (zombie.hp -= 1) <= 0) {
+      delete s.bot.entities[zombie.id];
+      s.bot.emit('entityDead', zombie);
+    }
+  };
+  const r = await s.run('#добудь железо 1 здесь', 900000);
+  const text = [].concat(r.message).join('\n');
+  assert.equal(r.ok, true, text);
+  assert.deepEqual(moved, ['shield'], 'щит переложил (сторож не прервал это из-за зомби)');
+  assert.equal(s.bot.inventory.slots[45] && s.bot.inventory.slots[45].name, 'shield');
+  assert.match(text, /Отбился от мобов: зомби ×1/);
+  assert.equal(r.data.mined, 1);
+});
+
 test('команды: #добудь при анти-X-ray — руду, что сервер открыл у хода, берёт сразу (ход бросает), а не после 8 блоков', async () => {
   // Руды не видно нигде (сервер прячет её камнем). Бот копает ход вглубь; у второго выкопанного блока сервер
   // открывает железо — бот бросает ход и берёт его.

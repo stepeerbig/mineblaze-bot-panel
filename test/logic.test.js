@@ -481,6 +481,33 @@ test('автовход: /login и команды после появления, 
   mgr.shutdown();
 });
 
+test('автовход: пароль с пробелом («пароль пароль», как для /register) — /login с первым словом; ответ сервера — в консоль', async () => {
+  const msg = (text) => ({ toString: () => text, toMotd: () => text });
+  const { mgr, bots, logs } = setup({ loginPassword: 'Secr3t Secr3t' }, { joinFirst: 10 });
+  mgr.start();
+  goOnline(bots[0]);
+  await sleep(40);
+  assert.deepEqual(bots[0].sent, ['/login Secr3t'], 'MineBlaze ждёт одно слово: на два отвечает «Авторизируйтесь»');
+  const t = lines(logs);
+  assert.ok(t.some((l) => /^warn:Пароль для \/login записан с пробелом/.test(l)), t.join('\n'));
+  assert.ok(!JSON.stringify(logs).includes('Secr3t'), 'пароль нигде не виден');
+  bots[0].emit('message', msg('| Вы успешно авторизовались'), 'system');
+  assert.ok(lines(logs).includes('ok:Автовход: сервер принял пароль'));
+  mgr.shutdown();
+
+  // Пароль не подошёл: сервер снова просит /login — понятное предупреждение (без входа он отключит бота).
+  const b = setup({ loginPassword: 'wrong' }, { joinFirst: 10 });
+  b.mgr.start();
+  goOnline(b.bots[0]);
+  await sleep(40);
+  b.bots[0].emit('message', msg('| Авторизируйтесь » /login [пароль]'), 'system'); // эхо сразу после — не в счёт
+  assert.ok(!lines(b.logs).some((l) => /Автовход не прошёл/.test(l)));
+  await sleep(1600);
+  b.bots[0].emit('message', msg('| Авторизируйтесь » /login [пароль]'), 'system');
+  assert.ok(lines(b.logs).some((l) => /^warn:Автовход не прошёл: сервер снова просит \/login/.test(l)), lines(b.logs).join('\n'));
+  b.mgr.shutdown();
+});
+
 test('автовход отменяется, если бот отключился раньше', async () => {
   const { mgr, bots } = setup({ loginPassword: 'pw' }, { joinFirst: 40 });
   mgr.start();

@@ -28,6 +28,10 @@ const GOD_AFTER_SWITCH_MS = 3000;
 const SETBACK_LIMIT = 8;
 const SETBACK_WINDOW_MS = 3000;
 const SETBACK_WARN_EVERY_MS = 30 * 1000;
+// Ответ сервера на автовход (MineBlaze: «Вы успешно авторизовались» / «Авторизируйтесь » /login [пароль]»).
+const LOGIN_OK_RE = /(?:успешно\s+авториз|уже\s+авториз|successfully\s+logged|logged\s+in\s+successfully)/i;
+const LOGIN_AGAIN_RE = /(?:авториз(?:ир)?уйтесь|неверный\s+пароль|wrong\s+password|incorrect\s+password|please\s+log\s*in)/i;
+const LOGIN_ECHO_MS = 1500; // напоминание «авторизуйтесь», пришедшее сразу за /login, могло уйти ещё до него
 
 const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
 
@@ -660,6 +664,16 @@ class BotManager extends EventEmitter {
       this._reportLinks(s, important, 'сообщение в чате');
       // Сообщения сервера (не игроков): возврат в лобби, ответы для охраны и режима бога.
       if (position !== 'chat') {
+        // Ответ на автовход: принял пароль — сказать; снова просит /login — пароль не подошёл (см. _scheduleJoinCommands).
+        if (s.loginSentAt && !s.loginDone) {
+          if (LOGIN_OK_RE.test(shown)) {
+            s.loginDone = true;
+            this.log('ok', 'Автовход: сервер принял пароль');
+          } else if (LOGIN_AGAIN_RE.test(shown) && Date.now() - s.loginSentAt > LOGIN_ECHO_MS) {
+            s.loginDone = true;
+            this.log('warn', 'Автовход не прошёл: сервер снова просит /login — пароль не подошёл. Проверь его: общий в «Автовход» или у бота в «Боты» (ник:пароль). Без входа сервер через пару минут отключает бота');
+          }
+        }
         const forced = forcedMoveReason(shown);
         if (forced) this._onForcedMove(s, forced);
         s.guard.onChat(shown);
@@ -889,7 +903,16 @@ class BotManager extends EventEmitter {
   /** Автовход и команды после входа — по очереди с паузами. Возвращает, сколько их будет. */
   _scheduleJoinCommands(s) {
     const queue = [];
-    if (this.config.loginPassword) queue.push({ cmd: `/login ${this.config.loginPassword}`, label: 'Автовход' });
+    // Пароль для /login — одно слово: на «/login слово слово» MineBlaze отвечает «Авторизируйтесь » /login [пароль]»,
+    // а через пару минут молча отключает (бот так и не вошёл). Записано несколько слов (например, «пароль пароль»,
+    // как для /register) — отправляем первое и говорим об этом.
+    const words = String(this.config.loginPassword || '').trim().split(/\s+/).filter(Boolean);
+    if (words.length) {
+      if (words.length > 1) {
+        this.log('warn', 'Пароль для /login записан с пробелом (несколько слов) — отправляю только первое слово. Не войдёт — проверь пароль: общий в «Автовход» или у бота в «Боты» (ник:пароль)');
+      }
+      queue.push({ cmd: `/login ${words[0]}`, label: 'Автовход' });
+    }
     for (const cmd of parseJoinCommands(this.config.joinCommands)) queue.push({ cmd, label: 'Команда после входа' });
     if (!queue.length) return 0;
 
@@ -899,7 +922,10 @@ class BotManager extends EventEmitter {
       if (this.cur !== s || s.stopping || !s.loggedIn) return;
       const { cmd, label } = queue[i];
       i += 1;
-      if (this._send(s, cmd)) this.log('info', `${label}: ${maskSecrets(cmd)}`);
+      if (this._send(s, cmd)) {
+        this.log('info', `${label}: ${maskSecrets(cmd)}`);
+        if (label === 'Автовход') s.loginSentAt = Date.now();
+      }
       if (i < queue.length) s.joinTimer = later(next, this.timings.joinStep);
     };
     s.joinTimer = later(next, this.timings.joinFirst);

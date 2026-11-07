@@ -2404,8 +2404,11 @@ async function mine(bot, ore, want, pick) {
     if (roaming && !guard.busy && bot.actions.busy) bot.actions.interrupt('рядом открылась руда', 'found');
   };
   bot.on('blockUpdate', onBlock);
-  guard.start();
   try {
+    // Щит — во вторую руку до сторожа: зомби рядом прервал бы перекладывание, и весь раз бот был бы без щита
+    // (от крипера только отходил бы). Перекладывание — полсекунды.
+    await prepareShield(bot);
+    guard.start();
     return await mineLoop();
   } finally {
     guard.stop();
@@ -2413,7 +2416,6 @@ async function mine(bot, ore, want, pick) {
   }
 
   async function mineLoop() {
-    await guarded(() => prepareShield(bot));
     const yaw = bot.entity.yaw;
     let dir = Math.abs(Math.sin(yaw)) > Math.abs(Math.cos(yaw)) ? new Vec3(-Math.sign(Math.sin(yaw)), 0, 0) : new Vec3(0, 0, -Math.sign(Math.cos(yaw)));
     while (mined < want) {
