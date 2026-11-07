@@ -470,6 +470,17 @@ function inject(bot, { physicsEnabled }, { tickEnd, clock, random }) {
     get pitch() {
       return conv.fromNotchianPitch(current.pitch);
     },
+    /** Взгляд этого тика в градусах игры — как в пакетах (use_item несёт его же). */
+    get rotationDegrees() {
+      return { yaw: Math.fround(current.yaw), pitch: Math.fround(current.pitch) };
+    },
+    /** Взгляд из последнего отправленного пакета (радианы, как bot.entity.yaw/pitch) — его сервер уже знает. */
+    get sentYaw() {
+      return conv.fromNotchianYaw(lastSent.yaw);
+    },
+    get sentPitch() {
+      return conv.fromNotchianPitch(lastSent.pitch);
+    },
     /** Голова не движется и смотрит туда, куда нужно. */
     get lookSettled() {
       return settled && rotationReady;

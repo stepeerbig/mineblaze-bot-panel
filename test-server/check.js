@@ -22,6 +22,9 @@
 //         npm run stand:check -- --mine          — добыча: руда спрятана в толще камня; бот (#добудь) прокапывается к ней
 //                                                  и поднимается обратно «столбом»; Grim смотрит копание и прыжки с блоком;
 //                                                  STAND_MINE=denied — там, где копать нельзя (ждём быстрый стоп)
+//         npm run stand:check -- --survive       — добыча с выживанием: алмазная кирка «Эффективность V», меч, щит, хлеб;
+//                                                  голод и мобы (зомби, крипер); бот добывает алмазы, отбивается, ест,
+//                                                  от крипера — щитом. Grim смотрит копание, еду, щит, удары и движение
 // Перед первым запуском один раз открой test-server\start-test-server.bat: он скачает сервер и спросит про EULA.
 // Код выхода 0 — бот простоял всё время, его не кикнули, и ни Grim, ни сервер ничего не заметили.
 // Журнал пакетов каждой проверки: test-server\server\journals.
@@ -43,11 +46,13 @@ const BOT_NAME = 'StandBot';
 const HELPER_NAME = 'Helper'; // второй игрок в сценарии — для команд по нику
 
 const ARGS = process.argv.slice(2);
-const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--no-clicks', '--scenario', '--clicks', '--fight', '--mine', '--electron']);
+const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--no-clicks', '--scenario', '--clicks', '--fight', '--mine', '--survive', '--electron']);
 const SCENARIO = ARGS.includes('--scenario');
 const CLICKS = ARGS.includes('--clicks');
 const FIGHT = ARGS.includes('--fight');
 const MINE = ARGS.includes('--mine');
+const SURVIVE = ARGS.includes('--survive');
+const ANY_CHECK = SCENARIO || CLICKS || FIGHT || MINE || SURVIVE;
 const ELECTRON_ARG = ARGS.find((a) => a === '--electron' || a.startsWith('--electron='));
 const ELECTRON = Boolean(ELECTRON_ARG);
 const ELECTRON_EXE = ELECTRON_ARG && ELECTRON_ARG.includes('=') ? ELECTRON_ARG.slice(ELECTRON_ARG.indexOf('=') + 1).replace(/^"|"$/g, '') : '';
@@ -55,7 +60,7 @@ const BOTS_ARG = ARGS.find((a) => a.startsWith('--bots='));
 const BOTS = BOTS_ARG ? Math.max(1, Math.min(200, parseInt(BOTS_ARG.slice('--bots='.length), 10) || 1)) : 1;
 const isStandBot = (name) => name === BOT_NAME || (BOTS > 1 && new RegExp(`^${BOT_NAME}\\d+$`).test(name));
 const ROOT = path.join(__dirname, '..');
-const STAY_MS = Math.max(5, parseInt(ARGS.find((a) => /^\d+$/.test(a)), 10) || (SCENARIO || CLICKS || FIGHT || MINE ? 10 : 60)) * 1000;
+const STAY_MS = Math.max(5, parseInt(ARGS.find((a) => /^\d+$/.test(a)), 10) || (ANY_CHECK ? 10 : 60)) * 1000;
 const LEGACY = ARGS.includes('--legacy');
 const COMPAT = {
   physics: !LEGACY && !ARGS.includes('--no-physics'),
@@ -330,7 +335,7 @@ async function runFightCheck(manager, cmd) {
   const COUNT = 4;
   for (const c of [
     'difficulty easy',
-    'gamerule doMobSpawning false',
+    'gamerule spawn_mobs false', // 1.21.11: правила игры переименованы (было doMobSpawning)
     'time set midnight',
     `effect give ${BOT_NAME} minecraft:resistance infinite 255 true`,
     `effect give ${BOT_NAME} minecraft:saturation infinite 255 true`,
@@ -397,6 +402,59 @@ async function runMineCheck(manager, cmd) {
   if (wet) console.log(`  [добыча] руда у воды: ${wet.name}`);
   const ok = r.data && r.data.mined >= 2 && r.data.back === true && Math.abs(p.y - o.y) < 0.1 && (!wet || wet.name === 'iron_ore');
   return ok ? 0 : 1;
+}
+
+/**
+ * Добыча с выживанием (--survive): каменная коробка, в толще — два спрятанных алмаза. У бота — алмазная кирка
+ * «Эффективность V», железный меч, щит и хлеб; голод (сытость падает) и мобы: зомби в 3 блоках, крипер в 6. Бот
+ * командой #добудь алмазы 2 здесь копает (руда — 3–4 тика, как у клиента), отбивается (зомби — мечом, крипер — щитом),
+ * ест хлеб. «Сопротивление I» — чтобы при ошибке проверка не кончилась смертью. Возвращает 0 или что не вышло.
+ */
+async function runSurviveCheck(manager, cmd) {
+  if (!cmd) throw new Error('для этой проверки сервер должна запускать сама проверка: закрой окно тестового сервера и запусти снова');
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  await wait(2000);
+  const bot = manager.getBot();
+  if (!bot || !bot.actions) throw new Error('у бота нет безопасных действий (они работают только со своей физикой)');
+  const o = bot.entity.position.floored();
+  const at = (dx, dy, dz) => `${o.x + dx} ${o.y + dy} ${o.z + dz}`;
+  const mid = (dx, dy, dz) => `${o.x + dx + 0.5} ${o.y + dy} ${o.z + dz + 0.5}`;
+  for (const c of [
+    'difficulty easy',
+    'gamerule spawn_mobs false', // 1.21.11: правила игры переименованы (было doMobSpawning)
+    'kill @e[type=!minecraft:player]', // мобы, предметы и сущности прошлых проверок
+    `fill ${at(-9, -13, -9)} ${at(9, 6, 9)} minecraft:stone hollow`,
+    `fill ${at(-8, -12, -8)} ${at(8, -1, 8)} minecraft:stone`,
+    `tp ${BOT_NAME} ${mid(0, 0, 0)}`,
+    `setblock ${at(5, -5, 2)} minecraft:diamond_ore`,
+    `setblock ${at(-3, -8, -4)} minecraft:deepslate_diamond_ore`,
+    `clear ${BOT_NAME}`,
+    `give ${BOT_NAME} minecraft:diamond_pickaxe[enchantments={efficiency:5}]`,
+    `give ${BOT_NAME} minecraft:iron_sword`,
+    `give ${BOT_NAME} minecraft:shield`,
+    `give ${BOT_NAME} minecraft:bread 8`,
+    `effect clear ${BOT_NAME}`,
+    `effect give ${BOT_NAME} minecraft:resistance 600 0 true`,
+  ]) cmd(c);
+  await wait(3000);
+  // Голод: сначала тратится насыщение (после прошлых проверок оно бывает полным), потом сытость — у бота есть хлеб.
+  cmd(`effect give ${BOT_NAME} minecraft:hunger 20 60 true`);
+  // Зомби — рядом (подходит первым), крипер — в углу, в ~10 блоках: подойдёт позже, его взрыв не убьёт зомби за бота.
+  cmd(`summon minecraft:zombie ${mid(3, 0, 3)} {PersistenceRequired:1b}`);
+  cmd(`summon minecraft:creeper ${mid(-7, 0, 7)} {PersistenceRequired:1b}`);
+  await wait(500);
+  const health0 = bot.health;
+  const started = Date.now();
+  const r = await runCommand(bot, '#добудь алмазы 2 здесь');
+  const text = [].concat(r.message).join(' | ');
+  console.log(`  [выживание] #добудь алмазы 2 здесь → ${r.ok ? 'да' : 'НЕТ'} (${((Date.now() - started) / 1000).toFixed(1)} с): ${text}`);
+  console.log(`  [выживание] здоровье ${health0} → ${bot.health}, сытость ${bot.food}`);
+  const problems = [];
+  if (!(r.data && r.data.mined >= 2)) problems.push('добыл меньше 2 алмазов');
+  if (!/Отбился от мобов/.test(text)) problems.push('не отбился от мобов');
+  if (!/Поел/.test(text)) problems.push('не поел');
+  if (!(bot.health > 0)) problems.push('погиб');
+  return problems.length ? problems.join(', ') : 0;
 }
 
 // Предметы для проверки кликов: как в меню NPC на MineBlaze (название с цветом, описание из нескольких строк)
@@ -655,18 +713,19 @@ function runBot(host, port, version, cmd) {
         onlineAt = Date.now();
         onlineAtJournal = performance.timeOrigin + performance.now();
         clearTimeout(onlineTimer);
-        if (SCENARIO || CLICKS || FIGHT || MINE) {
-          console.log(SCENARIO ? 'Бот в мире: готовлю площадку и действую…' : CLICKS ? 'Бот в мире: проверяю клики в меню…' : MINE ? 'Бот в мире: прячу руду в камне…' : 'Бот в мире: готовлю загон и пауков…');
-          const what = SCENARIO ? 'сценарий' : CLICKS ? 'клики' : MINE ? 'добыча' : 'бой';
-          (SCENARIO ? runScenario : CLICKS ? runClickCheck : MINE ? runMineCheck : runFightCheck)(manager, cmd).then(
+        if (ANY_CHECK) {
+          const check = SCENARIO ? { what: 'сценарий', start: 'готовлю площадку и действую…', done: 'Сценарий закончен', run: runScenario, why: (f) => `не выполнено команд — ${f}` }
+            : CLICKS ? { what: 'клики', start: 'проверяю клики в меню…', done: 'Клики проверены', run: runClickCheck, why: (f) => `неудачных проверок — ${f}` }
+              : MINE ? { what: 'добыча', start: 'прячу руду в камне…', done: 'Добыча окончена', run: runMineCheck, why: () => 'добыл не всё, тронул руду у воды или не вернулся на свою высоту' }
+                : SURVIVE ? { what: 'выживание', start: 'прячу алмазы, зову мобов…', done: 'Добыча с мобами окончена', run: runSurviveCheck, why: (f) => `не вышло: ${f}` }
+                  : { what: 'бой', start: 'готовлю загон и пауков…', done: 'Бой окончен', run: runFightCheck, why: () => 'убил не всех пауков' };
+          console.log(`Бот в мире: ${check.start}`);
+          check.run(manager, cmd).then(
             (failed) => {
-              console.log(`${SCENARIO ? 'Сценарий закончен' : CLICKS ? 'Клики проверены' : MINE ? 'Добыча окончена' : 'Бой окончен'}, бот стоит ещё ${STAY_MS / 1000} с…`);
-              const why = SCENARIO ? `не выполнено команд — ${failed}`
-                : CLICKS ? `неудачных проверок — ${failed}`
-                  : MINE ? 'добыл не всё, тронул руду у воды или не вернулся на свою высоту' : 'убил не всех пауков';
-              stayTimer = setTimeout(() => finish(failed ? `${what}: ${why}` : null), STAY_MS);
+              console.log(`${check.done}, бот стоит ещё ${STAY_MS / 1000} с…`);
+              stayTimer = setTimeout(() => finish(failed ? `${check.what}: ${check.why(failed)}` : null), STAY_MS);
             },
-            (err) => finish(`${what}: ${err.message}`),
+            (err) => finish(`${check.what}: ${err.message}`),
           );
         } else {
           console.log(`Бот в мире, стоит ${STAY_MS / 1000} с…`);
@@ -686,12 +745,12 @@ async function main() {
     console.error('--bots=N — только вместе с --electron (боты заходят через панель, как «Старт всех»)');
     return 2;
   }
-  if (ELECTRON && (SCENARIO || CLICKS || FIGHT || MINE || ARGS.some((a) => /^--(legacy|no-)/.test(a)))) {
-    console.error('--electron проверяет бота таким, какой он в панели: без --scenario, --clicks, --fight, --legacy и --no-…');
+  if (ELECTRON && (ANY_CHECK || ARGS.some((a) => /^--(legacy|no-)/.test(a)))) {
+    console.error('--electron проверяет бота таким, какой он в панели: без --scenario, --clicks, --fight, --mine, --survive, --legacy и --no-…');
     return 2;
   }
-  if ([SCENARIO, CLICKS, FIGHT, MINE].filter(Boolean).length > 1) {
-    console.error('--scenario, --clicks, --fight и --mine — разные проверки: запусти их по очереди');
+  if ([SCENARIO, CLICKS, FIGHT, MINE, SURVIVE].filter(Boolean).length > 1) {
+    console.error('--scenario, --clicks, --fight, --mine и --survive — разные проверки: запусти их по очереди');
     return 2;
   }
   if (unknown.length) {
@@ -735,7 +794,7 @@ async function main() {
 
     console.log('');
     console.log('===== Итог =====');
-    const stayed = `${Math.round(result.onlineMs / 1000)} с${SCENARIO || CLICKS || FIGHT || MINE ? ' (проверка и пауза после неё)' : ` из ${STAY_MS / 1000}`}`;
+    const stayed = `${Math.round(result.onlineMs / 1000)} с${ANY_CHECK ? ' (проверка и пауза после неё)' : ` из ${STAY_MS / 1000}`}`;
     console.log(`Бот в мире: ${result.online ? stayed : 'не появился'}`);
     if (result.kick) console.log(`Кик: ${result.kick}`);
     if (result.problem) console.log(`Проблема: ${result.problem}`);

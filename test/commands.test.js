@@ -1155,6 +1155,80 @@ test('команды: #добудь — руда в толще камня: пр�
   assert.equal(s.bot.heldItem && s.bot.heldItem.name, 'iron_pickaxe', 'копал киркой');
 });
 
+test('команды: #добудь — подошёл зомби: бросает копать, бьёт его лучшим мечом и докапывает; проголодался — ест хлеб', async () => {
+  const s = setup({ inventory: [['iron_pickaxe', 1], ['iron_sword', 1], ['bread', 3], ['cobblestone', 32]] });
+  s.world.set(new Vec3(6, 58, 0), 'iron_ore');
+  const zombie = { id: 601, type: 'hostile', name: 'zombie', position: new Vec3(0.5, 64, 2.5), width: 0.6, height: 1.95, hp: 2 };
+  let stops = 0;
+  let tick = 0;
+  let ateAt = null;
+  const attacked = [];
+  s.bot.on('physicsTick', () => {
+    tick += 1;
+    if (ateAt !== null && tick - ateAt >= 32) {
+      const bread = s.bot.inventory.slots.find((it) => it && it.name === 'bread');
+      bread.count -= 1;
+      s.bot.food = 17;
+      s.bot.emit('health');
+      ateAt = null;
+    }
+  });
+  const write = s.bot._client.write;
+  s.bot._client.write = (name, params) => {
+    write(name, params);
+    if (name === 'block_dig' && params.status === 2) {
+      stops += 1;
+      if (stops === 1) s.bot.entities[zombie.id] = zombie; // пришёл, пока бот копает
+      if (stops === 3) s.bot.food = 12; // проголодался
+    }
+    if (name === 'use_entity' && params.mouse === 1) {
+      attacked.push(params.target);
+      if (params.target === zombie.id && (zombie.hp -= 1) <= 0) {
+        delete s.bot.entities[zombie.id];
+        s.bot.emit('entityDead', zombie);
+      }
+    }
+    if (name === 'use_item' && s.bot.heldItem && s.bot.heldItem.name === 'bread') ateAt = tick;
+  };
+  const r = await s.run('#добудь железо 1 здесь', 900000);
+  const text = [].concat(r.message).join('\n');
+  assert.equal(r.ok, true, text);
+  assert.equal(r.data.mined, 1);
+  assert.deepEqual(attacked, [zombie.id, zombie.id], 'два удара — зомби нет');
+  assert.match(text, /Отбился от мобов: зомби ×1/);
+  assert.match(text, /Поел: 1 раз/);
+  assert.equal(s.bot.food, 17);
+  assert.equal(s.bot.heldItem && s.bot.heldItem.name, 'iron_pickaxe', 'после боя и еды снова кирка');
+});
+
+test('команды: #добудь при анти-X-ray — руду, что сервер открыл у хода, берёт сразу (ход бросает), а не после 8 блоков', async () => {
+  // Руды не видно нигде (сервер прячет её камнем). Бот копает ход вглубь; у второго выкопанного блока сервер
+  // открывает железо — бот бросает ход и берёт его.
+  const hiddenOres = { '1,61,0': 'iron_ore' };
+  const s = setup({ inventory: [['iron_pickaxe', 1], ['cobblestone', 32]], server: { hiddenOres } });
+  const r = await s.run('#добудь железо 1 здесь', 900000);
+  const text = [].concat(r.message).join('\n');
+  assert.equal(r.ok, true, text);
+  assert.equal(r.data.mined, 1);
+  assert.equal(s.world.get(new Vec3(1, 61, 0)) === 'iron_ore', false, 'открывшуюся руду выкопал');
+  const deepest = Math.min(...changedBelow(s.world, 'air').concat(changedBelow(s.world, 'cobblestone')).map((c) => c.y));
+  assert.ok(deepest >= 60, `ход бросил, как открылась руда: глубже Y ${deepest} не копал`);
+});
+
+test('команды: #рентген — вся руда у воздуха, в камне ни одной: честно говорит, что сервер её прячет', async () => {
+  const s = setup({ inventory: [] });
+  // 12 руд — все у воздуха (над полом): будто пещера; в толще камня — ничего.
+  for (let x = -6; x < 6; x += 1) s.world.set(new Vec3(x, 63, 3), 'iron_ore');
+  const r = await s.run('#рентген');
+  const text = [].concat(r.message).join('\n');
+  assert.equal(r.data.hiddenOre, true, text);
+  assert.match(text, /сервер прячет руду \(анти-X-ray\)/);
+  // А если хоть одна лежит в толще камня — так не говорит.
+  s.world.set(new Vec3(0, 50, 0), 'iron_ore');
+  const r2 = await s.run('#рентген');
+  assert.equal(r2.data.hiddenOre, false);
+});
+
 test('команды: #добудь — руду у воды не трогает (потечёт), берёт другую; рядом нет — копает дальше и ищет снова; кирка; где искать', async () => {
   const s = setup({ inventory: [['stone_pickaxe', 1], ['cobblestone', 16]] });
   s.world.set(new Vec3(3, 62, 0), 'iron_ore');

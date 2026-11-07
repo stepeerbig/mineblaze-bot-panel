@@ -137,6 +137,30 @@ test('путь с копанием: к руде в толще камня — п�
   assert.ok(!dug.some((p) => p.equals(ore)) || r.path.at(-1), 'руда — в конце или по пути');
 });
 
+test('путь с копанием «как танк»: копать дёшево (хорошая кирка) — напрямую сквозь камень, а не в обход по пещере', async () => {
+  const { w, getBlock } = world();
+  const y = 58;
+  const ore = new Vec3(12, y, 0);
+  w.set(ore, 'iron_ore');
+  // Бот в нише под землёй, руда в 12 блоках к востоку. Пещера уводит на юг и возвращается к руде (обход — 23 шага).
+  const air = (x, z) => {
+    for (const yy of [y, y + 1]) w.set(new Vec3(x, yy, z), 'air');
+  };
+  air(0, 0);
+  for (let z = 1; z <= 6; z += 1) {
+    air(0, z);
+    air(12, z);
+  }
+  for (let x = 0; x <= 12; x += 1) air(x, 6);
+  // С алмазной киркой «Эффективность V» камень — 2 тика + пауза: в поиске это ≈ 0,7 шага за блок (actions.digCostWith).
+  const tank = await run(getBlock, [0.5, y, 0.5], [12, y, 0], { reach: true, dig: () => 0.71, weight: 4 });
+  assert.equal(tank.complete, true, tank.reason);
+  assert.ok(tank.path.every((p) => p.z === 0 && p.y === y), `прямо на восток: ${cells(tank).join(' ')}`);
+  // Старая цена (по твёрдости: камень — как 3 шага) уводила в пещеру.
+  const old = await run(getBlock, [0.5, y, 0.5], [12, y, 0], { reach: true, dig: true, weight: 4 });
+  assert.ok(old.path.some((p) => p.z > 0), `по старой цене — в обход: ${cells(old).join(' ')}`);
+});
+
 test('путь с копанием: не ломает рядом с водой и лавой, под гравием; под себя — только на твёрдое', async () => {
   // Вода рядом с прямой дорогой вниз — ни один ломаемый блок не касается воды.
   const { w, getBlock } = world();

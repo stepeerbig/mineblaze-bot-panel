@@ -219,13 +219,20 @@ function makeWorld(cell, maxFall, { dig = null, place = false } = {}) {
   // Цена сломать клетку или null: не ломается, опасна, рядом вода или лава, сверху песок или гравий (кроме тех,
   // что ломаем этим же ходом — cells).
   const inMove = (cells, x, y, z) => cells.some((c) => c[0] === x && c[1] === y && c[2] === z);
+  // Цена копания — на один поиск: она зависит от кирки, а сведения о блоке общие для всех поисков процесса.
+  const digCache = new Map();
   const breakCost = (x, y, z, cells) => {
     const c = cell(x, y, z);
     if (!c.loaded || c.danger || c.liquid || !c.breakable) return null;
     for (const [ax, ay, az] of SIDES) if (cell(x + ax, y + ay, z + az).liquid) return null;
     if (cell(x, y + 1, z).falls && !inMove(cells, x, y + 1, z)) return null;
-    if (c.digCost === undefined) c.digCost = c.block ? dig(c.block) : null;
-    return typeof c.digCost === 'number' && Number.isFinite(c.digCost) ? c.digCost : null;
+    let k = digCache.get(c);
+    if (k === undefined) {
+      k = c.block ? dig(c.block) : null;
+      if (!(typeof k === 'number' && Number.isFinite(k))) k = null;
+      digCache.set(c, k);
+    }
+    return k;
   };
   // Освободить клетки хода (сверху вниз): { cost, dig: [[x, y, z]] } или null — нельзя.
   const clear = (cells) => {
@@ -377,7 +384,20 @@ async function findPath(getBlock, start, goal, opts = {}) {
   // По высоте пешком — прыжок или спуск по пути (полцены); с копанием каждый блок высоты — это слом или столб.
   const perY = dig || o.place ? 1 : 0.5;
   const h = target ? (n) => target.h(n) : (n) => Math.max(0, hDist(n) - o.range) + Math.max(0, Math.abs(n.y - goalY) - o.vertical) * perY;
-  const hw = (n) => h(n) * o.weight;
+  // С копанием путей одной цены много (ступеньки вбок, «змейка»): ничья — в пользу того, что ближе к прямой
+  // «старт → цель». Бот прокапывается прямо на цель, «как танк».
+  const gx = goal.x - (s.x + 0.5);
+  const gy = goalY - s.y;
+  const gz = goal.z - (s.z + 0.5);
+  const glen = Math.hypot(gx, gy, gz) || 1;
+  const offLine = (n) => {
+    const px = n.x - s.x;
+    const py = n.y - s.y;
+    const pz = n.z - s.z;
+    return Math.hypot(py * gz - pz * gy, pz * gx - px * gz, px * gy - py * gx) / glen;
+  };
+  const tie = dig ? 0.01 : 0;
+  const hw = tie ? (n) => h(n) * o.weight + tie * offLine(n) : (n) => h(n) * o.weight;
 
   const startNode = { ...s, g: 0, f: hw(s), parent: null };
   const open = new Heap();
@@ -441,4 +461,4 @@ async function findPath(getBlock, start, goal, opts = {}) {
 /** Ключ шага для opts.avoid: «x,y,z>x,y,z». */
 const edgeKey = (from, to) => `${key(Math.floor(from.x), Math.floor(from.y + 0.01), Math.floor(from.z))}>${key(to.x, to.y, to.z)}`;
 
-module.exports = { findPath, makeWorld, cellReader, fastReader, reachGoal, edgeKey, digCostByHardness, DANGER_RE, LIQUID_RE, FALLING_RE, UNBREAKABLE_RE, COST };
+module.exports = { findPath, makeWorld, cellReader, fastReader, reachGoal, edgeKey, digCostByHardness, DANGER_RE, LIQUID_RE, FALLING_RE, UNBREAKABLE_RE, COST, MAX_HARDNESS };

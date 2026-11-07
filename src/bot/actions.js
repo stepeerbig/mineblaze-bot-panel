@@ -13,7 +13,7 @@
 
 const { Vec3 } = require('vec3');
 const { RaycastIterator } = require('prismarine-world').iterators;
-const { findPath, fastReader, edgeKey, LIQUID_RE, UNBREAKABLE_RE } = require('./pathfinder');
+const { findPath, fastReader, edgeKey, LIQUID_RE, UNBREAKABLE_RE, MAX_HARDNESS } = require('./pathfinder');
 
 const BLOCK_REACH = 4.4; // у игрока 4,5 блока — оставляем запас
 const ENTITY_REACH = 2.9; // у игрока 3 блока
@@ -26,7 +26,12 @@ const LOOK_TIMEOUT_TICKS = 60;
 const STUCK_TICKS = 60; // столько тиков без продвижения — бот застрял
 const FIRST_SEARCH_NODES = 2000; // путь с копанием к точке: точный поиск — до стольких клеток, дальше — жадный
 const SETBACK_CALM_TICKS = 6; // после отката сервером — столько тиков без клавиш
+const WALK_TICKS_PER_BLOCK = 4.6; // шагом блок — за столько тиков (4,3 блока в секунду)
+// Копание при поиске пути дешевле настоящего времени во столько раз: бот прёт прямо на цель, «как танк», а не
+// обходит по пещерам. С хорошей киркой это и по времени не дольше: шаг туннеля ≈ 2 блока × (2–3 тика + пауза 5).
+const TANK = 0.35;
 const ATTACK_COOLDOWN_TICKS = 12; // пауза между ударами (меч восстанавливается за 12,5 тика)
+const EAT_MAX_TICKS = 60; // еда съедается за 32 тика (1,6 с); дольше этого и ответа сервера — не вышло
 const CHAT_INTERVAL_MS = 1500;
 // Клики в меню: первый — через 0,5–0,9 с после открытия, следующие — через 0,25–0,55 с; ответ сервера ждём до 0,5 с.
 const FIRST_CLICK_TICKS = 10;
@@ -329,12 +334,16 @@ function inject(bot, { random, now }) {
     throw new ActionError('не удалось повернуть голову');
   }
 
-  /** Стоять на месте: отпустить клавиши и дождаться, пока бот остановится. */
-  async function standStill(signal) {
+  /**
+   * Стоять на месте: отпустить клавиши и дождаться, пока бот остановится. loose — «почти стоит» (копать можно и
+   * когда бот ещё чуть катится: за пару тиков он сдвинется на сотые доли блока, а ждать полной остановки — 6 тиков).
+   */
+  async function standStill(signal, { loose = false } = {}) {
     releaseControls();
+    const limit = loose ? 0.03 : 0.003;
     for (let i = 0; i < 40; i += 1) {
       const v = bot.entity.velocity;
-      if (bot.entity.onGround && Math.hypot(v.x, v.z) < 0.003) return;
+      if (bot.entity.onGround && Math.hypot(v.x, v.z) < limit) return;
       await inTick(() => {}, signal);
     }
   }
@@ -372,9 +381,26 @@ function inject(bot, { random, now }) {
     return sequence;
   }
 
+  let swungTick = -Infinity;
   function swing() {
     bot._client.write('arm_animation', { hand: 0 });
+    swungTick = ticks();
   }
+
+  // Кнопка «зажата» между блоками: у клиента с зажатой кнопкой в паузе после сломанного блока (5 тиков) рука
+  // машет каждый тик, если под взглядом блок (continueDestroyBlock во время destroyDelay). Без этого бот копал
+  // «кликами»: удар — тишина — удар. Только пока идёт копание (dig, digTo).
+  let digHolding = false;
+  bot.on('physicsTick', () => {
+    if (!digHolding || !bot.serverView || swungTick === ticks()) return;
+    if (ticks() - lastDestroyTick >= DESTROY_DELAY_TICKS) return;
+    try {
+      const hit = lookedAtBlock(BLOCK_REACH);
+      if (hit && !isAir(hit.block)) swing();
+    } catch (_) {
+      // мир не загружен — не машем
+    }
+  });
 
   function blockAtOrThrow(position) {
     const block = blockAt(position);
@@ -493,7 +519,7 @@ function inject(bot, { random, now }) {
    * Пройти по точкам пути (клетки ног, см. pathfinder.js), не останавливаясь на каждой: смотреть на ближайшую ещё не
    * пройденную, на ступеньку — прыжок, с уступа — шаг вниз, в воде — всплывать. До последней — с точностью range.
    */
-  async function followPath(points, { range = 0.35, sprint = false } = {}, signal) {
+  async function followPath(points, { range = 0.35, sprint = false, settle = 0.003 } = {}, signal) {
     if (!points.length) return;
     const walkPitch = -(0.1 + 0.15 * random());
     const centre = (p) => new Vec3(p.x + 0.5, p.y, p.z + 0.5);
@@ -546,7 +572,7 @@ function inject(bot, { random, now }) {
         releaseControls();
         arrivedTicks += 1;
         const v = bot.entity.velocity;
-        return Math.hypot(v.x, v.z) < 0.003 || arrivedTicks > 10 ? true : undefined;
+        return Math.hypot(v.x, v.z) < settle || arrivedTicks > 10 ? true : undefined;
       }
       // Продвижение — по оставшемуся пути: нет его STUCK_TICKS — застрял (навигация найдёт путь заново).
       const left = dist + (points.length - 1 - i);
@@ -651,42 +677,74 @@ function inject(bot, { random, now }) {
   /** Сломать блок: взгляд на видимую грань, удар, взмах рукой каждый тик, время — как у клиента. */
   function dig(position) {
     const pos = new Vec3(Math.floor(position.x), Math.floor(position.y), Math.floor(position.z));
-    return run('копать', (signal) => digBlock(pos, signal));
+    return run('копать', async (signal) => {
+      digHolding = true;
+      try {
+        return await digBlock(pos, signal);
+      } finally {
+        digHolding = false;
+      }
+    });
   }
 
-  /** Сломать блок внутри действия (dig, digTo). */
-  async function digBlock(pos, signal) {
+  /** Куда смотреть, чтобы копать блок pos (видимая грань) — { yaw, pitch } или null. */
+  function aimAt(pos) {
+    const b = blockAt(pos);
+    if (!b || isAir(b)) return null;
+    const spot = visibleFacePoint(pos, b);
+    return spot ? anglesTo(eyePosition(), spot.point) : null;
+  }
+
+  /**
+   * Сломать блок внутри действия (dig, digTo). next — какой блок ломать следом: голова поворачивается к нему сразу
+   * после удара, пока сервер подтверждает этот (и пока идёт пауза), — как у человека с зажатой кнопкой.
+   */
+  async function digBlock(pos, signal, { next = null } = {}) {
     const block = blockAtOrThrow(pos);
     if (isAir(block)) throw new ActionError(`в ${fmt(pos)} нечего ломать — там воздух`);
     if (block.hardness === null || block.hardness < 0 || block.diggable === false) throw new ActionError(`${block.name} в ${fmt(pos)} не ломается`);
-    await standStill(signal);
+    await standStill(signal, { loose: true });
     const spot = visibleFacePoint(pos, block);
     if (!spot) throw new ActionError(`блок ${block.name} в ${fmt(pos)} не виден или слишком далеко`);
     const a = anglesTo(eyePosition(), spot.point);
-    await settleLook(a.yaw, a.pitch, signal);
-    // Пауза после предыдущего сломанного блока — как у клиента.
-    while (ticks() - lastDestroyTick < DESTROY_DELAY_TICKS) await inTick(() => {}, signal);
+    bot.look(a.yaw, a.pitch, true);
 
-    const needTicks = Math.max(1, Math.round(bot.digTime(block) / 50));
+    let needTicks = 1;
     let face = spot.face;
     let progress = 0;
     let started = false;
+    let waited = 0;
+    let reaims = 0;
     const abortDig = () => {
       if (started && progress < needTicks) bot._client.write('block_dig', { status: 1, location: pos, face: 0, sequence: 0 });
     };
     try {
       await everyTick(() => {
-        const hit = lookedAtBlock(BLOCK_REACH, pos);
-        if (!hit || !hit.position.equals(pos)) throw new ActionError(`блок ${fmt(pos)} ушёл из-под взгляда`);
         if (isAir(blockAt(pos))) return true; // его уже нет (сломал кто-то другой)
+        const hit = lookedAtBlock(BLOCK_REACH, pos);
+        const onTarget = Boolean(hit && hit.position.equals(pos));
         if (!started) {
+          // Удар — в том же тике, когда голова встала на блок и прошла пауза после прошлого (у клиента — на 6-й тик).
+          if (++waited > LOOK_TIMEOUT_TICKS) throw new ActionError('не удалось повернуть голову');
+          if (!bot.serverView.lookSettled || ticks() - lastDestroyTick < DESTROY_DELAY_TICKS) return undefined;
+          if (!onTarget) {
+            // Бот чуть сдвинулся (докатился) — навестись заново.
+            const again = reaims < 3 ? aimAt(pos) : null;
+            if (!again) throw new ActionError(`блок ${fmt(pos)} ушёл из-под взгляда`);
+            reaims += 1;
+            bot.look(again.yaw, again.pitch, true);
+            return undefined;
+          }
           face = hit.face;
+          needTicks = Math.max(1, Math.round(bot.digTime(blockAt(pos)) / 50));
+          if (!Number.isFinite(needTicks)) throw new ActionError(`${block.name} в ${fmt(pos)} этим не сломать`);
           started = true;
           bot._client.write('block_dig', { status: 0, location: pos, face, sequence: nextSequence() });
           swing(); // взмах от нажатия кнопки
           if (needTicks <= 1) {
-            progress = 1; // ломается сразу (трава, факел): только начало, без конца
-            lastDestroyTick = ticks();
+            // Ломается сразу (трава, факел; камень со «Спешкой»): только начало, без конца — и без паузы после,
+            // как у клиента (следующий блок — хоть в следующем тике).
+            progress = 1;
             setLocalBlock(pos, 'air');
             return true;
           }
@@ -694,6 +752,7 @@ function inject(bot, { random, now }) {
           // полное время. Конец на тик раньше Grim копит (FastBreak): за 20 блоков подряд набегает секунда — флаг.
           return undefined;
         }
+        if (!onTarget) throw new ActionError(`блок ${fmt(pos)} ушёл из-под взгляда`);
         progress += 1;
         if (progress >= needTicks) {
           bot._client.write('block_dig', { status: 2, location: pos, face, sequence: nextSequence() });
@@ -702,6 +761,9 @@ function inject(bot, { random, now }) {
           // Как обычный клиент: у себя блок пропадает сразу. Стоял на нём — падает тогда же, когда этого ждёт
           // античит (иначе, пока ответ сервера в пути, бот «висел» бы в воздухе — и Grim откатывал его).
           setLocalBlock(pos, 'air');
+          // Следующий блок — голову к нему сразу (пауза 5 тиков и ответ сервера идут, пока она поворачивается).
+          const aim = next ? aimAt(next) : null;
+          if (aim) bot.look(aim.yaw, aim.pitch, true);
           return true;
         }
         swing(); // пока кнопка зажата — взмах каждый тик
@@ -942,16 +1004,20 @@ function inject(bot, { random, now }) {
         continue;
       }
       const step = path[i];
-      for (const c of step.dig || []) {
+      const cells = step.dig || [];
+      for (let ci = 0; ci < cells.length; ci += 1) {
+        const c = cells[ci];
         if (!solidAt(c)) {
           if (isLiquid(blockAt(c))) return false;
           continue; // уже пусто
         }
         if (breakProblem(c)) return false;
+        // Следом — следующий блок этого шага: голова повернётся к нему сразу после удара.
+        const next = cells.slice(ci + 1).find((n) => solidAt(n)) || null;
         for (let k = 0; k < 4 && solidAt(c); k += 1) {
           if (tool) await equipItem(tool, signal);
           const was = blockAt(c);
-          await digBlock(c, signal);
+          await digBlock(c, signal, { next });
           if (onDig) onDig(was, c);
           if (solidAt(c) && breakProblem(c)) return false; // сверху упало что-то, что ломать нельзя
         }
@@ -966,7 +1032,8 @@ function inject(bot, { random, now }) {
         } else if (step.move === 'drop') {
           await waitLanded(step.y, signal);
         } else {
-          await followPath([step], { range: step.move === 'down' ? 0.15 : 0.25 }, signal);
+          // Шаг в прокопанную клетку — не дожидаясь полной остановки: дальше снова копать (как человек в туннеле).
+          await followPath([step], { range: step.move === 'down' ? 0.15 : 0.25, settle: cells.length ? 0.03 : 0.003 }, signal);
           await waitLanded(step.y, signal);
         }
       } catch (err) {
@@ -995,13 +1062,44 @@ function inject(bot, { random, now }) {
   function digTo(target, { reach = false, range = 0.5, vertical = 0, tool = null, item = null, onDig = null, maxDistance = 48, maxNodes = 8000 } = {}) {
     const goal = reach ? new Vec3(Math.floor(target.x), Math.floor(target.y), Math.floor(target.z)) : new Vec3(target.x, target.y, target.z);
     return run('копать путь', async (signal) => {
+      digHolding = true;
+      try {
+        return await digToInner(goal, { reach, range, vertical, tool, item, onDig, maxDistance, maxNodes }, signal);
+      } finally {
+        digHolding = false;
+      }
+    });
+  }
+
+  /**
+   * Цена сломать блок для поиска пути (в шагах ходьбы, шаг — ~4,6 тика) — по настоящему времени этой киркой: с
+   * «Эффективностью V» камень — 2 тика, а не «как 3 шага». Копание в поиске ещё и дешевле настоящего (TANK) — бот
+   * прокапывается прямо к цели, «как танк», а не обходит по пещерам. Обсидиан и твёрже — не копаем.
+   */
+  function digCostWith(toolName) {
+    const slots = bot.inventory && bot.inventory.slots ? bot.inventory.slots : [];
+    const toolItem = toolName ? slots.find((it) => it && it.name === toolName) || bot.heldItem : bot.heldItem;
+    const timeOf = typeof bot.digTimeWith === 'function'
+      ? (b) => bot.digTimeWith(b, toolItem, { onGround: true, inWater: false })
+      : (b) => bot.digTime(b);
+    return (block) => {
+      if (typeof block.hardness !== 'number' || block.hardness < 0 || block.hardness > MAX_HARDNESS) return null;
+      const t = timeOf(block) / 50;
+      if (!Number.isFinite(t)) return null;
+      const perBlock = t > 1 ? t + DESTROY_DELAY_TICKS : 1; // мгновенно ломается — без паузы после
+      return 0.1 + (perBlock / WALK_TICKS_PER_BLOCK) * TANK;
+    };
+  }
+
+  async function digToInner(goal, { reach, range, vertical, tool, item, onDig, maxDistance, maxNodes }, signal) {
+    {
       let replans = 0;
       let lastLeft = Infinity;
       let noProgress = 0;
       const avoid = new Set(); // шаги, которые не вышли (застрял, не допрыгнул): путь заново — в обход них
       for (;;) {
         const search = (weight, nodes) => findPath(blockAt, bot.entity.position, goal, {
-          dig: true, place: Boolean(item) && countItem(item) > 0, reach, range, vertical, maxDistance, maxNodes: nodes, weight, signal,
+          dig: digCostWith(tool), place: Boolean(item) && countItem(item) > 0, reach, range, vertical, maxDistance, maxNodes: nodes, weight, signal,
           avoid, fast: fastReader(bot.world, bot.registry),
         });
         // К руде — сразу жадный поиск (вес 4): путь почти лучший и находится за миллисекунды. К точке (обратно на
@@ -1036,7 +1134,7 @@ function inject(bot, { random, now }) {
           if (noProgress >= 2) throw new ActionError(`не прокопаться к ${fmt(goal)}: ${res.reason || 'ближе не подойти'}`, 'no_path');
         }
       }
-    });
+    }
   }
 
   /** Нажать правой кнопкой по грани: { position, face, point } — куда навести взгляд. Общая часть place и activate. */
@@ -1187,12 +1285,21 @@ function inject(bot, { random, now }) {
     return !wallBefore(eye, dir, t === null ? len : t);
   }
 
-  /** Ударить сущность: взгляд на неё, удар и взмах; между ударами — пауза восстановления. */
+  /**
+   * Ударить сущность: взгляд на неё, удар и взмах; между ударами — пауза восстановления. Как человек мышью: бьёт,
+   * когда прицел на цели, даже если голова ещё ведёт её (моб ходит — голова не «встаёт» никогда). Прицел на цели —
+   * и по взгляду, что сервер уже знает (прошлый пакет), и по взгляду этого тика.
+   */
   function attack(entity, { cooldownTicks = ATTACK_COOLDOWN_TICKS } = {}) {
     return run('ударить', async (signal) => {
       if (!entity || !entity.position) throw new ActionError('не на кого нападать');
       const boxOf = () => entityBox(entity);
       await standStill(signal);
+      const onTarget = (from, dir) => {
+        const t = rayBox(from, dir, boxOf());
+        if (t === null || t > ENTITY_REACH) return false;
+        return wallBefore(from, dir, t) ? 'wall' : true; // взгляд упирается в блок раньше цели
+      };
       for (let i = 0; i < LOOK_TIMEOUT_TICKS; i += 1) {
         if (!bot.entities || !bot.entities[entity.id]) throw new ActionError('цель пропала');
         const eye = eyePosition();
@@ -1200,14 +1307,14 @@ function inject(bot, { random, now }) {
         if (eye.distanceTo(closestPointOnBox(box, eye)) > ENTITY_REACH) throw new ActionError('цель слишком далеко');
         const a = anglesTo(eye, aimPoint(entity));
         bot.look(a.yaw, a.pitch, true);
-        const ready = bot.serverView.lookSettled && ticks() - lastAttackTick >= cooldownTicks;
+        const ready = ticks() - lastAttackTick >= cooldownTicks;
         if (ready) {
           const done = await inTick(() => {
             const from = eyePosition();
-            const dir = currentLook();
-            const t = rayBox(from, dir, boxOf());
-            if (t === null || t > ENTITY_REACH) return false;
-            if (wallBefore(from, dir, t)) return 'wall'; // взгляд упирается в блок раньше цели
+            const now = onTarget(from, currentLook());
+            const sent = onTarget(from, lookVector(bot.serverView.sentYaw, bot.serverView.sentPitch));
+            if (now === 'wall' && sent === 'wall') return 'wall';
+            if (now !== true || sent !== true) return false; // прицел ещё не на цели — следующий тик
             bot._client.write('use_entity', { target: entity.id, mouse: 1, sneaking: Boolean(bot.getControlState('sneak')) });
             swing();
             lastAttackTick = ticks();
@@ -1221,6 +1328,177 @@ function inject(bot, { random, now }) {
       }
       throw new ActionError('не удалось навести взгляд на цель');
     });
+  }
+
+  // ---------- правая кнопка с предметом: есть, щит ----------
+
+  // Блоки, на которых правая кнопка что-то делает (открыть, нажать, посадить): есть и поднимать щит, глядя на них, нельзя.
+  const INTERACTIVE_RE = /(?:chest|barrel|shulker_box|furnace|smoker|crafting_table|crafter|_door$|trapdoor|fence_gate|button|lever|_bed$|anvil|enchanting_table|brewing_stand|hopper|dispenser|dropper|note_block|repeater|comparator|cake|bell|beacon|lectern|loom|grindstone|stonecutter|smithing_table|cartography_table|fletching_table|composter|cauldron|respawn_anchor|_sign$|campfire|jukebox|flower_pot|daylight_detector|farmland|decorated_pot|chiseled_bookshelf|vault|trial_spawner|command_block|structure_block|jigsaw|redstone_ore|dragon_egg|end_portal_frame|beehive|bee_nest|copper_bulb|crafter)/;
+  const PICKABLE_TYPES = new Set(['player', 'mob', 'hostile', 'animal', 'passive', 'ambient', 'water_creature', 'other']);
+  const USE_RELEASE = { status: 5, location: { x: 0, y: 0, z: 0 }, face: 0, sequence: 0 }; // отпустить правую кнопку
+
+  /** Сущность на луче взгляда ближе блока и не дальше ENTITY_REACH: { entity, t, point } или null. */
+  function entityOnRay(blockHit) {
+    const eye = eyePosition();
+    const dir = currentLook();
+    const limit = Math.min(ENTITY_REACH + 0.1, blockHit ? eye.distanceTo(blockHit.point) : Infinity);
+    let best = null;
+    for (const e of Object.values(bot.entities || {})) {
+      if (!e || e === bot.entity || !e.position || !(PICKABLE_TYPES.has(e.type) || /boat|minecart/.test(e.name || ''))) continue;
+      const t = rayBox(eye, dir, entityBox(e));
+      if (t === null || t > limit || (best && t >= best.t)) continue;
+      best = { entity: e, t, point: eye.plus(dir.scaled(t)) };
+    }
+    return best;
+  }
+
+  /** На что сейчас пришлась бы правая кнопка: { block, entity } (то, что ближе) — и можно ли жать (ничего не откроет). */
+  function useTarget(allowEntity = () => false) {
+    const blockHit = lookedAtBlock(BLOCK_REACH);
+    const entityHit = entityOnRay(blockHit);
+    if (entityHit) return { entityHit, blockHit: null, ok: allowEntity(entityHit.entity) };
+    return { entityHit: null, blockHit, ok: !blockHit || !INTERACTIVE_RE.test(blockHit.block.name || '') };
+  }
+
+  /**
+   * Правая кнопка, как у клиента (Minecraft.startUseItem): для каждой руки по очереди — сначала то, на что смотрит
+   * взгляд (сущность — «нажать в точку» и «нажать», блок — «нажать на грань»), потом сам предмет (use_item с
+   * текущим взглядом). lastHand — рука, у которой выйдет (0 — основная: еда; 1 — вторая: щит); у основной перед ней
+   * ничего не выходит (меч, кирка). Внутри тика.
+   */
+  function pressUse(lastHand, target) {
+    const sneaking = Boolean(bot.getControlState('sneak'));
+    const { yaw, pitch } = bot.serverView.rotationDegrees;
+    for (let hand = 0; hand <= lastHand; hand += 1) {
+      const held = hand === 0 ? bot.heldItem : bot.inventory.slots[45];
+      if (target.entityHit) {
+        const e = target.entityHit.entity;
+        const at = target.entityHit.point.minus(e.position);
+        bot._client.write('use_entity', { target: e.id, mouse: 2, x: at.x, y: at.y, z: at.z, hand, sneaking });
+        bot._client.write('use_entity', { target: e.id, mouse: 0, hand, sneaking });
+      } else if (target.blockHit) {
+        const b = target.blockHit;
+        const cursor = b.point.minus(b.position);
+        bot._client.write('block_place', {
+          hand, location: b.position, direction: b.face, cursorX: clamp01(cursor.x), cursorY: clamp01(cursor.y), cursorZ: clamp01(cursor.z),
+          insideBlock: false, worldBorderHit: false, sequence: nextSequence(),
+        });
+      }
+      if (held) bot._client.write('use_item', { hand, sequence: nextSequence(), rotation: { x: yaw, y: pitch } });
+    }
+    lastUseTick = ticks();
+  }
+
+  /** Повернуть взгляд туда, где правая кнопка ничего не откроет и не посадит (под ноги, вверх, вниз). */
+  async function aimForUse(signal, allowEntity) {
+    if (useTarget(allowEntity).ok) return;
+    for (const pitchDeg of [60, -60, 89, -89]) {
+      await settleLook(bot.entity.yaw, (-pitchDeg * Math.PI) / 180, signal);
+      if (useTarget(allowEntity).ok) return;
+    }
+    throw new ActionError('некуда навести взгляд: правая кнопка что-нибудь откроет');
+  }
+
+  /**
+   * Съесть еду name: в руку, взгляд туда, где правая кнопка ничего не откроет, нажать и держать, пока не съест
+   * (у обычной еды 1,6 с), стоя на месте — как человек. Съел — сервер прибавил сытость или еды в руке стало меньше.
+   */
+  function eat(name) {
+    return run('есть', async (signal) => {
+      await equipItem(name, signal);
+      await standStill(signal);
+      await aimForUse(signal);
+      while (ticks() - lastUseTick < USE_DELAY_TICKS) await inTick(() => {}, signal);
+      const before = { food: bot.food };
+      // Съел — сервер сообщает «предмет использован» (событие сущности 9) и прибавляет сытость. По числу еды в руке
+      // не судим: ячейка от прошлой еды может прийти позже — и бот решил бы, что уже съел (и нажал бы снова).
+      let finished = false;
+      const onStatus = (p) => {
+        if (p && bot.entity && p.entityId === bot.entity.id && p.entityStatus === 9) finished = true;
+      };
+      bot._client.on('entity_status', onStatus);
+      let holding = false;
+      try {
+        await inTick(() => {
+          const target = useTarget();
+          if (!target.ok) throw new ActionError('взгляд ушёл туда, где правая кнопка что-нибудь откроет');
+          pressUse(0, target);
+          holding = true;
+        }, signal);
+        for (let t = 0; t < EAT_MAX_TICKS; t += 1) {
+          await inTick(() => {}, signal);
+          if (finished || (typeof bot.food === 'number' && typeof before.food === 'number' && bot.food > before.food)) {
+            holding = false; // съел — клиент сам перестаёт есть, отпускать нечего
+            return { ate: name, food: bot.food };
+          }
+        }
+        throw new ActionError(`не получилось съесть ${name}: сервер не засчитал`);
+      } finally {
+        bot._client.removeListener('entity_status', onStatus);
+        if (holding) bot._client.write('block_dig', USE_RELEASE);
+      }
+    });
+  }
+
+  /** Положить предмет во вторую руку (щит): переносом в инвентаре, стоя на месте, с паузами, как человек. */
+  function equipOffhand(name) {
+    return run('во вторую руку', async (signal) => {
+      const slots = bot.inventory ? bot.inventory.slots : [];
+      if (slots[45] && slots[45].name === name) return { already: true };
+      const item = slots.find((it, i) => it && it.name === name && i !== 45);
+      if (!item) throw new ActionError(`нет предмета ${name}`);
+      await standStill(signal);
+      await waitTicks(3 + Math.floor(random() * 4), signal);
+      await bot.equip(item, 'off-hand');
+      await waitTicks(2 + Math.floor(random() * 3), signal);
+      return { already: false };
+    });
+  }
+
+  /**
+   * Закрыться щитом (во второй руке) от сущности target: лицом к ней, правая кнопка — и держать, пока until() или
+   * её нет (взорвалась, убежала), но не дольше maxTicks. Щит закрывает от удара и взрыва спереди.
+   */
+  function shield(target, { maxTicks = 60, until = null } = {}) {
+    return run('щит', async (signal) => {
+      const off = bot.inventory && bot.inventory.slots ? bot.inventory.slots[45] : null;
+      if (!off || off.name !== 'shield') throw new ActionError('во второй руке нет щита');
+      await standStill(signal);
+      const facing = () => (target && target.position ? anglesTo(eyePosition(), target.position.offset(0, (target.height || 1.7) * 0.6, 0)) : null);
+      const a = facing();
+      if (a) await settleLook(a.yaw, a.pitch, signal);
+      const allow = (e) => e === target; // нажать на крипера (или другого врага) — ничего не будет
+      while (ticks() - lastUseTick < USE_DELAY_TICKS) await inTick(() => {}, signal);
+      let raised = false;
+      let held = 0;
+      try {
+        await inTick(() => {
+          const t = useTarget(allow);
+          if (!t.ok) throw new ActionError('щит не поднять: правая кнопка что-нибудь откроет');
+          pressUse(1, t);
+          raised = true;
+        }, signal);
+        for (; held < maxTicks; held += 1) {
+          const stop = await inTick(() => {
+            if (!bot.entities || !bot.entities[target.id]) return true;
+            const f = facing();
+            if (f) bot.look(f.yaw, f.pitch, true); // держать лицом к нему (щит закрывает спереди)
+            return Boolean(until && until());
+          }, signal);
+          if (stop) break;
+        }
+      } finally {
+        if (raised) bot._client.write('block_dig', USE_RELEASE);
+      }
+      return { ticks: held };
+    });
+  }
+
+  /** Прервать текущее действие (и очередь) с кодом code — например, «рядом враг» во время добычи. */
+  function interruptActions(reason, code = 'interrupted') {
+    const had = entries.size > 0;
+    abortAll(new ActionError(reason, code));
+    return had;
   }
 
   /**
@@ -1391,6 +1669,10 @@ function inject(bot, { random, now }) {
     activate,
     attack,
     canHit,
+    eat,
+    equipOffhand,
+    shield,
+    interrupt: interruptActions,
     interact,
     clickSlot,
     closeMenu,

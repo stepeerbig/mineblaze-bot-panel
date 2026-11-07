@@ -96,6 +96,117 @@ test('копание: пауза 5 тиков между блоками, как 
   assert.deepEqual(sent.filter((p) => p.name === 'block_dig').map((p) => p.params.sequence), [1, 2, 3, 4]);
 });
 
+test('копание: после блока, что ломается сразу (трава, камень со «Спешкой»), паузы нет — как у клиента', async () => {
+  const { clock, world, bot } = setup();
+  // Тот же блок дважды (трава, потом на её месте камень): голове не нужно поворачиваться — остаётся только пауза.
+  const p = new Vec3(0, 64, 2);
+  world.set(p, 'short_grass');
+  assert.ifError((await runFor(clock, bot.actions.dig(p))).error);
+  world.set(p, 'stone');
+  bot.digTicks.stone = 3;
+  assert.ifError((await runFor(clock, bot.actions.dig(p))).error);
+  const sent = take(bot);
+  const starts = sent.map((x, i) => (x.name === 'block_dig' && x.params.status === 0 ? i : -1)).filter((i) => i >= 0);
+  assert.equal(starts.length, 2);
+  const gap = sent.slice(starts[0], starts[1]).filter((x) => x.name === 'tick_end').length;
+  assert.ok(gap < 5, `второй удар — сразу, как сервер ответил, без паузы 5 тиков: ${gap}`);
+});
+
+test('копание туннелем, как с зажатой кнопкой: в паузе между блоками рука машет каждый тик, следующий удар — на 6-й тик', async () => {
+  const { clock, world, bot } = setup();
+  // Закрытый коридор шириной в блок: к цели — только сквозь стенку из двух блоков (голова, ноги).
+  for (let z = 1; z <= 5; z += 1) for (const x of [-1, 1]) for (const y of [64, 65]) world.set(new Vec3(x, y, z), 'stone');
+  for (const y of [64, 65]) {
+    world.set(new Vec3(0, y, 2), 'stone');
+    world.set(new Vec3(0, y, 5), 'stone');
+  }
+  bot.digTicks.stone = 3;
+  const res = await runFor(clock, bot.actions.digTo(new Vec3(0.5, 64, 3.5), { range: 0.4 }));
+  assert.ifError(res.error);
+  const sent = take(bot);
+  const at = (status) => sent.map((p, i) => (p.name === 'block_dig' && p.params.status === status ? i : -1)).filter((i) => i >= 0);
+  const [starts, stops] = [at(0), at(2)];
+  assert.equal(stops.length, 2, 'два блока: голова и ноги');
+  const pause = byTick(sent.slice(stops[0] + 1, starts[1]));
+  assert.equal(sent.slice(stops[0], starts[1]).filter((p) => p.name === 'tick_end').length, 6, 'удар по второму — на 6-й тик после первого');
+  const quiet = pause.filter((tick) => tick.some((p) => p.name === 'tick_end') && !tick.some((p) => p.name === 'arm_animation'));
+  assert.equal(quiet.length, 0, `в паузе рука машет каждый тик (тихих тиков: ${quiet.length})`);
+});
+
+test('удар: моб ходит (голова его ведёт и не «встаёт») — бьёт, как человек мышью: когда прицел на нём', async () => {
+  const { clock, bot } = setup();
+  const zombie = { id: 801, type: 'hostile', name: 'zombie', position: new Vec3(0.5, 64, 2.3), width: 0.6, height: 1.95 };
+  bot.entities[801] = zombie;
+  let tick = 0;
+  bot.on('physicsTick', () => {
+    tick += 1;
+    zombie.position = new Vec3(0.5 + 0.15 * Math.sin(tick / 2), 64, 2.3); // переминается с ноги на ногу
+  });
+  const res = await runFor(clock, bot.actions.attack(zombie));
+  assert.ifError(res.error);
+  const sent = take(bot);
+  const hits = sent.filter((p) => p.name === 'use_entity' && p.params.mouse === 1);
+  assert.equal(hits.length, 1, 'ударил');
+});
+
+test('еда: в руку, правая кнопка (use_item с тем взглядом, что в пакетах) и держать, пока сервер не засчитает', async () => {
+  const { clock, bot } = setup();
+  bot.inventory.slots[37] = { name: 'bread', count: 3 };
+  bot.food = 10;
+  // Сервер: через 32 тика после use_item хлеба меньше, сытость +5.
+  let tick = 0;
+  let usedAt = null;
+  bot.on('physicsTick', () => {
+    tick += 1;
+    if (usedAt !== null && tick - usedAt === 32) {
+      bot.inventory.slots[37].count -= 1;
+      bot.food = 15;
+      bot.emit('health');
+      usedAt = null;
+    }
+  });
+  const write = bot._client.write;
+  bot._client.write = (name, params) => {
+    write(name, params);
+    if (name === 'use_item' && bot.heldItem && bot.heldItem.name === 'bread') usedAt = tick;
+  };
+  const res = await runFor(clock, bot.actions.eat('bread'));
+  assert.ifError(res.error);
+  assert.equal(bot.food, 15);
+  const sent = take(bot);
+  const uses = sent.filter((p) => p.name === 'use_item');
+  assert.equal(uses.length, 1, 'одно нажатие — и держит');
+  assert.equal(uses[0].params.hand, 0);
+  const look = lastLook(sent, sent.indexOf(uses[0])) || { yaw: 0, pitch: 0 }; // голова не двигалась — взгляд с телепорта
+  assert.ok(Math.abs(uses[0].params.rotation.x - look.yaw) < 1e-6 && Math.abs(uses[0].params.rotation.y - look.pitch) < 1e-6, 'взгляд в нажатии — как в пакетах движения');
+  assert.ok(!sent.some((p) => p.name === 'block_dig' && p.params.status === 5), 'съел — отпускать нечего (клиент сам перестаёт)');
+  const moves = sent.filter((p) => /^position/.test(p.name));
+  assert.ok(moves.every((p) => Math.abs(p.params.x - 0.5) < 1e-6 && Math.abs(p.params.z - 0.5) < 1e-6), 'ел стоя на месте');
+});
+
+test('щит: лицом к криперу, правая кнопка как у клиента (основная рука — ничего, вторая — щит), держать, пока он есть', async () => {
+  const { clock, bot } = setup();
+  bot.inventory.slots[36] = { name: 'iron_sword', count: 1 };
+  bot.heldItem = bot.inventory.slots[36];
+  bot.inventory.slots[45] = { name: 'shield', count: 1 };
+  const creeper = { id: 501, type: 'hostile', name: 'creeper', position: new Vec3(0.5, 64, 3.2), width: 0.6, height: 1.7 };
+  bot.entities[501] = creeper;
+  let tick = 0;
+  bot.on('physicsTick', () => {
+    if ((tick += 1) === 40) delete bot.entities[501]; // взорвался
+  });
+  const res = await runFor(clock, bot.actions.shield(creeper, { maxTicks: 200 }));
+  assert.ifError(res.error);
+  const sent = take(bot);
+  const order = sent.filter((p) => p.name === 'use_entity' || p.name === 'use_item').map((p) => `${p.name}:${p.params.mouse !== undefined ? p.params.mouse : ''}:${p.params.hand}`);
+  // Крипер под взглядом (ближе 3 блоков): у каждой руки — «нажать в точку» и «нажать», потом сам предмет.
+  assert.deepEqual(order, ['use_entity:2:0', 'use_entity:0:0', 'use_item::0', 'use_entity:2:1', 'use_entity:0:1', 'use_item::1']);
+  const pressed = sent.findIndex((p) => p.name === 'use_item');
+  const release = sent.findIndex((p) => p.name === 'block_dig' && p.params.status === 5);
+  assert.ok(release > pressed, 'крипера нет — щит опущен');
+  assert.ok(!sent.some((p) => p.name === 'use_entity' && p.params.mouse === 1), 'со щитом не бьёт');
+});
+
 test('установка: нажатие по видимой грани соседа, курсор — точка под взглядом, пауза 4 тика', async () => {
   const { clock, world, bot } = setup();
   bot.inventory.slots[36] = { name: 'cobblestone' };

@@ -154,7 +154,7 @@ function physicsBot({ clock, world, tickEnd = true, actions = false, random = 0.
  * (prismarine-windows): shift-клик переносит стопку, как в игре (reject — сервер не даёт), при закрытии
  * инвентарь из окна переписывается в bot.inventory, как у mineflayer.
  */
-function autoServer(bot, world, { chests = {}, storage = {}, npcs = {}, onClick = null, denyDig = false, fakeOres = null } = {}) {
+function autoServer(bot, world, { chests = {}, storage = {}, npcs = {}, onClick = null, denyDig = false, fakeOres = null, hiddenOres = null } = {}) {
   const write = bot._client.write;
   bot.currentWindow = null;
   bot.clicks = [];
@@ -231,6 +231,18 @@ function autoServer(bot, world, { chests = {}, storage = {}, npcs = {}, onClick 
             answer(p);
           }
         }
+        // Анти-X-ray прячет настоящую: hiddenOres { 'x,y,z': руда } — у бота камень, пока в 2 блоках «крестом»
+        // от неё не сломают блок; тогда сервер присылает клетку (так открывает Paper).
+        if (hiddenOres) {
+          for (const [key, ore] of Object.entries(hiddenOres)) {
+            const [x, y, z] = key.split(',').map(Number);
+            if (Math.abs(x - at.x) + Math.abs(y - at.y) + Math.abs(z - at.z) > 2) continue;
+            delete hiddenOres[key];
+            const p = new Vec3(x, y, z);
+            world.set(p, ore);
+            answer(p);
+          }
+        }
       }
     } else if (name === 'block_place') {
       const loc = new Vec3(params.location.x, params.location.y, params.location.z);
@@ -245,11 +257,14 @@ function autoServer(bot, world, { chests = {}, storage = {}, npcs = {}, onClick 
         const items = chests[`${loc.x},${loc.y},${loc.z}`] || [];
         bot.currentWindow = { title: clicked, containerItems: () => items.map((it) => ({ ...it })) };
         bot.emit('windowOpen', bot.currentWindow);
-      } else if (bot.heldItem) {
-        // Семена на грядку — росток; блок в руке — сам блок.
+      } else if (bot.heldItem && !params.hand) {
+        // Семена на грядку — росток; блок в руке — сам блок; не блок (меч, еда) — ничего, как у сервера.
         const PLANTS = { wheat_seeds: 'wheat', carrot: 'carrots', potato: 'potatoes', beetroot_seeds: 'beetroots', nether_wart: 'nether_wart' };
-        world.set(loc.plus(FACE_VECTORS[params.direction]), PLANTS[bot.heldItem.name] || bot.heldItem.name);
-        answer(loc.plus(FACE_VECTORS[params.direction]));
+        const placed = PLANTS[bot.heldItem.name] || bot.heldItem.name;
+        if (bot.registry.blocksByName[placed]) {
+          world.set(loc.plus(FACE_VECTORS[params.direction]), placed);
+          answer(loc.plus(FACE_VECTORS[params.direction]));
+        }
       }
     }
   };

@@ -15,6 +15,7 @@ const {
 const { isStorageWindow } = require('./window-clicks');
 const { moveStacks, countIn, itemsIn, storageSlots, playerSlots } = require('./chests');
 const { sanitizeXray, scanXray, findEntries, registryOf } = require('./xray');
+const { createGuard, prepareShield, cooldownFor, eatIfHungry } = require('./survival');
 
 const MAX_WALK = 256; // за раз дальше не ходим: путь ищется по загруженному миру, дальше — по ходу
 const MAX_STEPS = 32; // «#вперёд N»: не больше
@@ -1701,16 +1702,6 @@ function rememberKillGoals(bot, title, quests) {
   lastKillGoals.get(key).set(npc, goals);
 }
 
-/** Пауза между ударами под оружие (полная сила удара в 1.21): меч — 0,625 с, топор — около 1 с. */
-function cooldownFor(item) {
-  const name = item ? item.name : '';
-  if (/_sword$/.test(name)) return 13;
-  if (/_axe$/.test(name)) return 21;
-  if (name === 'trident') return 19;
-  if (name === 'mace') return 34;
-  return 10;
-}
-
 const hasCustomName = (e) => {
   try {
     return typeof e.getCustomName === 'function' && Boolean(e.getCustomName());
@@ -1764,6 +1755,7 @@ async function fight(bot, goals, { idleMs = FIGHT_IDLE_MS, maxMs = FIGHT_MAX_MS 
       }
       const target = fightTargets(bot, mobs)[0];
       if (!target) {
+        if (await eatIfHungry(bot)) continue; // пока никого — поесть, если голоден
         if (idle >= idleMs) {
           note = `рядом никого ${Math.round(idleMs / 1000)} с`;
           break;
@@ -2274,18 +2266,18 @@ const feetY = (bot) => Math.floor(bot.entity.position.y + 0.01);
  * Вернуться туда, откуда начал копать: по выкопанному, где нужно — «столбом» (блок под себя) или прокапываясь.
  * Туда не выходит — хотя бы на ту же высоту рядом. → { ok, moved, y, why? }
  */
-async function climbBack(bot, start, opts) {
+async function climbBack(bot, start, opts, guarded = (fn) => fn()) {
   const startY = Math.floor(start.y + 0.01);
   if (bot.entity.position.distanceTo(start) < 1.5) return { ok: true, moved: false, y: startY };
   try {
-    await bot.actions.digTo(start, { range: 0.6, vertical: 0, maxDistance: 160, maxNodes: 30000, ...opts() });
+    await guarded(() => bot.actions.digTo(start, { range: 0.6, vertical: 0, maxDistance: 160, maxNodes: 30000, ...opts() }));
     return { ok: true, moved: true, y: startY };
   } catch (err) {
     if (isFatal(err)) throw err;
     if (feetY(bot) >= startY) return { ok: false, moved: false, y: feetY(bot), why: err.message };
     try {
       const p = bot.entity.position;
-      await bot.actions.digTo(new Vec3(p.x, startY, p.z), { range: 6, vertical: 0, maxDistance: 32, maxNodes: 20000, ...opts() });
+      await guarded(() => bot.actions.digTo(new Vec3(p.x, startY, p.z), { range: 6, vertical: 0, maxDistance: 32, maxNodes: 20000, ...opts() }));
       return { ok: true, moved: true, y: startY, nearby: true };
     } catch (err2) {
       if (isFatal(err2)) throw err2;
@@ -2359,6 +2351,7 @@ async function mine(bot, ore, want, pick) {
   };
   let queue = [];
   let scannedAt = null;
+  const revealed = []; // руда, которую сервер только что открыл рядом с ходом
   async function rescan() {
     const r = await scanXray(bot, { blocks: oreEntries, lava: false, radius: MINE_SCAN_CHUNKS }, { limit: 256 });
     const here = bot.entity.position;
@@ -2370,6 +2363,11 @@ async function mine(bot, ore, want, pick) {
     scannedAt = here.clone();
   }
   async function nextTarget() {
+    // Только что открылась рядом (сервер прислал клетку, пока бот копал ход) — её первой.
+    while (revealed.length) {
+      const p = revealed.shift();
+      if (isOre(p) && usable(p) && !skip.has(posKey(p))) return p;
+    }
     if (lastOre) {
       const vein = AROUND.map((d) => lastOre.plus(d)).find((p) => isOre(p) && usable(p));
       if (vein) return vein;
@@ -2382,94 +2380,150 @@ async function mine(bot, ore, want, pick) {
     }
     return null;
   }
-  const yaw = bot.entity.yaw;
-  let dir = Math.abs(Math.sin(yaw)) > Math.abs(Math.cos(yaw)) ? new Vec3(-Math.sign(Math.sin(yaw)), 0, 0) : new Vec3(0, 0, -Math.sign(Math.cos(yaw)));
-  while (mined < want) {
-    if (freeSlots(bot) === 0) {
-      note = 'инвентарь полон';
-      break;
-    }
-    if (Date.now() - started > MINE_MAX_MS) {
-      note = 'прошло 15 мин — на один раз хватит';
-      break;
-    }
-    if (rejected >= 2) {
-      note = MINE_DENIED;
-      break;
-    }
-    if (!toolNow()) {
-      note = 'кирка сломалась — дай боту новую';
-      break;
-    }
-    const target = await nextTarget();
-    if (target) {
-      const key = posKey(target);
-      skip.add(key);
+  // Сторож: враг рядом или пора поесть — текущее действие прерывается (код «threat»), бот отбивается или ест и
+  // продолжает то же самое (src/bot/survival.js). Щит — во вторую руку: от крипера.
+  const guard = createGuard(bot);
+  const guarded = async (fn) => {
+    for (let i = 0; ; i += 1) {
       try {
-        await bot.actions.digTo(target, { reach: true, maxDistance: MINE_REACH, ...opts() });
-        const b = bot.blockAt(target);
-        if (b && ids.has(b.name)) {
-          const tool = toolNow();
-          if (tool) await bot.actions.equip(tool);
-          await bot.actions.dig(target);
-          onDig(b, target);
-        } else if (!dugAt.has(key)) {
-          // Дошёл — а руды нет, и ломал её не он: сервер показывал ненастоящую (анти-X-ray), подошёл — открыл камень.
-          vanished += 1;
-          if (vanished >= 2) antiXray = true;
-        }
+        return await fn();
       } catch (err) {
-        if (isFatal(err)) throw err;
-        failed(err); // не прокопаться (вода, лава, бедрок, сервер не дал) — к следующей
-      }
-      continue;
-    }
-    // Руды рядом не видно: вглубь к лучшей высоте, на ней — вбок; и снова искать.
-    if (hops >= MINE_MAX_HOPS) {
-      note = `рядом руды нет — ${hops} раз копал дальше и искал снова, на один раз хватит`;
-      break;
-    }
-    hops += 1;
-    const feet = bot.entity.position.floored();
-    const deeper = feet.y > ore.best + 1 && feet.y > MINE_FLOOR_Y;
-    let moved = false;
-    for (let turn = 0; turn < 4 && !moved; turn += 1) {
-      const down = Math.min(MINE_HOP_DOWN, feet.y - Math.max(ore.best, MINE_FLOOR_Y));
-      const to = deeper ? feet.offset(dir.x * 4 * Math.sign(turn), -down, dir.z * 4 * Math.sign(turn)) : feet.plus(dir.scaled(MINE_HOP_SIDE));
-      try {
-        await bot.actions.digTo(to, { range: deeper ? 2.5 : 1.5, vertical: 0, maxDistance: 24, ...opts() });
-        moved = true;
-      } catch (err) {
-        if (isFatal(err)) throw err;
-        failed(err);
-        if (rejected >= 2) break;
-        dir = new Vec3(-dir.z, 0, dir.x); // туда не прокопаться — в другую сторону
+        if (!err || err.code !== 'threat' || i >= 30) throw err;
+        await guard.handle();
       }
     }
-    if (rejected >= 2) {
-      note = MINE_DENIED;
-      break;
-    }
-    if (!moved) {
-      const last = [...fails.keys()].pop();
-      note = `дальше не прокопаться${last ? `: ${last}` : ''}`;
-      break;
-    }
-  }
-  const back = await climbBack(bot, start, opts);
-  const toolEnd = toolNow();
-  if (toolEnd && back.moved) {
-    try {
-      await bot.actions.equip(toolEnd); // после столба в руке булыжник — снова кирку
-    } catch (err) {
-      if (isFatal(err)) throw err;
-    }
-  }
-  return {
-    mined, dug, hops, note, denied: rejected >= 2, antiXray, vanished,
-    fails: [...fails].map(([text, count]) => ({ text, count })).sort((a, b) => b.count - a.count),
-    y: feetY(bot), startY: Math.floor(start.y + 0.01), back,
   };
+  // Анти-X-ray открывает настоящую руду, когда рядом ломают блоки: сервер присылает клетку. Нужная руда открылась
+  // рядом, пока бот копает ход (или идёт к дальней), — бросить ход и взять её сразу.
+  let roaming = false; // идёт ход или путь к руде (их можно прервать ради открывшейся рядом)
+  const onBlock = (oldBlock, newBlock) => {
+    if (!newBlock || !newBlock.position || !ids.has(newBlock.name) || (oldBlock && ids.has(oldBlock.name))) return;
+    const p = newBlock.position;
+    if (skip.has(posKey(p)) || p.distanceTo(bot.entity.position) > 6) return;
+    revealed.push(p.clone());
+    if (roaming && !guard.busy && bot.actions.busy) bot.actions.interrupt('рядом открылась руда', 'found');
+  };
+  bot.on('blockUpdate', onBlock);
+  guard.start();
+  try {
+    return await mineLoop();
+  } finally {
+    guard.stop();
+    bot.removeListener('blockUpdate', onBlock);
+  }
+
+  async function mineLoop() {
+    await guarded(() => prepareShield(bot));
+    const yaw = bot.entity.yaw;
+    let dir = Math.abs(Math.sin(yaw)) > Math.abs(Math.cos(yaw)) ? new Vec3(-Math.sign(Math.sin(yaw)), 0, 0) : new Vec3(0, 0, -Math.sign(Math.cos(yaw)));
+    while (mined < want) {
+      if (guard.wants()) await guard.handle();
+      if (freeSlots(bot) === 0) {
+        note = 'инвентарь полон';
+        break;
+      }
+      if (Date.now() - started > MINE_MAX_MS) {
+        note = 'прошло 15 мин — на один раз хватит';
+        break;
+      }
+      if (rejected >= 2) {
+        note = MINE_DENIED;
+        break;
+      }
+      if (!toolNow()) {
+        note = 'кирка сломалась — дай боту новую';
+        break;
+      }
+      const target = await nextTarget();
+      if (target) {
+        const key = posKey(target);
+        skip.add(key);
+        try {
+          roaming = true;
+          try {
+            await guarded(() => bot.actions.digTo(target, { reach: true, maxDistance: MINE_REACH, ...opts() }));
+          } finally {
+            roaming = false;
+          }
+          const b = bot.blockAt(target);
+          if (b && ids.has(b.name)) {
+            const tool = toolNow();
+            if (tool) await guarded(() => bot.actions.equip(tool));
+            await guarded(() => bot.actions.dig(target));
+            onDig(b, target);
+          } else if (!dugAt.has(key)) {
+            // Дошёл — а руды нет, и ломал её не он: сервер показывал ненастоящую (анти-X-ray), подошёл — открыл камень.
+            vanished += 1;
+            if (vanished >= 2) antiXray = true;
+          }
+        } catch (err) {
+          if (isFatal(err)) throw err;
+          if (err && err.code === 'found') {
+            // По дороге рядом открылась руда — сначала её, к этой — потом.
+            skip.delete(key);
+            queue.unshift(target);
+            continue;
+          }
+          failed(err); // не прокопаться (вода, лава, бедрок, сервер не дал) — к следующей
+        }
+        continue;
+      }
+      // Руды рядом не видно: вглубь к лучшей высоте, на ней — вбок; и снова искать.
+      if (hops >= MINE_MAX_HOPS) {
+        note = `рядом руды нет — ${hops} раз копал дальше и искал снова, на один раз хватит`;
+        break;
+      }
+      hops += 1;
+      const feet = bot.entity.position.floored();
+      const deeper = feet.y > ore.best + 1 && feet.y > MINE_FLOOR_Y;
+      let moved = false;
+      for (let turn = 0; turn < 4 && !moved; turn += 1) {
+        const down = Math.min(MINE_HOP_DOWN, feet.y - Math.max(ore.best, MINE_FLOOR_Y));
+        const to = deeper ? feet.offset(dir.x * 4 * Math.sign(turn), -down, dir.z * 4 * Math.sign(turn)) : feet.plus(dir.scaled(MINE_HOP_SIDE));
+        try {
+          roaming = true;
+          try {
+            await guarded(() => bot.actions.digTo(to, { range: deeper ? 2.5 : 1.5, vertical: 0, maxDistance: 24, ...opts() }));
+          } finally {
+            roaming = false;
+          }
+          moved = true;
+        } catch (err) {
+          if (isFatal(err)) throw err;
+          if (err && err.code === 'found') {
+            moved = true; // ход прерван: рядом открылась руда — за ней
+            break;
+          }
+          failed(err);
+          if (rejected >= 2) break;
+          dir = new Vec3(-dir.z, 0, dir.x); // туда не прокопаться — в другую сторону
+        }
+      }
+      if (rejected >= 2) {
+        note = MINE_DENIED;
+        break;
+      }
+      if (!moved) {
+        const last = [...fails.keys()].pop();
+        note = `дальше не прокопаться${last ? `: ${last}` : ''}`;
+        break;
+      }
+    }
+    const back = await climbBack(bot, start, opts, guarded);
+    const toolEnd = toolNow();
+    if (toolEnd && back.moved) {
+      try {
+        await guarded(() => bot.actions.equip(toolEnd)); // после столба в руке булыжник — снова кирку
+      } catch (err) {
+        if (isFatal(err)) throw err;
+      }
+    }
+    return {
+      mined, dug, hops, note, denied: rejected >= 2, antiXray, vanished,
+      fails: [...fails].map(([text, count]) => ({ text, count })).sort((a, b) => b.count - a.count),
+      y: feetY(bot), startY: Math.floor(start.y + 0.01), back, guard: guard.stats,
+    };
+  }
 }
 
 /** Лучшая подходящая для руды кирка в инвентаре (имя) или null. */
@@ -2544,6 +2598,15 @@ async function cmdMine({ bot, args: allArgs, words = [] }) {
     lines.push(`Похоже, на сервере анти-X-ray: ${r.vanished} раз дошёл до руды — а там камень (сервер показывает ненастоящую). ` +
       'Дальше брал только открытую — у пещер и в своих ходах; рентген в «Экране бота» тоже показывает и ненастоящую');
   }
+  const g = r.guard || {};
+  if (g.kills) {
+    const byName = new Map();
+    for (const n of g.killed || []) byName.set(n, (byName.get(n) || 0) + 1);
+    lines.push(`Отбился от мобов: ${[...byName].map(([n, k]) => `${mobName(n)} ×${k}`).join(', ')}`);
+  }
+  if (g.blocked) lines.push(`От крипера закрывался щитом: ${g.blocked} ${plural(g.blocked, 'раз', 'раза', 'раз')}`);
+  if (g.ate) lines.push(`Поел: ${g.ate} ${plural(g.ate, 'раз', 'раза', 'раз')}`);
+  if (g.hungry) lines.push('Голоден, а еды нет — положи боту еду (хлеб, жареное мясо)');
   if (r.note && !r.denied) lines.push(`Остановился: ${r.note}`);
   if (!r.mined && !r.denied && r.fails.length) {
     lines.push(`Не прокопался к руде: ${r.fails.slice(0, 2).map((f) => `${f.text}${f.count > 1 ? ` (×${f.count})` : ''}`).join('; ')}`);
@@ -2560,6 +2623,26 @@ async function cmdMine({ bot, args: allArgs, words = [] }) {
 // ---------- рентген: что из списка (руды, спавнеры…) есть в загруженных чанках вокруг ----------
 
 const XRAY_TOP = 10; // строк с координатами, когда спрашивают про один блок
+const HIDDEN_MIN = 12; // столько руды «только у воздуха» — уже не случайность
+
+/** Руда вся у воздуха (пещеры, ходы), а в толще камня — ни одной? Так бывает, когда сервер её прячет. → { total, buried } */
+function oreExposure(bot, groups) {
+  let total = 0;
+  let buried = 0;
+  const open = (b) => !b || !b.shapes || !b.shapes.length || /(?:air|water|lava|glass|leaves|ice|slab|stairs|torch|pane|fence|wall)/.test(b.name);
+  for (const g of groups) {
+    if (!/(?:_ore|ancient_debris)$/.test(g.key || '')) continue;
+    for (let i = 0; i < g.positions.length && total < 400; i += 3) {
+      const p = new Vec3(g.positions[i], g.positions[i + 1], g.positions[i + 2]);
+      total += 1;
+      if (!SIDES.some((d) => open(bot.blockAt(p.plus(d))))) buried += 1;
+    }
+  }
+  return { total, buried };
+}
+const HIDDEN_ORE_NOTE = 'Вся найденная руда — у воздуха (пещеры, шахты), а в толще камня — ни одной: так бывает, когда сервер прячет руду ' +
+  '(анти-X-ray) — вместо неё присылает камень, и её не видит ни мод, ни бот. Настоящую сервер открывает, когда рядом ломают блоки ' +
+  '(в 2 блоках от выкопанного): #добудь так её и находит — копает ходы на нужной высоте и сразу берёт открывшуюся';
 
 /**
  * «#рентген» — что из списка рентгена (настройки панели, «Экран бота» → G) есть вокруг и где ближайшее;
@@ -2612,12 +2695,16 @@ async function cmdXray({ bot, args, words = [] }) {
     const none = r.groups.filter((g) => !g.count).map((g) => g.label.toLowerCase());
     if (none.length) lines.push(`Нет: ${none.join(', ')}`);
   }
+  const exposure = oreExposure(bot, found);
+  const hidden = exposure.total >= HIDDEN_MIN && exposure.buried === 0;
+  if (hidden) lines.push(HIDDEN_ORE_NOTE);
   return {
     ok: true,
     message: lines,
     data: {
       radius: r.radius,
       total: r.total,
+      hiddenOre: hidden,
       groups: r.groups.map((g) => ({ key: g.key, label: g.label, count: g.count, nearest: g.nearest, positions: g.positions.slice(0, XRAY_TOP * 3) })),
     },
   };
@@ -2812,8 +2899,9 @@ const COMMANDS = [
     about: 'добыть руду (уголь, медь, железо, лазурит, золото, редстоун, алмазы, изумруды; в Незере — кварц, золото, древние обломки): ' +
       'нет подходящей кирки — берёт её в сундуке на общем доме («дом X» или «Дом склада» из настроек), потом /rtp и копает там ' +
       '(«здесь» — на месте); находит руду в чанках вокруг и прокапывается прямо к ней — вперёд, под себя, ступеньками, сначала жила; ' +
-      'рядом нет — вглубь к лучшей высоте (железо Y≈16, алмазы и редстоун Y≈−58…), там ходами вбок; потом обратно на свою высоту ' +
-      '(где нужно — «столбом»); у воды, лавы, под гравием не копает; где копать нельзя — скажет сразу; не нашёл — скажет, где искать',
+      'рядом нет — вглубь к лучшей высоте (железо Y≈16, алмазы и редстоун Y≈−58…), там ходами вбок (открылась руда у хода — сразу к ней); ' +
+      'потом обратно на свою высоту (где нужно — «столбом»); за работой ест (хлеб, мясо из инвентаря) и отбивается от мобов мечом, ' +
+      'от крипера — щитом во второй руке; у воды, лавы, под гравием не копает; где копать нельзя — скажет сразу; не нашёл — скажет, где искать',
     run: cmdMine,
   },
   {

@@ -13,12 +13,14 @@
 //    любой клик в сундуке уходил с чужим номером, и сервер в ответ пересылал всё окно заново. Как в игре:
 //    клик несёт номер того окна, в котором кликают.
 // 4. Зачарования предметов 1.20.5+ mineflayer отдаёт объектом, а ждёт список: bot.digTime падал
-//    («enchantments is not iterable») у любой зачарованной кирки — бот не мог копать.
+//    («enchantments is not iterable») у любой зачарованной кирки — бот не мог копать. Теперь время копания
+//    считается как в игре 1.21 — src/bot/dig-speed.js (там же — почему руда копалась в разы дольше).
 // 5. Shift-клик в сундуке (перенос стопки) prismarine-windows считает не как игра: в сундук — мимо последней
 //    его ячейки, стопки сравнивает без компонентов. Ошибка в прогнозе — сервер в ответ поправляет ячейки.
 //    Здесь — как в игре (AbstractContainerMenu.moveItemStackTo), см. quickMove.
 
 const { toHashedSlot } = require('./item-hash');
+const { trackServerEnchantments, enchantmentsOf, digTicks } = require('./dig-speed');
 
 // Окна-хранилища: сундук и большой сундук, бочка, эндер-сундук (generic_9xN), раздатчик (generic_3x3),
 // шалкер, воронка. Сначала ячейки хранилища, за ними 36 ячеек инвентаря игрока.
@@ -157,32 +159,14 @@ function windowClicksPlugin(bot) {
     bot.emit('cursorItem', window.selectedItem);
   });
 
-  // Зачарования списком {name, lvl}, как их ждёт prismarine-block (у предметов с компонентами — {id, level}).
-  const enchantList = (item) => {
-    if (!item) return [];
-    let e;
-    try {
-      e = item.enchants;
-    } catch (_) {
-      return [];
-    }
-    if (Array.isArray(e)) return e;
-    const list = e && Array.isArray(e.enchantments) ? e.enchantments : [];
-    return list.map((x) => ({ name: (bot.registry.enchantments && bot.registry.enchantments[x.id] && bot.registry.enchantments[x.id].name) || '', lvl: x.level }));
-  };
-  bot.enchantsOf = enchantList;
+  // Зачарования списком {name, lvl} (у предметов с компонентами — {id, level}; номера — по списку сервера).
+  trackServerEnchantments(bot);
+  bot.enchantsOf = (item) => enchantmentsOf(bot, item);
   if (typeof bot.digTime === 'function') {
-    // Как digTime в mineflayer (инструмент в руке, зачарования руки и шлема, вода, земля под ногами, эффекты).
-    bot.digTime = (block) => {
-      const held = bot.heldItem;
-      const headSlot = typeof bot.getEquipmentDestSlot === 'function' ? bot.getEquipmentDestSlot('head') : 5;
-      const head = bot.inventory && bot.inventory.slots ? bot.inventory.slots[headSlot] : null;
-      const creative = Boolean(bot.game && bot.game.gameMode === 'creative');
-      const e = bot.entity;
-      const eyeBlock = e && e.position && typeof bot.blockAt === 'function' ? bot.blockAt(e.position.offset(0, e.eyeHeight, 0)) : null;
-      const inWater = Boolean(eyeBlock && ['water', 'flowing_water'].includes(eyeBlock.name));
-      return block.digTime(held ? held.type : null, creative, inWater, !(e && e.onGround), [...enchantList(held), ...enchantList(head)], (e && e.effects) || {});
-    };
+    // Время копания — как у игры 1.21 (src/bot/dig-speed.js): инструмент, «Эффективность», эффекты, вода, земля
+    // под ногами. digTimeWith — той вещью, что ещё не в руке (цена копания при поиске пути).
+    bot.digTime = (block) => digTicks(bot, block) * 50;
+    bot.digTimeWith = (block, item, opts) => digTicks(bot, block, item, opts) * 50;
   }
 
   const hashed = usesHashedSlots(bot.registry);
