@@ -35,6 +35,7 @@ const el = {
   guardTag: $('guardTag'),
   guardOn: $('guardOn'),
   godOn: $('godOn'),
+  liveBg: $('liveBg'),
   whitelist: $('whitelist'),
   questTag: $('questTag'),
   questToggle: $('questToggle'),
@@ -445,6 +446,8 @@ function fillForm(cfg) {
   el.joinCommands.value = cfg.joinCommands || '';
   el.guardOn.checked = cfg.guard !== false;
   el.godOn.checked = cfg.godMode !== false;
+  el.liveBg.checked = cfg.liveBackground !== false;
+  applyLiveBackground();
   if (document.activeElement !== el.whitelist) el.whitelist.value = cfg.whitelist || '';
   for (const key of ['aiKey', 'aiModel', 'aiBaseUrl', 'ollamaModel', 'ollamaUrl']) {
     if (document.activeElement !== el[key]) el[key].value = cfg[key] || '';
@@ -786,6 +789,15 @@ el.guardOn.addEventListener('change', () => {
 el.godOn.addEventListener('change', () => {
   updateGuardTag();
   bridge.saveConfig({ godMode: el.godOn.checked });
+});
+
+// Живой фон «Вороны» (background.js): галочка «Живой фон» в «Вид».
+function applyLiveBackground() {
+  if (window.liveBackground) window.liveBackground.setEnabled(el.liveBg.checked);
+}
+el.liveBg.addEventListener('change', () => {
+  applyLiveBackground();
+  bridge.saveConfig({ liveBackground: el.liveBg.checked });
 });
 
 // Белый список уходит ботам прямо во время набора (с небольшой паузой), перезапуск не нужен.

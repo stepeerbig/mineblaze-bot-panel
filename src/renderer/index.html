@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <canvas id="bg" aria-hidden="true" hidden></canvas>
   <div class="app">
     <aside class="side">
       <div class="status">
@@ -223,6 +224,11 @@
         </label>
         <p class="hint">Действует сразу, перезапускать ботов не нужно. Можно писать и ник, и имя, которое показывает /near.</p>
       </details>
+
+      <div class="group">
+        <div class="group-title">Вид</div>
+        <label class="check" title="Рисует только окно — на ботов не влияет. Свёрнутое окно фон не рисует"><input id="liveBg" type="checkbox" checked><span>Живой фон: вороны разлетаются от курсора</span></label>
+      </div>
     </aside>
 
     <main class="main">
@@ -276,6 +282,7 @@
   </div>
 
   <script src="motd.js"></script>
+  <script src="background.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>

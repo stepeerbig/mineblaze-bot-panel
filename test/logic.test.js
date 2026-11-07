@@ -845,6 +845,9 @@ test('настройки: разбор и проверка', () => {
     reconnectDelay: 12, auth: 'microsoft', autoReconnect: true,
   });
   assert.deepEqual(sanitize({ loginPassword: ' p w \n', joinCommands: 'a\r\nb' }), { loginPassword: 'p w', joinCommands: 'a\nb' });
+  assert.deepEqual(sanitize({ liveBackground: false }), { liveBackground: false }, 'живой фон можно выключить');
+  assert.deepEqual(sanitize({ liveBackground: 'да' }), {}, 'не да/нет — не принимается');
+  assert.equal(DEFAULT_CONFIG.liveBackground, true, 'по умолчанию живой фон включён');
   assert.deepEqual(sanitize(null), {});
   assert.equal(validate({ ...DEFAULT_CONFIG }), null);
   assert.equal(validate({ ...DEFAULT_CONFIG, host: '' }), 'Не указан адрес сервера');

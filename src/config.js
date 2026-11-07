@@ -42,6 +42,7 @@ const DEFAULT_CONFIG = Object.freeze({
   questPause: 15, // минут между проверками одного бота
   // Рентген (src/bot/xray.js): какие блоки подсвечивать в «Экране бота» и искать #рентген — цвета, радиус, лава.
   xray: DEFAULT_XRAY,
+  liveBackground: true, // живой фон окна «Вороны» (src/renderer/background.js); на ботов не влияет
 });
 
 const MAX_WHITELIST_LENGTH = 5000;
@@ -109,6 +110,7 @@ function sanitize(src) {
   if (VIEWER_MODES.includes(src.viewerMode)) out.viewerMode = src.viewerMode;
   if (typeof src.guard === 'boolean') out.guard = src.guard;
   if (typeof src.godMode === 'boolean') out.godMode = src.godMode;
+  if (typeof src.liveBackground === 'boolean') out.liveBackground = src.liveBackground;
   if (typeof src.whitelist === 'string') out.whitelist = src.whitelist.replace(/\r\n?/g, '\n').slice(0, MAX_WHITELIST_LENGTH);
   if (typeof src.accounts === 'string') out.accounts = src.accounts.replace(/\r\n?/g, '\n').slice(0, MAX_ACCOUNTS_LENGTH);
   const int = (value, min, max) => {
