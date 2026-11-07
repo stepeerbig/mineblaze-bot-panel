@@ -15,7 +15,8 @@ const {
 const { isStorageWindow } = require('./window-clicks');
 const { moveStacks, countIn, itemsIn, storageSlots, playerSlots } = require('./chests');
 const { sanitizeXray, scanXray, findEntries, registryOf } = require('./xray');
-const { createGuard, prepareShield, cooldownFor, eatIfHungry, isFood, foodRank } = require('./survival');
+const { createGuard, prepareShield, cooldownFor, eatIfHungry, isFood, foodRank, FIRE_POTIONS, fireResPotions, hasFireRes } = require('./survival');
+const { potionOf } = require('./item-hash');
 
 const MAX_WALK = 256; // за раз дальше не ходим: путь ищется по загруженному миру, дальше — по ходу
 const MAX_STEPS = 32; // «#вперёд N»: не больше
@@ -1168,6 +1169,24 @@ const lastHomes = new Map(); // ник бота → { storage, rewards }: «#к�
  * Написать серверу команду телепорта (/home склад, /warp ah) и дождаться самого телепорта (пакет позиции
  * или смена мира). Потом постоять, пока вокруг догрузятся чанки с сундуками и NPC.
  */
+/** Дождаться, пока бот снова «жив» (событие spawn после update_health), не дольше ms. */
+function waitAlive(bot, ms) {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      bot.removeListener('spawn', done);
+      bot.removeListener('health', check);
+      resolve();
+    };
+    const check = () => {
+      if (bot.isAlive !== false) done();
+    };
+    const timer = setTimeout(done, ms);
+    bot.on('spawn', done);
+    bot.on('health', check);
+  });
+}
+
 async function teleportBy(bot, cmd, { waitMs = TELEPORT_WAIT_MS } = {}) {
   if (typeof bot.sendCommand !== 'function') throw new CommandError('бот не может писать команды серверу');
   let moved = false;
@@ -1179,7 +1198,14 @@ async function teleportBy(bot, cmd, { waitMs = TELEPORT_WAIT_MS } = {}) {
   const chat = watchChat(bot);
   try {
     if (!bot.sendCommand(cmd)) throw new CommandError(`не удалось отправить ${cmd}: бот не в сети`);
-    for (let t = 0; t < waitMs && !moved; t += 100) await bot.actions.wait(100);
+    for (let t = 0; t < waitMs && !moved; t += 100) {
+      try {
+        await bot.actions.wait(100);
+      } catch (err) {
+        // Переход в другое измерение (Незер) — «смена мира»: действия прерываются, а это и есть нужный телепорт.
+        if (!(err && err.code === 'interrupted' && moved)) throw err;
+      }
+    }
   } finally {
     bot.removeListener('forcedMove', onMove);
     bot.removeListener('respawn', onMove);
@@ -1194,6 +1220,8 @@ async function teleportBy(bot, cmd, { waitMs = TELEPORT_WAIT_MS } = {}) {
     else err.code = 'no_teleport';
     throw err;
   }
+  // После смены измерения mineflayer считает бота мёртвым, пока сервер не пришлёт здоровье (update_health).
+  if (bot.isAlive === false) await waitAlive(bot, 5000);
   for (let i = 0; i < 30 && !bot.blockAt(bot.entity.position.offset(0, -1, 0)); i += 1) await bot.actions.wait(100);
   await bot.actions.wait(800 + Math.floor(Math.random() * 400));
 }
@@ -1267,6 +1295,7 @@ async function takeFromStorage(bot, needs) {
 // ---------- снаряжение со склада ----------
 
 const FOOD_WANT = 45; // еды с собой (штук)
+const FIRE_RES_WANT = 3; // зелий огнестойкости с собой в Незер
 const ARMOR_TIERS = ['netherite', 'diamond', 'iron', 'chainmail', 'golden', 'leather'];
 const GEAR_TOOL_TIERS = ['netherite', 'diamond', 'iron', 'stone', 'golden', 'wooden'];
 // Что входит в снаряжение: броня на 4 места, меч, кирка, щит во вторую руку. rank — меньше = лучше, null — не то.
@@ -1322,7 +1351,7 @@ function gearMissing(bot) {
  * из какого сундука бы оно ни было; чего нет в одном — ищет в остальных. Броню надевает, щит — во вторую руку.
  * → { lines, data: { took, wore, missing, food, chests } }
  */
-async function gearUp(bot, { pickTier = 0 } = {}) {
+async function gearUp(bot, { pickTier = 0, fireRes = 0 } = {}) {
   const chests = storageChests(bot);
   if (!chests.length) throw new CommandError(`рядом нет сундуков склада (до ${STORAGE_RANGE} блоков)`);
   const own = ownGear(bot);
@@ -1342,7 +1371,7 @@ async function gearUp(bot, { pickTier = 0 } = {}) {
       const [start, end] = storageSlots(chest.window);
       for (let i = start; i < end; i += 1) {
         const it = chest.window.slots[i];
-        if (it) found.push({ chest: c, name: it.name, count: it.count || 1 });
+        if (it) found.push({ chest: c, name: it.name, count: it.count || 1, potion: it.name === 'potion' ? potionOf(it) : null });
       }
     } finally {
       await closeAfter(bot);
@@ -1374,6 +1403,15 @@ async function gearUp(bot, { pickTier = 0 } = {}) {
     add(f.chest, { name: f.name, want: Math.min(f.count, foodNeed), key: 'food' });
     foodNeed -= Math.min(f.count, foodNeed);
   }
+  // Зелья огнестойкости (в Незер): до fireRes штук, долгие — первыми.
+  let potionNeed = Math.max(0, fireRes - fireResPotions(bot).length);
+  const potions = found.filter((f) => FIRE_POTIONS.includes(f.potion)).sort((a, b) => FIRE_POTIONS.indexOf(a.potion) - FIRE_POTIONS.indexOf(b.potion));
+  for (const f of potions) {
+    if (potionNeed <= 0) break;
+    const n = Math.min(f.count, potionNeed);
+    add(f.chest, { name: f.name, potion: f.potion, want: n, key: 'potion' });
+    potionNeed -= n;
+  }
   // 3. Взять: только те сундуки, где лежит выбранное.
   const took = new Map();
   let full = false;
@@ -1389,7 +1427,8 @@ async function gearUp(bot, { pickTier = 0 } = {}) {
     try {
       const w = chest.window;
       for (const e of entries) {
-        const r = await moveStacks(bot, w, storageSlots(w), playerSlots(w), (it) => it.name === e.name, e.want);
+        const test = (it) => it.name === e.name && (!e.potion || potionOf(it) === e.potion);
+        const r = await moveStacks(bot, w, storageSlots(w), playerSlots(w), test, e.want);
         for (const [name, n] of r.moved) took.set(name, (took.get(name) || 0) + n);
         if (r.full) {
           full = true;
@@ -1418,6 +1457,7 @@ async function gearUp(bot, { pickTier = 0 } = {}) {
   lines.push(`Снаряжение: сундуков осмотрел ${opened}${took.size ? `, взял ${countsText(took)}` : ', брать нечего — у бота уже лучшее'}`);
   if (wore.length) lines.push(`Надел: ${wore.join(', ')}`);
   lines.push(`Еда: ${food} из ${FOOD_WANT}${food < FOOD_WANT ? ' — на складе больше нет' : ''}`);
+  if (fireRes) lines.push(`Зелья огнестойкости: ${fireResPotions(bot).length} из ${fireRes}`);
   if (missing.length) lines.push(`Не нашлось ни у бота, ни в сундуках: ${missing.join(', ')}`);
   if (full) lines.push('Инвентарь полон — взял не всё');
   return { lines, data: { took: countsData(took), wore, missing, food, chests: opened, full } };
@@ -2484,7 +2524,7 @@ const ORES = {
   debris: { name: 'древние обломки', blocks: ['ancient_debris'], item: 'ancient_debris', best: 15, tier: 3, nether: true, where: 'Незер, Y 8…22, больше всего — Y ≈ 15' },
 };
 const ORE_WORDS = [
-  [/(?:^|\s)(?:незерск\S*\s+золот|золот\S*\s+незер)/, 'nether_gold'], [/(?:^|\s)(?:древн|обломк)/, 'debris'],
+  [/(?:^|\s)(?:незерск\S*\s+золот|золот\S*\s+незер)/, 'nether_gold'], [/(?:^|\s)(?:древн|обломк|незерит|netherite|debris)/, 'debris'],
   [/(?:^|\s)(?:угол|угл[яеиь]|coal)/, 'coal'], [/(?:^|\s)(?:мед[ьи]|copper)/, 'copper'], [/(?:^|\s)(?:желез|iron)/, 'iron'],
   [/(?:^|\s)(?:лазурит|lapis)/, 'lapis'], [/(?:^|\s)(?:золот|gold)/, 'gold'], [/(?:^|\s)(?:редстоун|красн\S*\s+пыл|redstone)/, 'redstone'],
   [/(?:^|\s)(?:алмаз|diamond)/, 'diamond'], [/(?:^|\s)(?:изумруд|emerald)/, 'emerald'], [/(?:^|\s)(?:кварц|quartz)/, 'quartz'],
@@ -2836,7 +2876,14 @@ async function cmdMine({ bot, args: allArgs, words = [] }) {
   }
   const ore = ORES[key];
   const dim = () => (bot.game && bot.game.dimension ? String(bot.game.dimension) : '');
-  if (ore.nether && dim() && !/nether/.test(dim())) throw new CommandError(`«${ore.name}» — только в Незере (${ore.where}); бот сейчас не там`);
+  const inNether = () => /nether/.test(dim());
+  const netherCmd = String((bot.panelConfig && bot.panelConfig.netherCommand) || '').trim();
+  if (ore.nether && !inNether() && !netherCmd) {
+    throw new CommandError(`«${ore.name}» — только в Незере (${ore.where}). Впиши «Команду в ад» в настройках автопилота ` +
+      '(например, /warp nether) — бот возьмёт со склада зелья огнестойкости и пойдёт туда сам; или отведи бота в Незер');
+  }
+  // В Незер — только с огнестойкостью: зелья со склада (или уже действует).
+  const fireLow = () => ore.nether && !fireResPotions(bot).length && !hasFireRes(bot);
   const lines = [];
   // 1. Снаряжение: нет кирки (или брони, щита, мало еды) — на общий дом, там лучшее из сундуков (#снаряжение).
   let pick = pickFor(bot, ore);
@@ -2844,11 +2891,11 @@ async function cmdMine({ bot, args: allArgs, words = [] }) {
   if (!pick && !base) {
     throw noPickaxe(`нет кирки для «${ore.name}» (нужна не хуже: ${TIER_NAMES[ore.tier]}) — дай боту кирку или укажи общий дом, где в сундуке лежат кирки: «Дом склада» в настройках автопилота или #добудь ${text} дом база`);
   }
-  if (base && (!pick || gearMissing(bot))) {
+  if (base && (!pick || gearMissing(bot) || fireLow())) {
     await teleportBy(bot, `/home ${base}`);
     let why = '';
     try {
-      const g = await gearUp(bot, { pickTier: ore.tier });
+      const g = await gearUp(bot, { pickTier: ore.tier, fireRes: ore.nether ? FIRE_RES_WANT : 0 });
       lines.push(`Общий дом «${base}»: ${g.lines[0].replace(/^Снаряжение: /, '')}`, ...g.lines.slice(1));
     } catch (err) {
       if (isFatal(err)) throw err;
@@ -2857,8 +2904,17 @@ async function cmdMine({ bot, args: allArgs, words = [] }) {
     pick = pickFor(bot, ore);
     if (!pick) throw noPickaxe(`на общем доме «${base}» нет кирки не хуже: ${TIER_NAMES[ore.tier]}${why || ' (в сундуках рядом)'} — положи туда кирки`);
   }
-  // 2. Где копать: случайное место (/rtp) — там можно ломать; или прямо здесь.
-  if (!here) {
+  if (fireLow()) {
+    throw Object.assign(new CommandError(`в Незер без зелья огнестойкости не иду: положи зелья огнестойкости ${base ? `в сундуки у дома «${base}»` : 'боту в инвентарь (или впиши «Дом склада», где они лежат)'}`), { code: 'no_fire_res' });
+  }
+  // 2. Где копать: Незер — по «Команде в ад» и прямо там (/rtp в Незере может увести в обычный мир); иначе случайное
+  // место (/rtp) — там можно ломать; или прямо здесь.
+  if (ore.nether && !inNether()) {
+    await teleportBy(bot, netherCmd, { waitMs: RTP_WAIT_MS });
+    if (!inNether()) throw new CommandError(`после ${netherCmd} бот не в Незере — проверь «Команду в ад» в настройках автопилота`);
+    const p = bot.entity.position;
+    lines.push(`${netherCmd}: бот в Незере, копаю у ${Math.floor(p.x)} ${Math.floor(p.y)} ${Math.floor(p.z)}`);
+  } else if (!here && !ore.nether) {
     await teleportBy(bot, RTP_CMD, { waitMs: RTP_WAIT_MS });
     const p = bot.entity.position;
     lines.push(`${RTP_CMD}: копаю у ${Math.floor(p.x)} ${Math.floor(p.y)} ${Math.floor(p.z)}`);
@@ -2889,9 +2945,12 @@ async function cmdMine({ bot, args: allArgs, words = [] }) {
     const d = await depositJunk(bot);
     lines.push(`Инвентарь забился — мусор в сундуки у дома «${junkHome}»: ${d.put.size ? countsText(d.put) : 'положить не вышло'}`);
     if (!freeSlots(bot) || here) break; // место не освободилось; «здесь» — назад на то место не попасть
-    await teleportBy(bot, RTP_CMD, { waitMs: RTP_WAIT_MS });
+    const back = ore.nether ? netherCmd : RTP_CMD;
+    if (!back) break; // в Незер обратно не попасть: «Команда в ад» не задана
+    await teleportBy(bot, back, { waitMs: RTP_WAIT_MS });
+    if (ore.nether && !inNether()) break;
     const p = bot.entity.position;
-    lines.push(`${RTP_CMD}: копаю дальше у ${Math.floor(p.x)} ${Math.floor(p.y)} ${Math.floor(p.z)}`);
+    lines.push(`${back}: копаю дальше у ${Math.floor(p.x)} ${Math.floor(p.y)} ${Math.floor(p.z)}`);
     pick = pickFor(bot, ore) || pick;
     await bot.actions.equip(pick);
   }
@@ -2920,6 +2979,8 @@ async function cmdMine({ bot, args: allArgs, words = [] }) {
   if (g.blocked) lines.push(`От крипера закрывался щитом: ${g.blocked} ${plural(g.blocked, 'раз', 'раза', 'раз')}`);
   if (g.ate) lines.push(`Поел: ${g.ate} ${plural(g.ate, 'раз', 'раза', 'раз')}`);
   if (g.hungry) lines.push('Голоден, а еды нет — положи боту еду (хлеб, жареное мясо)');
+  if (g.drank) lines.push(`Горел — выпил зелье огнестойкости: ${g.drank} ${plural(g.drank, 'раз', 'раза', 'раз')}`);
+  if (g.burnedNoPotion) lines.push('Горел, а зелий огнестойкости не осталось — положи их на склад');
   if (r.note && !r.denied) lines.push(`Остановился: ${r.note}`);
   if (!r.mined && !r.denied && r.fails.length) {
     lines.push(`Не прокопался к руде: ${r.fails.slice(0, 2).map((f) => `${f.text}${f.count > 1 ? ` (×${f.count})` : ''}`).join('; ')}`);
@@ -3208,14 +3269,16 @@ const COMMANDS = [
   {
     name: 'добудь',
     aliases: ['добыть', 'шахта', 'mine'],
-    usage: ['#добудь железо', '#добудь алмазы 5', '#добудь уголь 64 дом база', '#добудь лазурит здесь'],
+    usage: ['#добудь железо', '#добудь алмазы 5', '#добудь уголь 64 дом база', '#добудь лазурит здесь', '#добудь обломки 4'],
     about: 'добыть руду (уголь, медь, железо, лазурит, золото, редстоун, алмазы, изумруды; в Незере — кварц, золото, древние обломки): ' +
       'нет подходящей кирки, брони, щита или еды — идёт на общий дом («дом X» или «Дом склада» из настроек) и берёт там лучшее ' +
       '(как #снаряжение), потом /rtp и копает там ' +
       '(«здесь» — на месте); находит руду в чанках вокруг и прокапывается прямо к ней — вперёд, под себя, ступеньками, сначала жила; ' +
       'рядом нет — вглубь к лучшей высоте (железо Y≈16, алмазы и редстоун Y≈−58…), там ходами вбок (открылась руда у хода — сразу к ней); ' +
       'потом обратно на свою высоту (где нужно — «столбом»); за работой ест (хлеб, мясо из инвентаря) и отбивается от мобов мечом, ' +
-      'от крипера — щитом во второй руке; у воды, лавы, под гравием не копает; где копать нельзя — скажет сразу; не нашёл — скажет, где искать',
+      'от крипера — щитом во второй руке; у воды, лавы, под гравием не копает; где копать нельзя — скажет сразу; не нашёл — скажет, где искать; ' +
+      'Незер (древние обломки, кварц): бот идёт туда по «Команде в ад» из настроек, только с зельями огнестойкости (берёт со склада 3), ' +
+      'загорелся — сразу пьёт; копает там, где оказался; инвентарь забился — разгрузится на «Доме мусора» и вернётся в Незер',
     run: cmdMine,
   },
   {

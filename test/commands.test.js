@@ -1533,6 +1533,68 @@ test('команды: #очисти — мусор в сундуки «Дома 
   assert.match([].concat(nr.message).join('\n'), /Впиши «Дом мусора» в настройках автопилота/);
 });
 
+test('команды: #добудь обломки — склад (снаряжение и 3 зелья огнестойкости, не вода), «Команда в ад», копает в Незере; без зелий и без команды — нет', async () => {
+  const POTION = (id) => [{ type: 'potion_contents', data: { potionId: id, customEffects: [] } }];
+  const make = (storageItems, netherCommand = '/warp nether') => {
+    const s = setup({ inventory: [['diamond_pickaxe', 1], ['bread', 32]], storage: { '2,64,-2': { items: storageItems } } });
+    s.world.set(new Vec3(2, 64, -2), 'chest');
+    s.bot.panelConfig = { questStorage: 'база', netherCommand };
+    s.bot.game = { gameMode: 'survival', dimension: 'minecraft:overworld' };
+    s.bot.equip = async (item, dest) => {
+      const WEAR = { head: 5, torso: 6, legs: 7, feet: 8, 'off-hand': 45 };
+      const slots = s.bot.inventory.slots;
+      const from = slots.indexOf(item);
+      const old = slots[WEAR[dest]] || null;
+      slots[WEAR[dest]] = item;
+      slots[from] = old;
+    };
+    s.sent = [];
+    s.bot.sendCommand = (cmd) => {
+      s.sent.push(cmd);
+      setImmediate(() => {
+        if (cmd === '/warp nether') {
+          s.bot.game.dimension = 'minecraft:the_nether';
+          s.bot.emit('respawn');
+          teleport(s.bot, { x: 200.5, y: 64, z: 0.5 });
+        } else {
+          teleport(s.bot, { x: 0.5, y: 64, z: 0.5 });
+        }
+      });
+      return true;
+    };
+    return s;
+  };
+  const s = make([
+    [0, 'potion', 1, POTION(0)], // вода — не та
+    [1, 'potion', 1, POTION(11)], [2, 'potion', 1, POTION(12)], [3, 'potion', 1, POTION(11)], [4, 'potion', 1, POTION(11)],
+    [5, 'shield', 1], [6, 'diamond_helmet', 1],
+  ]);
+  s.world.set(new Vec3(203, 62, 2), 'ancient_debris');
+  const r = await s.run('#добудь обломки 1', 900000);
+  const text = [].concat(r.message).join('\n');
+  assert.equal(r.ok, true, text);
+  assert.deepEqual(s.sent, ['/home база', '/warp nether']);
+  const { potionOf } = require(path.join(__dirname, '..', 'src', 'bot', 'item-hash.js'));
+  const potions = s.bot.inventory.slots.slice(9, 45).filter((it) => it && it.name === 'potion').map(potionOf);
+  assert.deepEqual(potions.sort(), ['fire_resistance', 'fire_resistance', 'long_fire_resistance'], 'три огнестойкости, долгая — первой; воду не взял');
+  assert.match(text, /Зелья огнестойкости: 3 из 3/);
+  assert.match(text, /^\/warp nether: бот в Незере, копаю у 200 64 0$/m);
+  assert.equal(r.data.mined, 1);
+
+  // Зелий нет нигде — в Незер не идёт.
+  const n = make([[0, 'shield', 1]]);
+  const nr = await n.run('#добудь обломки 1', 900000);
+  assert.equal(nr.ok, false);
+  assert.equal(nr.code, 'no_fire_res');
+  assert.match([].concat(nr.message).join('\n'), /в Незер без зелья огнестойкости не иду: положи зелья огнестойкости в сундуки у дома «база»/);
+  assert.deepEqual(n.sent, ['/home база']);
+
+  // «Команда в ад» не задана — подсказка, где её вписать.
+  const c = make([], '');
+  const cr = await c.run('#добудь незерит');
+  assert.match([].concat(cr.message).join('\n'), /Впиши «Команду в ад» в настройках автопилота/);
+});
+
 test('команды: #добудь без кирки — /home на общий дом, кирка из сундука, потом /rtp и добыча там', async () => {
   const s = setup({ inventory: [['cobblestone', 16]], storage: { '2,64,-2': { items: [[0, 'stone_pickaxe', 1], [1, 'iron_pickaxe', 1]] } } });
   s.world.set(new Vec3(2, 64, -2), 'chest');

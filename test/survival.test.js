@@ -140,3 +140,37 @@ test('еда: любая еда игры (мёд, пирог), кроме вре
   assert.equal(isFood('pumpkin_pie', registry), true);
   assert.equal(isFood('chorus_fruit', registry), false);
 });
+
+test('огонь: горит без огнестойкости — сторож пьёт зелье огнестойкости (долгое — первым), не воду; зелий нет — отмечает', async () => {
+  const { createGuard, burning, fireResPotions } = require(path.join(__dirname, '..', 'src', 'bot', 'survival.js'));
+  const { potionOf } = require(path.join(__dirname, '..', 'src', 'bot', 'item-hash.js'));
+  const { bot } = setup();
+  const potion = (id) => ({ name: 'potion', count: 1, components: [{ type: 'potion_contents', data: { potionId: id, customEffects: [] } }] });
+  bot.inventory.slots[36] = potion(0); // вода
+  bot.inventory.slots[37] = potion(11);
+  bot.inventory.slots[38] = potion(12); // долгая
+  const drank = [];
+  bot.actions.drink = async (it) => {
+    drank.push(potionOf(it));
+    bot.entity.effects[11] = { id: 11, amplifier: 0, duration: 9600 };
+    bot.inventory.slots[bot.inventory.slots.indexOf(it)] = { name: 'glass_bottle', count: 1 };
+  };
+  bot.entity.metadata = [0x01]; // горит
+  assert.equal(burning(bot), true);
+  assert.deepEqual(fireResPotions(bot).map(potionOf), ['long_fire_resistance', 'fire_resistance']);
+  const guard = createGuard(bot);
+  assert.equal(guard.wants(), 'fire');
+  await guard.handle();
+  assert.deepEqual(drank, ['long_fire_resistance']);
+  assert.equal(guard.stats.drank, 1);
+  assert.equal(guard.wants(), null, 'огнестойкость действует — больше не пьёт');
+  guard.stop();
+
+  // Горит, а зелий нет — отмечает (в отчёте #добудь: «положи их на склад»).
+  const t = setup();
+  t.bot.entity.metadata = [0x01];
+  const g2 = createGuard(t.bot);
+  assert.equal(g2.wants(), null);
+  assert.equal(g2.stats.burnedNoPotion, true);
+  g2.stop();
+});

@@ -61,6 +61,7 @@ const el = {
   questSetupTag: $('questSetupTag'),
   questStorage: $('questStorage'),
   questJunk: $('questJunk'),
+  netherCommand: $('netherCommand'),
   questRewards: $('questRewards'),
   questMobHomes: $('questMobHomes'),
   questFarm: $('questFarm'),
@@ -551,7 +552,7 @@ function fillForm(cfg) {
   }
   el.aiProvider.value = cfg.aiProvider === 'openai' ? 'openai' : 'ollama';
   el.ollamaGpu.checked = cfg.ollamaGpu !== false;
-  for (const key of ['questStorage', 'questRewards', 'questFarm', 'questPen', 'questJunk', 'questMobHomes', 'questTogether', 'questPause']) {
+  for (const key of ['questStorage', 'questRewards', 'questFarm', 'questPen', 'questJunk', 'netherCommand', 'questMobHomes', 'questTogether', 'questPause']) {
     if (document.activeElement !== el[key]) el[key].value = cfg[key] === undefined || cfg[key] === null ? '' : cfg[key];
   }
   updateQuestSetupTag();
@@ -573,6 +574,7 @@ const readQuestForm = () => ({
   questFarm: el.questFarm.value,
   questPen: el.questPen.value,
   questJunk: el.questJunk.value,
+  netherCommand: el.netherCommand.value,
   questMobHomes: el.questMobHomes.value,
   questTogether: el.questTogether.value,
   questPause: el.questPause.value,
@@ -947,7 +949,7 @@ el.questToggle.addEventListener('click', async () => {
   }
 });
 el.questCheckNow.addEventListener('click', async () => renderQuests(await bridge.questsCheckNow()));
-for (const field of [el.questStorage, el.questRewards, el.questFarm, el.questPen, el.questJunk, el.questMobHomes, el.questTogether, el.questPause]) {
+for (const field of [el.questStorage, el.questRewards, el.questFarm, el.questPen, el.questJunk, el.netherCommand, el.questMobHomes, el.questTogether, el.questPause]) {
   field.addEventListener('change', async () => fillForm(await bridge.saveConfig(readQuestForm())));
 }
 el.questStorage.addEventListener('input', updateQuestSetupTag);

@@ -1483,6 +1483,60 @@ function inject(bot, { random, now }) {
     });
   }
 
+  /**
+   * Выпить зелье (item — сам предмет: зелий одного имени «potion» много, нужное — по содержимому). Как у клиента:
+   * в руку (с хотбара — цифрой, из инвентаря — переносом), правая кнопка и держать, пока сервер не засчитает
+   * (событие 9 — «использовал») или не появится новый эффект. Полной остановки не ждём: в огне и в лаве некогда.
+   */
+  function drink(item) {
+    return run('выпить', async (signal) => {
+      const slots = bot.inventory ? bot.inventory.slots : [];
+      const at = slots.indexOf(item);
+      if (!item || at < 0) throw new ActionError('нет такого зелья');
+      if (bot.heldItem !== item) {
+        if (at >= 36 && at <= 44) {
+          await inTick(() => bot.setQuickBarSlot(at - 36), signal);
+          await waitTicks(2, signal);
+        } else {
+          releaseControls();
+          await waitTicks(2 + Math.floor(random() * 3), signal);
+          await bot.equip(item, 'hand');
+          await waitTicks(2, signal);
+        }
+      }
+      releaseControls();
+      await aimForUse(signal);
+      while (ticks() - lastUseTick < USE_DELAY_TICKS) await inTick(() => {}, signal);
+      const effectsBefore = new Set(Object.keys((bot.entity && bot.entity.effects) || {}));
+      let finished = false;
+      const onStatus = (p) => {
+        if (p && bot.entity && p.entityId === bot.entity.id && p.entityStatus === 9) finished = true;
+      };
+      bot._client.on('entity_status', onStatus);
+      let holding = false;
+      try {
+        await inTick(() => {
+          const target = useTarget();
+          if (!target.ok) throw new ActionError('взгляд ушёл туда, где правая кнопка что-нибудь откроет');
+          pressUse(0, target);
+          holding = true;
+        }, signal);
+        for (let t = 0; t < EAT_MAX_TICKS; t += 1) {
+          await inTick(() => {}, signal);
+          const gained = Object.keys((bot.entity && bot.entity.effects) || {}).some((k) => !effectsBefore.has(k));
+          if (finished || gained) {
+            holding = false;
+            return { drank: item.name };
+          }
+        }
+        throw new ActionError('не получилось выпить: сервер не засчитал');
+      } finally {
+        bot._client.removeListener('entity_status', onStatus);
+        if (holding) bot._client.write('block_dig', USE_RELEASE);
+      }
+    });
+  }
+
   /** Положить предмет во вторую руку (щит): переносом в инвентаре, стоя на месте, с паузами, как человек. */
   function equipOffhand(name) {
     return equipTo(name, 'off-hand');
@@ -1726,6 +1780,7 @@ function inject(bot, { random, now }) {
     attack,
     canHit,
     eat,
+    drink,
     equipOffhand,
     equipTo,
     shield,

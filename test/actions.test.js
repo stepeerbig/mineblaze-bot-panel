@@ -528,3 +528,32 @@ test('открытое окно (сундук) перед действием з�
   assert.ifError((await runFor(clock, bot.actions.wait(100))).error);
   assert.deepEqual(closed, ['chest'], '«ждать» окно не трогает');
 });
+
+test('выпить: именно это зелье (с хотбара — цифрой), правая кнопка, держать, пока сервер не засчитает (событие 9)', async () => {
+  const { clock, bot } = setup();
+  const potion = (id) => ({ name: 'potion', count: 1, components: [{ type: 'potion_contents', data: { potionId: id } }] });
+  bot.inventory.slots[36] = potion(0);
+  const fire = potion(11);
+  bot.inventory.slots[38] = fire;
+  let tick = 0;
+  let usedAt = null;
+  bot.on('physicsTick', () => {
+    tick += 1;
+    if (usedAt !== null && tick - usedAt === 32) {
+      bot._client.emit('entity_status', { entityId: bot.entity.id, entityStatus: 9 });
+      usedAt = null;
+    }
+  });
+  const write = bot._client.write;
+  bot._client.write = (name, params) => {
+    write(name, params);
+    if (name === 'use_item' && bot.heldItem === fire) usedAt = tick;
+  };
+  take(bot);
+  const res = await runFor(clock, bot.actions.drink(fire));
+  assert.ifError(res.error);
+  const sent = take(bot);
+  assert.ok(sent.some((p) => p.name === 'held_item_slot' && p.params.slotId === 2), 'зелье — в руку цифрой 3');
+  assert.equal(sent.filter((p) => p.name === 'use_item').length, 1);
+  assert.ok(!sent.some((p) => p.name === 'block_dig' && p.params.status === 5), 'выпил — отпускать нечего');
+});

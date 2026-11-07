@@ -32,6 +32,7 @@ const DEFAULT_CONFIG = Object.freeze({
   aiModel: 'nvidia/nemotron-3-ultra-550b-a55b:free',
   // Автопилот заданий NPC (src/quest-autopilot.js): боты сами проходят задания Фермера, Алхимика, Оружейника.
   questAuto: false, // включён (после перезапуска панели продолжит сам)
+  netherCommand: '', // как попасть в Незер (например, /warp nether): #добудь обломки, кварц — бот пойдёт туда сам
   questJunk: '', // дом мусора: сундуки, куда бот складывает землю, камень, семена… (#очисти; #добудь — когда инвентарь полон)
   questStorage: '', // дом склада с предметами для «Передайте…» (/home <имя> у каждого бота)
   questRewards: '', // дом склада наград
@@ -145,6 +146,10 @@ function sanitize(src) {
     if (typeof src[key] !== 'string') continue;
     const home = src[key].trim().replace(/^\/?home\s+/i, ''); // «/home урожай» — тоже можно
     if (!home || HOME_RE.test(home)) out[key] = home;
+  }
+  if (typeof src.netherCommand === 'string') {
+    const c = src.netherCommand.replace(/[\r\n]+/g, ' ').trim().slice(0, 100);
+    if (!c || c.startsWith('/')) out.netherCommand = c;
   }
   if (typeof src.questMobHomes === 'string') out.questMobHomes = src.questMobHomes.replace(/\r\n?/g, '\n').slice(0, 2000);
   for (const [key, min, max] of [['questTogether', 1, 5], ['questPause', 5, 240]]) {

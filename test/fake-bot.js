@@ -190,7 +190,14 @@ function autoServer(bot, world, { chests = {}, storage = {}, npcs = {}, onClick 
     const w = require('prismarine-windows')(registry).createWindow(7, spec.type || 'minecraft:generic_9x3', title);
     w.storageSpec = spec;
     if (spec.slots) spec.slots.forEach((it, slot) => it && w.updateSlot(slot, it));
-    else for (const [slot, name, count] of spec.items || []) w.updateSlot(slot, make(name, count));
+    else {
+      // [ячейка, имя, сколько, компоненты?] — компоненты как у mineflayer: [{ type: 'potion_contents', data: { potionId } }]
+      for (const [slot, name, count, components] of spec.items || []) {
+        const it = make(name, count);
+        if (components) it.components = components;
+        w.updateSlot(slot, it);
+      }
+    }
     for (let i = 0; i < 36; i += 1) {
       const it = bot.inventory.slots[9 + i];
       if (it) w.updateSlot(w.inventoryStart + i, it.type !== undefined ? it : make(it.name, it.count));

@@ -35,6 +35,51 @@ const FOOD_LOW = ['apple', 'carrot', 'melon_slice', 'sweet_berries', 'glow_berri
 const FOOD_BAD = new Set(['rotten_flesh', 'spider_eye', 'poisonous_potato', 'pufferfish', 'suspicious_stew', 'chorus_fruit', 'chicken']);
 const FOOD_LAST = ['golden_apple', 'enchanted_golden_apple'];
 
+// ---------- огонь и зелья огнестойкости (Незер) ----------
+
+const FIRE_POTIONS = ['long_fire_resistance', 'fire_resistance']; // долгое — первым
+const { potionOf } = require('./item-hash');
+
+/** Номер эффекта «Огнестойкость» (реестр 1.21: 11). */
+const fireResEffect = (bot) => {
+  const e = bot.registry && bot.registry.effectsByName ? bot.registry.effectsByName.FireResistance : null;
+  return e ? e.id : 11;
+};
+
+/** Действует ли огнестойкость. */
+function hasFireRes(bot) {
+  const eff = bot.entity && bot.entity.effects;
+  return Boolean(eff && eff[fireResEffect(bot)]);
+}
+
+/** Горит или в лаве (флаг «горит» — бит 0x01 в метаданных сущности). */
+function burning(bot) {
+  const e = bot.entity;
+  if (!e) return false;
+  const flags = e.metadata ? e.metadata[0] : 0;
+  return Boolean((typeof flags === 'number' && flags & 1) || e.isInLava);
+}
+
+/** Зелья огнестойкости в инвентаре (предметы; долгие — первыми). */
+function fireResPotions(bot) {
+  const slots = bot.inventory && bot.inventory.slots ? bot.inventory.slots : [];
+  return slots.filter((it, i) => it && i >= 9 && it.name === 'potion' && FIRE_POTIONS.includes(potionOf(it)))
+    .sort((a, b) => FIRE_POTIONS.indexOf(potionOf(a)) - FIRE_POTIONS.indexOf(potionOf(b)));
+}
+
+/** Выпить зелье огнестойкости (если горит, а огнестойкости нет). → true — выпил. */
+async function drinkFireRes(bot) {
+  const potion = fireResPotions(bot)[0];
+  if (!potion || !bot.actions || !bot.actions.drink) return false;
+  try {
+    await bot.actions.drink(potion);
+    return true;
+  } catch (err) {
+    if (isStop(err)) throw err;
+    return false;
+  }
+}
+
 /** Годится ли предмет в еду (любая еда игры, кроме вредной и вёдер). */
 function isFood(name, registry = null) {
   const n = String(name || '');
@@ -339,8 +384,14 @@ function createGuard(bot) {
   let tick = 0;
   const ignore = new Map();
   let eatFailedAt = -Infinity;
-  const stats = { kills: 0, killed: [], ate: 0, fights: 0, blocked: 0, hungry: false };
+  let drinkFailedAt = -Infinity;
+  const stats = { kills: 0, killed: [], ate: 0, fights: 0, blocked: 0, hungry: false, drank: 0, burnedNoPotion: false };
   const wants = () => {
+    // Горит (или в лаве), огнестойкости нет — первым делом выпить зелье огнестойкости.
+    if (burning(bot) && !hasFireRes(bot)) {
+      if (fireResPotions(bot).length && nowOf(bot) - drinkFailedAt > 3000) return 'fire';
+      stats.burnedNoPotion = !fireResPotions(bot).length || stats.burnedNoPotion;
+    }
     if (threats(bot, ignore).length) return 'threat';
     if (needsFood(bot) && nowOf(bot) - eatFailedAt > 30000) return 'food';
     if (typeof bot.food === 'number' && bot.food <= EAT_LOW && !pickFood(bot)) stats.hungry = true;
@@ -348,7 +399,7 @@ function createGuard(bot) {
   };
   const onTick = () => {
     if (!active || busy || (tick += 1) % 4) return;
-    if (wants() && bot.actions && bot.actions.busy) bot.actions.interrupt('рядом враг или пора поесть', 'threat');
+    if (wants() && bot.actions && bot.actions.busy) bot.actions.interrupt('горит, рядом враг или пора поесть', 'threat');
   };
   bot.on('physicsTick', onTick);
   return {
@@ -372,7 +423,10 @@ function createGuard(bot) {
         for (let round = 0; round < 6; round += 1) {
           const w = wants();
           if (!w) break;
-          if (w === 'threat') {
+          if (w === 'fire') {
+            if (await drinkFireRes(bot)) stats.drank += 1;
+            else drinkFailedAt = nowOf(bot);
+          } else if (w === 'threat') {
             stats.fights += 1;
             const r = await defend(bot, { ignore });
             stats.kills += r.kills;
@@ -393,5 +447,5 @@ function createGuard(bot) {
 
 module.exports = {
   HOSTILE, RANGED, FOOD_GOOD, FOOD_LOW, FOOD_BAD, EAT_AT, isFood, foodRank, cooldownFor, bestWeapon, pickFood, needsFood, fusing, threats, defend,
-  eatIfHungry, prepareShield, createGuard,
+  eatIfHungry, prepareShield, createGuard, FIRE_POTIONS, hasFireRes, burning, fireResPotions, drinkFireRes,
 };

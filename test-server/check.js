@@ -46,14 +46,15 @@ const BOT_NAME = 'StandBot';
 const HELPER_NAME = 'Helper'; // второй игрок в сценарии — для команд по нику
 
 const ARGS = process.argv.slice(2);
-const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--no-clicks', '--scenario', '--clicks', '--fight', '--mine', '--survive', '--gear', '--electron']);
+const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--no-clicks', '--scenario', '--clicks', '--fight', '--mine', '--survive', '--gear', '--nether', '--electron']);
 const SCENARIO = ARGS.includes('--scenario');
 const CLICKS = ARGS.includes('--clicks');
 const FIGHT = ARGS.includes('--fight');
 const MINE = ARGS.includes('--mine');
 const SURVIVE = ARGS.includes('--survive');
 const GEAR = ARGS.includes('--gear');
-const ANY_CHECK = SCENARIO || CLICKS || FIGHT || MINE || SURVIVE || GEAR;
+const NETHER = ARGS.includes('--nether');
+const ANY_CHECK = SCENARIO || CLICKS || FIGHT || MINE || SURVIVE || GEAR || NETHER;
 const ELECTRON_ARG = ARGS.find((a) => a === '--electron' || a.startsWith('--electron='));
 const ELECTRON = Boolean(ELECTRON_ARG);
 const ELECTRON_EXE = ELECTRON_ARG && ELECTRON_ARG.includes('=') ? ELECTRON_ARG.slice(ELECTRON_ARG.indexOf('=') + 1).replace(/^"|"$/g, '') : '';
@@ -462,6 +463,69 @@ async function runSurviveCheck(manager, cmd) {
 }
 
 /**
+ * Проверка Незера (--nether): бот (оператор на стенде) по «Команде в ад» переходит в Незер в комнату из адского камня с
+ * древними обломками, с тремя зельями огнестойкости; под ноги ему ставим огонь — он должен выпить зелье и докопать.
+ */
+async function runNetherCheck(manager, cmd) {
+  if (!cmd) throw new Error('для этой проверки сервер должна запускать сама проверка: закрой окно тестового сервера и запусти снова');
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  await wait(2000);
+  const bot = manager.getBot();
+  if (!bot || !bot.actions) throw new Error('у бота нет безопасных действий (они работают только со своей физикой)');
+  const N = (c) => `execute in minecraft:the_nether run ${c}`;
+  for (const c of [
+    `op ${BOT_NAME}`,
+    `clear ${BOT_NAME}`,
+    `effect clear ${BOT_NAME}`,
+    `give ${BOT_NAME} minecraft:diamond_pickaxe[enchantments={efficiency:5}]`,
+    `give ${BOT_NAME} minecraft:iron_sword`,
+    `give ${BOT_NAME} minecraft:shield`,
+    `give ${BOT_NAME} minecraft:bread 32`,
+    `give ${BOT_NAME} minecraft:iron_chestplate`,
+    `give ${BOT_NAME} minecraft:potion[potion_contents={potion:"minecraft:long_fire_resistance"}]`,
+    `give ${BOT_NAME} minecraft:potion[potion_contents={potion:"minecraft:fire_resistance"}]`,
+    `give ${BOT_NAME} minecraft:potion[potion_contents={potion:"minecraft:fire_resistance"}]`,
+    'gamerule spawn_mobs false',
+    N('forceload add -16 -16 16 16'),
+    N('fill -12 8 -12 12 24 12 minecraft:netherrack'),
+    N('fill -3 16 -3 3 19 3 minecraft:air'),
+    N('setblock 5 15 2 minecraft:ancient_debris'),
+    N('setblock -4 13 -6 minecraft:ancient_debris'),
+    N('kill @e[type=!minecraft:player,distance=..40]'),
+  ]) cmd(c);
+  await wait(4000);
+  bot.panelConfig = { netherCommand: "/execute in minecraft:the_nether run tp @s 0.5 16 0.5" };
+  // Огонь под ноги, как только бот окажется в Незере.
+  // Огонь под ноги, как только бот окажется в Незере, — пока не загорится (не больше 10 раз).
+  const { burning } = require('../src/bot/survival');
+  let lit = 0;
+  let inAt = 0;
+  const fire = setInterval(() => {
+    if (!/nether/.test(String(bot.game && bot.game.dimension)) || !bot.entity) return;
+    if (!inAt) inAt = Date.now();
+    if (Date.now() - inAt < 1500 || lit >= 10 || burning(bot)) return;
+    if (lit && burning(bot) === false && bot.entity.effects && bot.entity.effects[11]) return; // уже выпил
+    lit += 1;
+    cmd(`execute as ${BOT_NAME} at @s run setblock ~ ~ ~ minecraft:fire`);
+  }, 700);
+  const started = Date.now();
+  let r;
+  try {
+    r = await runCommand(bot, '#добудь обломки 2');
+  } finally {
+    clearInterval(fire);
+  }
+  const text = [].concat(r.message).join(' | ');
+  console.log(`  [Незер] #добудь обломки 2 → ${r.ok ? 'да' : 'НЕТ'} (${((Date.now() - started) / 1000).toFixed(1)} с): ${text}`);
+  console.log(`  [Незер] здоровье ${bot.health}, измерение ${bot.game && bot.game.dimension}`);
+  const problems = [];
+  if (!(r.data && r.data.mined >= 2)) problems.push('добыл меньше 2 обломков');
+  if (!/выпил зелье огнестойкости/.test(text)) problems.push('горел, а зелье не выпил');
+  if (!(bot.health > 0)) problems.push('погиб');
+  return problems.length ? problems.join(', ') : 0;
+}
+
+/**
  * Проверка снаряжения (--gear): в трёх сундуках (один — дальше 4 блоков) незеритовая броня с зачарованиями,
  * алмазная и железная похуже, кирки, мечи, щит, еда и вредная еда. #снаряжение должен надеть лучшее, щит — во вторую
  * руку, взять незеритовые кирку и меч и еды не меньше 45; сервер (Paper) должен принять клики, Grim — промолчать.
@@ -513,6 +577,7 @@ async function runGearCheck(manager, cmd) {
 
 // Предметы для проверки кликов: как в меню NPC на MineBlaze (название с цветом, описание из нескольких строк)
 // и другие частые компоненты. [что проверяем, предмет для команды /item].
+const CLICK_POTION = 'minecraft:potion[potion_contents={potion:"minecraft:long_fire_resistance"}]';
 const CLICK_ITEMS = [
   ['простое название', 'minecraft:gold_ingot[custom_name="Аванс на семена."]'],
   [
@@ -562,7 +627,8 @@ async function runClickCheck(manager, cmd) {
     ...CLICK_ITEMS.map(([, item], i) => `item replace block ${at} container.${i} with ${item}`),
     // Для shift-кликов: яйца (стопка по 16) и камень — сундук занят весь, кроме последней ячейки [26].
     `item replace block ${at} container.11 with minecraft:egg 12`,
-    ...Array.from({ length: 14 }, (_, i) => `item replace block ${at} container.${12 + i} with minecraft:stone 64`),
+    ...Array.from({ length: 13 }, (_, i) => `item replace block ${at} container.${12 + i} with minecraft:stone 64`),
+    `item replace block ${at} container.25 with ${CLICK_POTION}`,
     `clear ${BOT_NAME}`,
     `item replace entity ${BOT_NAME} container.0 with minecraft:iron_pickaxe[damage=5,enchantments={efficiency:2},custom_name="Кирка"]`,
     `item replace entity ${BOT_NAME} container.9 with minecraft:wheat 60`,
@@ -637,6 +703,7 @@ async function runClickCheck(manager, cmd) {
     for (let i = 0; i < CLICK_ITEMS.length; i += 1) await check(i, CLICK_ITEMS[i][0]);
     const dirt = CLICK_ITEMS.findIndex(([, item]) => item.startsWith('minecraft:dirt'));
     await check(dirt, 'половина стака', 1);
+    await check(25, 'зелье огнестойкости (долгое)');
     const pick = window.slots.findIndex((it, i) => i >= window.inventoryStart && it && it.name === 'iron_pickaxe');
     if (pick >= 0) await check(pick, 'своя кирка в инвентаре (название, износ, зачарование)');
     else console.log('  [клики] кирки в инвентаре нет — её не проверил');
@@ -771,6 +838,7 @@ function runBot(host, port, version, cmd) {
           const check = SCENARIO ? { what: 'сценарий', start: 'готовлю площадку и действую…', done: 'Сценарий закончен', run: runScenario, why: (f) => `не выполнено команд — ${f}` }
             : CLICKS ? { what: 'клики', start: 'проверяю клики в меню…', done: 'Клики проверены', run: runClickCheck, why: (f) => `неудачных проверок — ${f}` }
               : MINE ? { what: 'добыча', start: 'прячу руду в камне…', done: 'Добыча окончена', run: runMineCheck, why: () => 'добыл не всё, тронул руду у воды или не вернулся на свою высоту' }
+                : NETHER ? { what: 'Незер', start: 'строю комнату в Незере, прячу обломки…', done: 'Добыча в Незере окончена', run: runNetherCheck, why: (f) => `не вышло: ${f}` }
                 : GEAR ? { what: 'снаряжение', start: 'раскладываю по сундукам незерит, броню, щит, еду…', done: 'Снаряжение собрано', run: runGearCheck, why: (f) => `не вышло: ${f}` }
                 : SURVIVE ? { what: 'выживание', start: 'прячу алмазы, зову мобов…', done: 'Добыча с мобами окончена', run: runSurviveCheck, why: (f) => `не вышло: ${f}` }
                   : { what: 'бой', start: 'готовлю загон и пауков…', done: 'Бой окончен', run: runFightCheck, why: () => 'убил не всех пауков' };

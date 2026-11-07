@@ -193,6 +193,23 @@ const textHash = (tag) => nbtHash(tag, TEXT_BOOLEANS);
 
 const ns = (name) => (String(name).includes(':') ? String(name) : `minecraft:${name}`);
 
+// Зелья по номерам — встроенный реестр игры (порядок регистрации в Potions, 1.21.11; сверено с jar сервера).
+const POTIONS = [
+  'water', 'mundane', 'thick', 'awkward', 'night_vision', 'long_night_vision', 'invisibility', 'long_invisibility', 'leaping',
+  'long_leaping', 'strong_leaping', 'fire_resistance', 'long_fire_resistance', 'swiftness', 'long_swiftness', 'strong_swiftness',
+  'slowness', 'long_slowness', 'strong_slowness', 'turtle_master', 'long_turtle_master', 'strong_turtle_master', 'water_breathing',
+  'long_water_breathing', 'healing', 'strong_healing', 'harming', 'strong_harming', 'poison', 'long_poison', 'strong_poison',
+  'regeneration', 'long_regeneration', 'strong_regeneration', 'strength', 'long_strength', 'strong_strength', 'weakness',
+  'long_weakness', 'luck', 'slow_falling', 'long_slow_falling', 'wind_charged', 'weaving', 'oozing', 'infested',
+];
+
+/** Какое зелье у предмета (зелье, взрывное, оседающее, стрела): 'fire_resistance', … или null. */
+function potionOf(item) {
+  const c = item && Array.isArray(item.components) ? item.components.find((x) => x && x.type === 'potion_contents') : null;
+  const id = c && c.data ? c.data.potionId : undefined;
+  return Number.isInteger(id) && POTIONS[id] ? POTIONS[id] : null;
+}
+
 /**
  * Отпечаток одного компонента предмета (значение — как его разбирает minecraft-protocol).
  * names — справочник имён по номерам: { enchantment(id), component(id) }.
@@ -251,6 +268,21 @@ function componentHash(type, data, names = {}) {
         hidden_components: hidden.length ? h.list(hidden) : undefined,
       });
     }
+    case 'potion_contents': {
+      // PotionContents.FULL_CODEC: potion (имя), custom_color, custom_effects (по умолчанию пусто — тогда нет поля), custom_name.
+      const d = data || {};
+      if (d.customEffects && d.customEffects.length) return null; // свои эффекты — считать не умеем
+      let potion;
+      if (d.potionId !== undefined && d.potionId !== null) {
+        if (!POTIONS[d.potionId]) return null;
+        potion = h.str(ns(POTIONS[d.potionId]));
+      }
+      return h.fields({
+        potion,
+        custom_color: d.customColor !== undefined && d.customColor !== null ? h.int(d.customColor) : undefined,
+        custom_name: d.customName !== undefined && d.customName !== null ? h.str(String(d.customName)) : undefined,
+      });
+    }
     case 'custom_model_data': {
       const d = data || {};
       const listOf = (arr, fn) => (arr && arr.length ? h.list(arr.map(fn)) : undefined);
@@ -302,4 +334,4 @@ function toHashedSlot(slot, { names = {}, onUnknown = null } = {}) {
   return { itemId, itemCount: count, components, removeComponents };
 }
 
-module.exports = { crc32c, Hasher, h, nbtHash, textHash, componentHash, toHashedSlot, TEXT_BOOLEANS };
+module.exports = { crc32c, Hasher, h, nbtHash, textHash, componentHash, toHashedSlot, TEXT_BOOLEANS, POTIONS, potionOf };
