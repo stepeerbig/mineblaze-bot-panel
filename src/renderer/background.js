@@ -2,17 +2,18 @@
 
 // Живой фон панели «Вороны» (тёмное фэнтези): стая ворон над мёртвым деревом под красной луной. От курсора вороны
 // разлетаются, роняя перья; щелчок — спугнуть стаю. Рисует только окно — на ботов не влияет (они в своих процессах).
-// Окно свёрнуто — кадров нет (requestAnimationFrame не вызывается); окно не в фокусе — не чаще 20 кадров в секунду;
-// «уменьшение движения» в Windows — неподвижная картинка. Включает и выключает renderer.js: window.liveBackground.
+// Окно свёрнуто — кадров нет (requestAnimationFrame не вызывается); окно не в фокусе — не чаще 20 кадров в секунду.
+// Включает и выключает renderer.js (галочка «Живой фон»): window.liveBackground.
+// Общую настройку Windows «уменьшение движения» фон не слушает: её часто выключают ради быстродействия («наилучшее
+// быстродействие»), и тогда вороны стояли, а на щелчок только разворачивались. Фон — выбор в самой панели, галочкой.
 (() => {
   const canvas = document.getElementById('bg');
   if (!canvas || !canvas.getContext) return;
   const ctx = canvas.getContext('2d');
-  const reduce = Boolean(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
   const TAU = Math.PI * 2;
   const SIDE = 320; // ширина левой панели: луна — правее неё, чтобы её было видно
   const IDLE_FRAME_MS = 50; // окно не в фокусе — не чаще 20 кадров в секунду
-  const FLEE_RADIUS = 170; // ближе к курсору — ворона улетает
+  const FLEE_RADIUS = 190; // ближе к курсору — ворона улетает
   const DPR = () => Math.min(window.devicePixelRatio || 1, 1.5);
 
   /** Повторяемая «случайность» (mulberry32): дерево и облака одни и те же при каждом изменении окна. */
@@ -299,12 +300,7 @@
   }
 
   function start() {
-    if (!enabled) return;
-    if (reduce) {
-      draw();
-      return;
-    }
-    if (raf) return;
+    if (!enabled || raf) return;
     last = performance.now();
     raf = requestAnimationFrame(frame);
   }
@@ -315,9 +311,7 @@
   }
 
   window.addEventListener('resize', () => {
-    if (!enabled) return;
-    resize();
-    if (reduce) draw();
+    if (enabled) resize();
   });
   window.addEventListener('pointermove', (e) => {
     pointer.x = e.clientX;
@@ -331,9 +325,7 @@
     pointer.inside = false;
   });
   window.addEventListener('pointerdown', (e) => {
-    if (!enabled) return;
-    scare(e.clientX, e.clientY, 260, 420);
-    if (reduce) draw();
+    if (enabled) scare(e.clientX, e.clientY, 260, 420);
   });
 
   window.liveBackground = {
@@ -352,6 +344,17 @@
     },
     get enabled() {
       return enabled;
+    },
+    /** Для проверки: где курсор, сколько ворон рядом с ним и сколько их сейчас его боятся. */
+    debugState() {
+      return {
+        inside: pointer.inside,
+        x: pointer.x,
+        y: pointer.y,
+        birds: birds.length,
+        near: birds.filter((b) => Math.hypot(b.x - pointer.x, b.y - pointer.y) < FLEE_RADIUS).length,
+        scared: birds.filter((b) => b.scared > 0.5).length,
+      };
     },
   };
 })();
