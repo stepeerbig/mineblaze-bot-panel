@@ -87,6 +87,8 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
     manager.on('chat', (m) => emit('chat', { bot: id, ...m }));
     manager.on('state', (state) => emit('state', { bot: id, state }));
     manager.on('link', (l) => emit('link', { bot: id, ...l }));
+    manager.on('captcha', (c) => emit('captcha', { bot: id, ...c }));
+    manager.on('captcha-done', (c) => emit('captcha-done', { bot: id, ...c }));
     manager.on('msa', (d) => emit('msa', { bot: id, ...d }));
     manager.on('ping', (ping) => emit('ping', { bot: id, ping }));
     // Экран показывает своего бота: тот появился в мире или пропал — экран узнаёт сразу.

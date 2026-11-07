@@ -358,7 +358,7 @@ function updateSelectedUi() {
   el.chatInput.disabled = !can;
   el.chatSend.disabled = !can;
   if (mode === 'all') el.chatInput.placeholder = canAll ? 'Команда всем ботам в сети сразу: /… серверу или #… боту' : 'Ни одного бота в сети';
-  else if (mode === 'turn') el.chatInput.placeholder = canAll ? 'Команда боту (#…) всем по очереди: следующий начнёт, когда закончит предыдущий' : 'Ни одного бота в сети';
+  else if (mode === 'turn') el.chatInput.placeholder = canAll ? 'Всем по очереди: сообщение, /… серверу (через 2 с друг за другом) или #… боту (когда закончит предыдущий)' : 'Ни одного бота в сети';
   else if (canOne) el.chatInput.placeholder = 'Сообщение, команда серверу (/…) или боту (#помощь), Enter — отправить';
   else el.chatInput.placeholder = b ? 'Бот не в сети' : 'Выбери бота в списке';
 }

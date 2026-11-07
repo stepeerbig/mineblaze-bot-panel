@@ -457,23 +457,33 @@ test('отправка в чат: только когда бот на серве
   mgr.shutdown();
 });
 
-test('автовход: /login и команды после появления, пароль нигде не виден', async () => {
+/** Сообщение сервера в чат бота (не игрока). */
+const serverSays = (bot, text) => bot.emit('message', { toString: () => text, toMotd: () => text }, 'system');
+
+test('вход: /login — когда сервер просит; «успешно» — дальше команды после входа; пароль нигде не виден', async () => {
   const { mgr, bots, logs, chats } = setup(
     { loginPassword: 'Secr3t', joinCommands: '/server survival\n\n  /home  \n' },
     { joinFirst: 10, joinStep: 10 },
   );
   mgr.start();
   goOnline(bots[0]);
-  assert.deepEqual(bots[0].sent, []); // сначала пауза
-  await sleep(100);
+  await sleep(40);
+  assert.deepEqual(bots[0].sent, [], 'сервер не просил войти — /login не шлёт, команды ждут входа');
+  serverSays(bots[0], '| Авторизируйтесь » /login [пароль]');
+  assert.deepEqual(bots[0].sent, ['/login Secr3t']);
+  serverSays(bots[0], '| Авторизируйтесь » /login [пароль]'); // напоминание сразу за командой — ещё раз не шлёт
+  assert.deepEqual(bots[0].sent, ['/login Secr3t']);
+  serverSays(bots[0], '| Вы успешно авторизовались');
+  await sleep(80);
   assert.deepEqual(bots[0].sent, ['/login Secr3t', '/server survival', '/home']);
   const t = lines(logs);
   assert.ok(t.includes('info:Автовход: /login ••••'));
+  assert.ok(t.includes('ok:Автовход: сервер принял пароль'));
   assert.ok(t.includes('info:Команда после входа: /server survival'));
-  const everything = JSON.stringify([logs, chats]);
-  assert.ok(!everything.includes('Secr3t'));
+  assert.ok(!JSON.stringify([logs, chats]).includes('Secr3t'));
 
-  // После смерти и возрождения команды повторно не отправляются.
+  // Вошёл: напоминание, ушедшее до ответа, и гибель с возрождением — ничего не шлёт заново.
+  serverSays(bots[0], '| Авторизируйтесь » /login [пароль]');
   bots[0].emit('death');
   bots[0].emit('spawn');
   await sleep(60);
@@ -481,31 +491,109 @@ test('автовход: /login и команды после появления, 
   mgr.shutdown();
 });
 
-test('автовход: пароль с пробелом («пароль пароль», как для /register) — /login с первым словом; ответ сервера — в консоль', async () => {
-  const msg = (text) => ({ toString: () => text, toMotd: () => text });
-  const { mgr, bots, logs } = setup({ loginPassword: 'Secr3t Secr3t' }, { joinFirst: 10 });
+test('вход: пароль с пробелом («пароль пароль») — /login первым словом; сервер 3 раза снова просит — стоп с понятной причиной', async () => {
+  const { mgr, bots, logs } = setup({ loginPassword: 'Secr3t Secr3t' }, { joinFirst: 10, authRetry: 20 });
   mgr.start();
   goOnline(bots[0]);
-  await sleep(40);
+  serverSays(bots[0], '| Авторизируйтесь » /login [пароль]');
   assert.deepEqual(bots[0].sent, ['/login Secr3t'], 'MineBlaze ждёт одно слово: на два отвечает «Авторизируйтесь»');
-  const t = lines(logs);
-  assert.ok(t.some((l) => /^warn:Пароль для \/login записан с пробелом/.test(l)), t.join('\n'));
+  assert.ok(lines(logs).some((l) => /^warn:Пароль записан с пробелом/.test(l)), lines(logs).join('\n'));
   assert.ok(!JSON.stringify(logs).includes('Secr3t'), 'пароль нигде не виден');
-  bots[0].emit('message', msg('| Вы успешно авторизовались'), 'system');
+  serverSays(bots[0], '| Вы успешно авторизовались');
   assert.ok(lines(logs).includes('ok:Автовход: сервер принял пароль'));
   mgr.shutdown();
 
-  // Пароль не подошёл: сервер снова просит /login — понятное предупреждение (без входа он отключит бота).
-  const b = setup({ loginPassword: 'wrong' }, { joinFirst: 10 });
+  // Пароль не подходит: сервер раз за разом снова просит — ещё 2 попытки (команду сразу за другой MineBlaze
+  // пропускает), потом стоп: иначе бот заходил бы по кругу.
+  const b = setup({ loginPassword: 'wrong', autoReconnect: true }, { joinFirst: 10, authRetry: 20 });
   b.mgr.start();
   goOnline(b.bots[0]);
-  await sleep(40);
-  b.bots[0].emit('message', msg('| Авторизируйтесь » /login [пароль]'), 'system'); // эхо сразу после — не в счёт
-  assert.ok(!lines(b.logs).some((l) => /Автовход не прошёл/.test(l)));
-  await sleep(1600);
-  b.bots[0].emit('message', msg('| Авторизируйтесь » /login [пароль]'), 'system');
-  assert.ok(lines(b.logs).some((l) => /^warn:Автовход не прошёл: сервер снова просит \/login/.test(l)), lines(b.logs).join('\n'));
-  b.mgr.shutdown();
+  for (let i = 0; i < 4; i += 1) {
+    serverSays(b.bots[0], '| Авторизируйтесь » /login [пароль]');
+    await sleep(30);
+  }
+  assert.deepEqual(b.bots[0].sent, ['/login wrong', '/login wrong', '/login wrong']);
+  assert.ok(lines(b.logs).some((l) => /^error:Автовход не прошёл: сервер 3 раза подряд снова просит \/login/.test(l)), lines(b.logs).join('\n'));
+  await sleep(20);
+  assert.equal(b.mgr.state, 'offline');
+  assert.equal(b.mgr.wantRun, false, 'не переподключается');
+});
+
+test('вход: не зарегистрирован — /reg по подсказке сервера; лимит регистраций с IP — понятная причина и стоп', async () => {
+  const { mgr, bots, logs } = setup({ loginPassword: 'pw' }, { joinFirst: 10 });
+  mgr.start();
+  bots[0].emit('login');
+  // Просьба пришла ещё до появления в мире (MineBlaze — сразу после проверки «я не робот») — ответ при появлении.
+  serverSays(bots[0], '| Зарегистрируйтесь » /reg [пароль]');
+  assert.deepEqual(bots[0].sent, []);
+  bots[0].emit('spawn');
+  assert.deepEqual(bots[0].sent, ['/reg pw'], 'MineBlaze: /reg [пароль] — пароль один раз');
+  serverSays(bots[0], '| Вы успешно зарегистрировались');
+  assert.ok(lines(logs).includes('ok:Регистрация: аккаунт зарегистрирован, вход выполнен'));
+  assert.ok(lines(logs).includes('info:Регистрация: /reg ••••'));
+  mgr.shutdown();
+
+  // Другой сервер (AuthMe): «/register <password> <ConfirmPassword>» — пароль дважды.
+  const a = setup({ loginPassword: 'pw' });
+  a.mgr.start();
+  goOnline(a.bots[0]);
+  serverSays(a.bots[0], 'Please, register to the server with the command: /register <password> <ConfirmPassword>');
+  assert.deepEqual(a.bots[0].sent, ['/register pw pw']);
+  a.mgr.shutdown();
+
+  // Сервер не даёт регистрировать больше аккаунтов с этого IP — заходить снова бессмысленно.
+  const b = setup({ loginPassword: 'pw', autoReconnect: true });
+  b.mgr.start();
+  goOnline(b.bots[0]);
+  serverSays(b.bots[0], '| Зарегистрируйтесь » /reg [пароль]');
+  serverSays(b.bots[0], '| Вы превысили лимит регистраций с вашего IP');
+  assert.ok(lines(b.logs).some((l) => l.startsWith('error:Сервер не даёт зарегистрировать аккаунт: «Вы превысили лимит регистраций с вашего IP»')), lines(b.logs).join('\n'));
+  await sleep(20);
+  assert.equal(b.mgr.state, 'offline');
+  assert.equal(b.mgr.wantRun, false, 'не переподключается');
+});
+
+test('вход: сервер не просит войти (уже вошёл или вход не нужен) — /login не шлёт, команды после входа идут', async () => {
+  const { mgr, bots, logs } = setup({ loginPassword: 'pw', joinCommands: '/g5' }, { joinFirst: 10, authWait: 30 });
+  mgr.start();
+  goOnline(bots[0]);
+  await sleep(100);
+  assert.deepEqual(bots[0].sent, ['/g5']);
+  assert.ok(!lines(logs).some((l) => /Автовход/.test(l)));
+  mgr.shutdown();
+
+  // Без пароля сервер просит войти — подсказка, где его вписать (одна).
+  const n = setup();
+  n.mgr.start();
+  goOnline(n.bots[0]);
+  serverSays(n.bots[0], '| Авторизируйтесь » /login [пароль]');
+  serverSays(n.bots[0], '| Авторизируйтесь » /login [пароль]');
+  assert.deepEqual(n.bots[0].sent, []);
+  assert.equal(lines(n.logs).filter((l) => /^warn:Сервер просит войти \(\/login\), а пароль не задан/.test(l)).length, 1);
+  n.mgr.shutdown();
+});
+
+test('проверка «я не робот»: ссылка — в консоль с подсказкой, события для очереди входа; прошёл — «пройдена»', () => {
+  const { mgr, bots, logs } = setup();
+  const events = [];
+  mgr.on('captcha', (c) => events.push(['captcha', c.url]));
+  mgr.on('captcha-done', () => events.push(['done']));
+  mgr.start();
+  bots[0].emit('login');
+  const url = 'https://mineblaze.net/antibot/?id=abc';
+  const text = `[*] Пожалуйста подтвердите, что вы не робот - кликните мышкой по ссылке и нажмите 'Да': ${url}`;
+  bots[0].emit('message', { toString: () => text, toMotd: () => text, json: { text } }, 'system');
+  bots[0].emit('message', { toString: () => text, toMotd: () => text, json: { text } }, 'system'); // повтор — тот же
+  assert.ok(lines(logs).includes(`warn:Ссылка от сервера (проверка «я не робот» — открой ссылку и нажми «Да»): ${url}`), lines(logs).join('\n'));
+  serverSays(bots[0], '[*] Вы прошли проверку, пропускаем вас на сервер!');
+  assert.ok(lines(logs).includes('ok:Проверка «я не робот» пройдена'));
+  assert.deepEqual(events, [['captcha', url], ['done']]);
+
+  // Снова проверка, и бот отключился, так её и не пройдя, — очередь входа его больше не ждёт.
+  const again = text.replace('abc', 'xyz');
+  bots[0].emit('message', { toString: () => again, toMotd: () => again, json: { text: again } }, 'system');
+  bots[0].emit('end', 'socketClosed');
+  assert.deepEqual(events, [['captcha', url], ['done'], ['captcha', `${url.replace('abc', 'xyz')}`], ['done']]);
 });
 
 test('автовход отменяется, если бот отключился раньше', async () => {
@@ -513,6 +601,7 @@ test('автовход отменяется, если бот отключилс�
   mgr.start();
   goOnline(bots[0]);
   bots[0].emit('end', 'socketClosed');
+  serverSays(bots[0], '| Авторизируйтесь » /login [пароль]');
   await sleep(80);
   assert.deepEqual(bots[0].sent, []);
 });
@@ -644,8 +733,8 @@ test('экран бота: ошибка подписчика не ломает �
   goOnline(bots[0]);
   assert.equal(mgr.state, 'online');
   assert.ok(lines(logs).includes('error:Экран бота: viewer boom'));
-  await sleep(40);
-  assert.deepEqual(bots[0].sent, ['/login pw']); // автовход всё равно отправлен
+  serverSays(bots[0], '| Авторизируйтесь » /login [пароль]');
+  assert.deepEqual(bots[0].sent, ['/login pw']); // автовход всё равно работает
   mgr.shutdown();
   assert.equal(mgr.getBot(), null);
   assert.deepEqual(seen, [bots[0], null]);

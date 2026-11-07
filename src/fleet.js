@@ -13,11 +13,16 @@
 
 const EventEmitter = require('events');
 const { BotClient } = require('./bot-client');
+const { maskSecrets } = require('./chat-utils');
 
 const DEFAULT_TIMINGS = Object.freeze({
   broadcastGap: 150, // «всем ботам»: между ботами — пауза, а не 70 команд в одну секунду
   turnTimeout: 15 * 60 * 1000, // «по очереди»: столько ждём одного бота (#квесты принести — минуты)
+  turnGap: 2000, // «по очереди» сообщение или «/…»: конца не дождаться — следующий бот через столько
   replyMs: 3000, // команда серверу «/…» от ИИ: столько собираем ответ сервера в чате бота
+  // Бот ждёт проверку «я не робот» (её проходит человек по ссылке) — столько новых в очередь входа не пускаем:
+  // иначе ссылки сыплются пачкой, и сервер не дожидается проверки у остальных.
+  captchaHoldMs: 90 * 1000,
 });
 const STOP_RE = /^#\s*(?:стоп|stop|хватит|стой)(?:\s|$)/i;
 const REPLY_LINES = 6; // строк ответа сервера на «/…» — каждому боту
@@ -46,6 +51,7 @@ class Fleet extends EventEmitter {
     this.workers = []; // { client, ready, bots: Set, resume: [] }
     this.queue = []; // кто ждёт входа (номера), по порядку
     this._turn = null; // идущая очередь «по очереди» (см. runInTurn)
+    this._captcha = new Map(); // номер бота → { since, url }: ждёт проверку «я не робот»
     this._lastAdmitAt = -Infinity;
     this._queueTimer = null;
     this._summaryPending = false;
@@ -162,12 +168,13 @@ class Fleet extends EventEmitter {
   }
 
   /**
-   * Команда всем ботам в сети — по очереди, с паузой. Только команды («/…» серверу и «#…» боту): одно и то же
-   * сообщение от 70 ботов в общий чат — это спам. Возвращает { targets } сразу, рассылка идёт дальше сама.
+   * Команда всем ботам в сети — почти сразу (пауза broadcastGap). Только команды («/…» серверу и «#…» боту): одно
+   * и то же сообщение от 70 ботов за пару секунд — это спам; сообщение — «по очереди» (runInTurn).
+   * Возвращает { targets } сразу, рассылка идёт дальше сама.
    */
   broadcast(text) {
     const msg = String(text || '').trim();
-    if (!/^[/#]/.test(msg)) return { targets: 0, refused: 'всем ботам — только команды: «/…» серверу или «#…» боту' };
+    if (!/^[/#]/.test(msg)) return { targets: 0, refused: 'всем сразу — только команды «/…» серверу или «#…» боту; обычное сообщение — выбери «всем по очереди»' };
     if (STOP_RE.test(msg)) this.cancelTurn(); // «#стоп» всем — и очередь тоже
     const targets = this.order.map((id) => this.bots.get(id)).filter((b) => b.state === 'online' || b.state === 'connected');
     (async () => {
@@ -186,21 +193,24 @@ class Fleet extends EventEmitter {
   }
 
   /**
-   * Команда боту «#…» всем ботам в сети по очереди: следующий начинает, когда предыдущий закончил (together —
-   * сколько сразу). Для дел у одного склада и NPC (#квесты принести): 70 ботов разом — толпа и драка за сундуки.
+   * Всем ботам в сети по очереди (together — сколько сразу). Команда боту «#…» — следующий начинает, когда
+   * предыдущий закончил: для дел у одного склада и NPC (#квесты принести) 70 ботов разом — толпа и драка за
+   * сундуки. Сообщение или «/…» серверу — конца не дождаться: следующий бот через turnGap (не 70 разом).
    * Возвращает { targets } сразу, очередь идёт дальше сама; остановить — cancelTurn() («#стоп» всем, «Стоп всех»).
    */
   runInTurn(text, { together = 1 } = {}) {
     const line = String(text || '').trim();
-    if (!line.startsWith('#')) return { targets: 0, refused: 'по очереди — только команды боту «#…» (у «/…» нет конца, который можно ждать)' };
+    if (!line) return { targets: 0 };
+    const command = line.startsWith('#');
+    const shown = maskSecrets(line); // «/reg пароль» по очереди — пароль в консоль не пишем
     if (this._turn) {
-      return { targets: 0, refused: `уже идёт очередь «${this._turn.line}» (${this._turn.done} из ${this._turn.total}); остановить — «#стоп» всем` };
+      return { targets: 0, refused: `уже идёт очередь «${this._turn.shown}» (${this._turn.done} из ${this._turn.total}); остановить — «#стоп» всем` };
     }
     const targets = this.order.map((id) => this.bots.get(id)).filter((b) => b.state === 'online' || b.state === 'connected');
     if (!targets.length) return { targets: 0 };
-    const turn = { line, total: targets.length, done: 0, ok: 0, failed: [], cancelled: false };
+    const turn = { line, shown, total: targets.length, done: 0, ok: 0, failed: [], cancelled: false };
     this._turn = turn;
-    this._log('info', `По очереди, ботов: ${targets.length} — ${line}`);
+    this._log('info', `По очереди, ботов: ${targets.length} — ${shown}${command ? '' : ` (друг за другом через ${this.timings.turnGap / 1000} с)`}`);
     const queue = targets.slice();
     const lane = async () => {
       while (queue.length && !turn.cancelled && !this._closed) {
@@ -209,6 +219,19 @@ class Fleet extends EventEmitter {
         if (!this.bots.has(b.bot) || (b.state !== 'online' && b.state !== 'connected') || !w || !w.client || !w.client.child) {
           turn.done += 1;
           turn.failed.push(`${b.nick} (не в сети)`);
+          continue;
+        }
+        if (!command) {
+          // Сообщение или «/…»: отправить — и через паузу следующий.
+          try {
+            if (await this.say(b.bot, line)) turn.ok += 1;
+            else turn.failed.push(b.nick);
+          } catch (err) {
+            turn.failed.push(b.nick);
+            this._log('error', `По очереди: ${errText(err)}`, b.bot);
+          }
+          turn.done += 1;
+          if (queue.length && !turn.cancelled && !this._closed) await new Promise((r) => later(r, this.timings.turnGap));
           continue;
         }
         this._log('info', `По очереди: ${turn.done + 1} из ${turn.total} — начинаю`, b.bot);
@@ -227,8 +250,8 @@ class Fleet extends EventEmitter {
       if (this._turn === turn) this._turn = null;
       const failed = turn.failed.length ? `; не вышло: ${turn.failed.slice(0, 10).join(', ')}${turn.failed.length > 10 ? ` и ещё ${turn.failed.length - 10}` : ''}` : '';
       this._log(turn.failed.length || turn.cancelled ? 'warn' : 'ok',
-        `По очереди «${line}»: ${turn.cancelled ? 'остановлено' : 'готово'} — без ошибок ${turn.ok} из ${turn.total}${failed}`);
-      this.emit('turn', { line, total: turn.total, ok: turn.ok, failed: turn.failed.slice(), cancelled: turn.cancelled });
+        `По очереди «${shown}»: ${turn.cancelled ? 'остановлено' : 'готово'} — ${command ? 'без ошибок' : 'отправили'} ${turn.ok} из ${turn.total}${failed}`);
+      this.emit('turn', { line: shown, total: turn.total, ok: turn.ok, failed: turn.failed.slice(), cancelled: turn.cancelled });
     });
     return { targets: targets.length };
   }
@@ -324,7 +347,7 @@ class Fleet extends EventEmitter {
   cancelTurn() {
     if (!this._turn || this._turn.cancelled) return false;
     this._turn.cancelled = true;
-    this._log('warn', `По очереди «${this._turn.line}»: останавливаю — новые боты не начнут`);
+    this._log('warn', `По очереди «${this._turn.shown}»: останавливаю — новые боты не начнут`);
     return true;
   }
 
@@ -388,6 +411,14 @@ class Fleet extends EventEmitter {
       if (!b || b.state !== 'queued') {
         this.queue.shift(); // остановили, убрали из списка или уже входит
         continue;
+      }
+      const hold = this._captchaHoldLeft();
+      if (hold > 0) {
+        this._queueTimer = later(() => {
+          this._queueTimer = null;
+          this._pump();
+        }, hold);
+        return;
       }
       const gap = this._gapMs();
       const wait = this._lastAdmitAt + gap - Date.now();
@@ -473,6 +504,8 @@ class Fleet extends EventEmitter {
     client.on('chat', (m) => this._emitBot('chat', m));
     client.on('state', (p) => this._onState(p && p.bot, p && p.state));
     client.on('link', (l) => this._emitBot('link', l));
+    client.on('captcha', (c) => this._onCaptcha(c));
+    client.on('captcha-done', (c) => this._onCaptchaDone(c && c.bot));
     client.on('msa', (d) => this._emitBot('msa', d));
     client.on('ping', (p) => {
       const b = p && this.bots.get(p.bot);
@@ -489,10 +522,39 @@ class Fleet extends EventEmitter {
     return client;
   }
 
+  /** Бот ждёт проверку «я не робот»: новых в очередь входа не пускаем, пока её не пройдут (не дольше captchaHoldMs). */
+  _onCaptcha(c) {
+    const b = c && this.bots.get(c.bot);
+    if (!b) return;
+    this._captcha.set(b.bot, { since: Date.now(), url: c.url });
+    this._emitBot('captcha', c);
+    if (this.queue.length) {
+      this._log('warn', `Очередь входа ждёт: ${b.nick} проходит проверку «я не робот» — открой его ссылку в консоли и нажми «Да» ` +
+        `(дольше ${Math.round(this.timings.captchaHoldMs / 1000)} с ждать не буду)`);
+    }
+  }
+
+  _onCaptchaDone(id) {
+    if (!id || !this._captcha.delete(id)) return;
+    this._emitBot('captcha-done', { bot: id });
+    clearTimeout(this._queueTimer); // ждали проверку — пустить следующего, как только можно
+    this._queueTimer = null;
+    this._pump();
+  }
+
+  /** Сколько ещё очередь входа ждёт проверку «я не робот» (0 — не ждёт). */
+  _captchaHoldLeft() {
+    let left = 0;
+    const now = Date.now();
+    for (const c of this._captcha.values()) left = Math.max(left, c.since + this.timings.captchaHoldMs - now);
+    return left;
+  }
+
   _onState(id, state) {
     const b = this.bots.get(id);
     if (!b || !state || b.state === state) return;
     b.state = state;
+    if (state === 'offline' || state === 'reconnecting') this._onCaptchaDone(id); // проверку он уже не ждёт
     if (state === 'offline') b.ping = null;
     this.emit('state', { bot: id, nick: b.nick, state });
     this._summary();

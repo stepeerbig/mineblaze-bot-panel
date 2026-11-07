@@ -12,14 +12,14 @@ const { inMemory, flush } = require('./fake-host');
 
 const accounts = (n, prefix = 'Farm') => Array.from({ length: n }, (_, i) => ({ username: `${prefix}${String(i + 1).padStart(2, '0')}`, password: i % 2 ? `p${i}` : '' }));
 
-function makeFleet({ perProcess = 3, gapMs = 30, autoReconnect = false } = {}) {
+function makeFleet({ perProcess = 3, gapMs = 30, autoReconnect = false, timings = {} } = {}) {
   const mem = inMemory();
   const config = { host: 'mineblaze.net', botsPerProcess: perProcess, startInterval: 5, autoReconnect, loginPassword: 'common', accounts: 'секрет' };
   const fleet = new Fleet({
     fork: () => mem.fork(),
     initPayload: () => ({ authCacheDir: '/a', journalDir: '/j' }),
     config,
-    timings: { startGapMs: gapMs, broadcastGap: 5 },
+    timings: { startGapMs: gapMs, broadcastGap: 5, ...timings },
     clientTimings: { restartDelay: 10, requestTimeout: 2000, shutdownTimeout: 200 },
   });
   const events = [];
@@ -114,7 +114,7 @@ test('флот: «всем ботам» — только команды, все�
   fleet.setAccounts(accounts(5));
   await fleet.start(['Farm01', 'Farm03']);
   assert.ok(await waitFor(() => fleet.summary().online === 2));
-  assert.deepEqual(fleet.broadcast('привет всем'), { targets: 0, refused: 'всем ботам — только команды: «/…» серверу или «#…» боту' });
+  assert.deepEqual(fleet.broadcast('привет всем'), { targets: 0, refused: 'всем сразу — только команды «/…» серверу или «#…» боту; обычное сообщение — выбери «всем по очереди»' });
   assert.deepEqual(fleet.broadcast('/warp ah'), { targets: 2 });
   assert.ok(await waitFor(() => managerOf('Farm03').calls.includes('say:/warp ah')));
   assert.ok(managerOf('Farm01').calls.includes('say:/warp ah'));
@@ -135,7 +135,6 @@ test('флот: «всем по очереди» — команда боту п�
   fleet.setAccounts(accounts(4));
   await fleet.start();
   assert.ok(await waitFor(() => fleet.summary().online === 4));
-  assert.deepEqual(fleet.runInTurn('/warp ah'), { targets: 0, refused: 'по очереди — только команды боту «#…» (у «/…» нет конца, который можно ждать)' });
   managerOf('Farm03').failCommands = true;
   assert.deepEqual(fleet.runInTurn('#квесты принести'), { targets: 4 });
   assert.match(fleet.runInTurn('#где').refused, /^уже идёт очередь «#квесты принести» \(0 из 4\)/);
@@ -160,6 +159,57 @@ test('флот: «всем по очереди» — команда боту п�
   // До ботов другого процесса «#стоп» идёт своим сообщением — может прийти чуть позже конца очереди.
   assert.ok(await waitFor(() => managerOf('Farm04').calls.includes('say:#стоп')), '#стоп ушёл и самим ботам');
   assert.deepEqual(fleet.runInTurn('#где'), { targets: 4 }, 'после остановки можно новую очередь');
+  await fleet.shutdown();
+});
+
+test('флот: «всем по очереди» — и «/…», и обычное сообщение: друг за другом через паузу; пароль в консоль не пишется', async () => {
+  const { fleet, managers, events } = makeFleet({ perProcess: 2, gapMs: 1, timings: { turnGap: 40 } });
+  fleet.setAccounts(accounts(3));
+  await fleet.start();
+  assert.ok(await waitFor(() => fleet.summary().online === 3));
+  const said = [];
+  for (const m of managers()) {
+    const say = m.say.bind(m);
+    m.say = (text) => {
+      said.push({ nick: m.opts.config.username, text, at: Date.now() });
+      return say(text);
+    };
+  }
+  assert.deepEqual(fleet.runInTurn('/reg Secr3t'), { targets: 3 });
+  assert.ok(await waitFor(() => events.some(([n]) => n === 'turn')));
+  assert.deepEqual(said.map((s) => [s.nick, s.text]), [['Farm01', '/reg Secr3t'], ['Farm02', '/reg Secr3t'], ['Farm03', '/reg Secr3t']]);
+  for (let i = 1; i < said.length; i += 1) assert.ok(said[i].at - said[i - 1].at >= 35, `пауза перед ${said[i].nick}: ${said[i].at - said[i - 1].at} мс`);
+  const logs = events.filter(([n]) => n === 'log').map(([, p]) => p.text);
+  assert.ok(logs.includes('По очереди, ботов: 3 — /reg •••• (друг за другом через 0.04 с)'), logs.join('\n'));
+  assert.ok(logs.includes('По очереди «/reg ••••»: готово — отправили 3 из 3'), logs.join('\n'));
+  // (В чат бота команда уходит как есть — её маскирует сам менеджер бота; у подделки маски нет.)
+  assert.ok(!JSON.stringify(events.filter(([n]) => n !== 'chat')).includes('Secr3t'), 'пароль в консоль не попал');
+
+  said.length = 0;
+  events.length = 0;
+  assert.deepEqual(fleet.runInTurn('всем привет'), { targets: 3 });
+  assert.ok(await waitFor(() => events.some(([n]) => n === 'turn')));
+  assert.deepEqual(said.map((s) => s.text), ['всем привет', 'всем привет', 'всем привет']);
+  await fleet.shutdown();
+});
+
+test('флот: проверка «я не робот» — очередь входа ждёт, пока её пройдут (или не дольше заданного)', async () => {
+  const { fleet, managerOf, events } = makeFleet({ perProcess: 3, gapMs: 60, timings: { captchaHoldMs: 400 } });
+  fleet.setAccounts(accounts(3));
+  await fleet.start();
+  assert.ok(await waitFor(() => fleet.get('Farm01').state === 'online'));
+  managerOf('Farm01').emit('captcha', { time: 1, url: 'https://mineblaze.net/antibot/?id=1' });
+  assert.ok(await waitFor(() => events.some(([n, p]) => n === 'log' && /^Очередь входа ждёт: Farm01 проходит проверку «я не робот»/.test(p.text))));
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(fleet.get('Farm02').state, 'queued', 'пока Farm01 не прошёл проверку, следующий не входит');
+  managerOf('Farm01').emit('captcha-done', { time: 2 });
+  assert.ok(await waitFor(() => fleet.get('Farm02').state === 'online', 300), 'прошёл — следующий входит');
+
+  // Farm02 так и не прошёл проверку — дольше captchaHoldMs очередь не стоит.
+  managerOf('Farm02').emit('captcha', { time: 3, url: 'https://mineblaze.net/antibot/?id=2' });
+  const since = Date.now();
+  assert.ok(await waitFor(() => fleet.get('Farm03').state === 'online', 2000));
+  assert.ok(Date.now() - since >= 350, `ждала ${Date.now() - since} мс`);
   await fleet.shutdown();
 });
 

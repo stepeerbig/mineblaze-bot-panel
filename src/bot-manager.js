@@ -28,10 +28,29 @@ const GOD_AFTER_SWITCH_MS = 3000;
 const SETBACK_LIMIT = 8;
 const SETBACK_WINDOW_MS = 3000;
 const SETBACK_WARN_EVERY_MS = 30 * 1000;
-// Ответ сервера на автовход (MineBlaze: «Вы успешно авторизовались» / «Авторизируйтесь » /login [пароль]»).
-const LOGIN_OK_RE = /(?:успешно\s+авториз|уже\s+авториз|successfully\s+logged|logged\s+in\s+successfully)/i;
-const LOGIN_AGAIN_RE = /(?:авториз(?:ир)?уйтесь|неверный\s+пароль|wrong\s+password|incorrect\s+password|please\s+log\s*in)/i;
-const LOGIN_ECHO_MS = 1500; // напоминание «авторизуйтесь», пришедшее сразу за /login, могло уйти ещё до него
+// Вход с паролем (AuthMe и похожие). Бот отвечает на то, что пишет сервер, а не вслепую по таймеру: просит войти —
+// /login, просит зарегистрироваться — /reg, «успешно / уже авторизовались» — вошёл, больше не шлёт. MineBlaze:
+// «Авторизируйтесь » /login [пароль]», «Зарегистрируйтесь » /reg [пароль]», «Для начала необходимо авторизоваться»,
+// «Вы успешно авторизовались», «Вы уже авторизовались», «Вы успешно зарегистрировались»,
+// «Вы превысили лимит регистраций с вашего IP».
+const AUTH_LOGIN_RE = /(?:авториз(?:ир)?уйтесь|необходимо\s+авториз|please,?\s+log\s*in|\/l(?:ogin)?\s+[<[(]\s*(?:пароль|password))/i;
+const AUTH_REGISTER_RE = /(?:зарегистрируйтесь|необходимо\s+зарегистр|please,?\s+register|\/reg(?:ister)?\s+[<[(]\s*(?:пароль|password))/i;
+const AUTH_OK_RE = /(?:успешно\s+(?:авториз|зарегистр|вошли)|уже\s+авториз|successfully\s+(?:logged|registered|authenticated)|logged\s+in\s+successfully|already\s+logged\s+in)/i;
+const AUTH_WRONG_RE = /(?:неверный\s+пароль|неправильный\s+пароль|wrong\s+password|incorrect\s+password|invalid\s+password)/i;
+const AUTH_REG_LIMIT_RE = /(?:лимит\s+регистраций|превысили\s+лимит|максимальное\s+(?:число|количество)\s+(?:аккаунтов|регистраций)|too\s+many\s+(?:accounts|registrations)|max(?:imum)?\s+(?:number\s+of\s+)?registrations)/i;
+const AUTH_MAX_TRIES = 3; // столько раз подряд сервер снова просит войти — пароль не подходит, бросаем
+// Проверка «я не робот» (MineBlaze: «Пожалуйста подтвердите, что вы не робот - кликните мышкой по ссылке и нажмите
+// 'Да': https://…» → «Вы прошли проверку, пропускаем вас на сервер!»). Проходит человек: панель показывает ссылку.
+const CAPTCHA_RE = /(?:не\s+робот|antibot|captcha|капч)/i;
+const CAPTCHA_DONE_RE = /(?:прошли\s+проверку|проверка\s+пройдена|verification\s+(?:passed|complete|successful))/i;
+
+/** Команда регистрации по подсказке сервера: «/reg [пароль]» — один раз, «/register <пароль> <повтор>» — дважды. */
+function registerCommand(template, word) {
+  const m = String(template || '').match(/\/(reg(?:ister)?)\b([^\n|»]*)/i);
+  const name = m ? m[1].toLowerCase() : 'reg';
+  const slots = m ? (m[2].match(/[<[(][^>\])]*[>\])]/g) || []).length : 1;
+  return `/${name} ${word}${slots >= 2 ? ` ${word}` : ''}`;
+}
 
 const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
 
@@ -63,8 +82,14 @@ function later(fn, ms) {
 const DEFAULT_TIMINGS = Object.freeze({
   loginTimeout: 40 * 1000, // столько ждём входа на сервер, потом считаем попытку неудачной
   msaTimeout: 15 * 60 * 1000, // вход через Microsoft: время, чтобы ввести код в браузере
-  joinFirst: 1500, // пауза после появления в мире перед первой командой
+  joinFirst: 1500, // пауза после появления в мире (или входа с паролем) перед первой командой
   joinStep: 1200, // пауза между командами после входа
+  // Вход с паролем: просьбы войти нет столько после появления (или после /login нет ни «успешно», ни новой
+  // просьбы) — вход не нужен или прошёл, дальше — команды после входа.
+  authWait: 8000,
+  // Сервер снова просит войти — повторить не раньше, чем через столько после прошлой команды: напоминание
+  // (MineBlaze — каждые ~3 с) могло уйти ещё до неё, а команду сразу за другой MineBlaze молча пропускает.
+  authRetry: 4000,
   // Между командами (и сообщениями) в чат. MineBlaze молча пропускает команду, пришедшую меньше чем через
   // ~1 с после предыдущей: так терялся /spawn охраны сразу за /near и второй /god подряд.
   commandGap: 1500,
@@ -135,6 +160,8 @@ const MAX_LINKS_PER_SESSION = 30; // чтобы спам ссылками не �
  *   'msa'   { verification_uri, user_code }                                  (вход через Microsoft)
  *   'bot'   bot | null   бот появился в мире / пропал (для «Экрана бота»; без повторов, см. getBot)
  *   'link'  { time, url, source }   сервер прислал ссылку для человека (например, проверка «я не робот»)
+ *   'captcha' { time, url }          сервер ждёт проверку «я не робот» (её проходит человек по ссылке)
+ *   'captcha-done' { time }          проверку прошли (или бот её больше не ждёт: отключился)
  *   'ping'  мс | null   пинг бота, как его считает сервер (он же — в Tab у игроков); null — бот не в сети
  */
 class BotManager extends EventEmitter {
@@ -353,6 +380,7 @@ class BotManager extends EventEmitter {
     clearTimeout(s.errorTimer);
     clearTimeout(s.loginTimer);
     clearTimeout(s.joinTimer);
+    clearTimeout(s.authTimer);
     clearInterval(s.silenceTimer);
     clearTimeout(s.outboxTimer);
     s.outboxTimer = null;
@@ -437,6 +465,12 @@ class BotManager extends EventEmitter {
       outbox: [], // команды и сообщения, ждущие своей очереди (см. _send)
       outboxTimer: null,
       lastSentAt: 0,
+      // Вход с паролем (см. _onAuthMessage): done — вошёл (или вход не нужен), failed — бросили; sent — что
+      // отправили последним ('login' | 'register'), pending — просьба пришла до появления в мире.
+      auth: { done: false, confirmed: false, doneAt: 0, failed: false, tries: 0, sent: null, sentAt: 0, pending: null, template: '', noted: new Set() },
+      authTimer: null,
+      joinStarted: false, // команды после входа уже пошли
+      captcha: null, // ссылка проверки «я не робот», которую ждёт сервер
     };
     const alive = () => this.cur === s;
 
@@ -566,9 +600,7 @@ class BotManager extends EventEmitter {
         this.attempt = 0;
         this._setState('online');
         this.log('ok', 'В сети: бот появился в мире');
-        const joinCount = this._scheduleJoinCommands(s);
-        // Режим бога — после команд входа (если они переведут на другой сервер, проверка перенесётся туда).
-        s.god.schedule(this.timings.joinFirst + joinCount * this.timings.joinStep + GOD_AFTER_JOIN_MS);
+        this._afterSpawnAuth(s);
         this._announceBot();
       } else if (s.dead) {
         s.dead = false;
@@ -661,19 +693,19 @@ class BotManager extends EventEmitter {
       this.emit('chat', { time: Date.now(), text, motd: motd || text, position, links });
       // В консоль — спрятанные ссылки и всё, что пришло до появления в мире (проверка при входе).
       const important = s.spawned ? links.filter((url) => !shown.includes(url)) : links;
-      this._reportLinks(s, important, 'сообщение в чате');
-      // Сообщения сервера (не игроков): возврат в лобби, ответы для охраны и режима бога.
+      const captcha = position !== 'chat' && links.length > 0 && CAPTCHA_RE.test(shown);
+      this._reportLinks(s, important, captcha ? 'проверка «я не робот» — открой ссылку и нажми «Да»' : 'сообщение в чате');
+      // Сообщения сервера (не игроков): вход с паролем, проверка «я не робот», возврат в лобби, охрана, режим бога.
       if (position !== 'chat') {
-        // Ответ на автовход: принял пароль — сказать; снова просит /login — пароль не подошёл (см. _scheduleJoinCommands).
-        if (s.loginSentAt && !s.loginDone) {
-          if (LOGIN_OK_RE.test(shown)) {
-            s.loginDone = true;
-            this.log('ok', 'Автовход: сервер принял пароль');
-          } else if (LOGIN_AGAIN_RE.test(shown) && Date.now() - s.loginSentAt > LOGIN_ECHO_MS) {
-            s.loginDone = true;
-            this.log('warn', 'Автовход не прошёл: сервер снова просит /login — пароль не подошёл. Проверь его: общий в «Автовход» или у бота в «Боты» (ник:пароль). Без входа сервер через пару минут отключает бота');
-          }
+        if (captcha && !s.captcha) {
+          s.captcha = links[0];
+          this.emit('captcha', { time: Date.now(), url: links[0] });
+        } else if (s.captcha && CAPTCHA_DONE_RE.test(shown)) {
+          s.captcha = null;
+          this.log('ok', 'Проверка «я не робот» пройдена');
+          this.emit('captcha-done', { time: Date.now() });
         }
+        this._onAuthMessage(s, shown);
         const forced = forcedMoveReason(shown);
         if (forced) this._onForcedMove(s, forced);
         s.guard.onChat(shown);
@@ -900,36 +932,157 @@ class BotManager extends EventEmitter {
     return true;
   }
 
-  /** Автовход и команды после входа — по очереди с паузами. Возвращает, сколько их будет. */
-  _scheduleJoinCommands(s) {
-    const queue = [];
-    // Пароль для /login — одно слово: на «/login слово слово» MineBlaze отвечает «Авторизируйтесь » /login [пароль]»,
-    // а через пару минут молча отключает (бот так и не вошёл). Записано несколько слов (например, «пароль пароль»,
-    // как для /register) — отправляем первое и говорим об этом.
-    const words = String(this.config.loginPassword || '').trim().split(/\s+/).filter(Boolean);
-    if (words.length) {
-      if (words.length > 1) {
-        this.log('warn', 'Пароль для /login записан с пробелом (несколько слов) — отправляю только первое слово. Не войдёт — проверь пароль: общий в «Автовход» или у бота в «Боты» (ник:пароль)');
-      }
-      queue.push({ cmd: `/login ${words[0]}`, label: 'Автовход' });
-    }
-    for (const cmd of parseJoinCommands(this.config.joinCommands)) queue.push({ cmd, label: 'Команда после входа' });
-    if (!queue.length) return 0;
+  // ---------- вход с паролем ----------
 
+  /**
+   * Пароль для /login и /reg — одно слово: на «/login слово слово» MineBlaze отвечает «Авторизируйтесь » /login
+   * [пароль]» и через пару минут молча отключает. Записано несколько (например, «пароль пароль», как для
+   * /register) — первое.
+   */
+  _passwordWord() {
+    return String(this.config.loginPassword || '').trim().split(/\s+/).filter(Boolean)[0] || '';
+  }
+
+  /** Бот впервые появился в мире: без пароля — сразу команды после входа; с паролем — ждём, что скажет сервер. */
+  _afterSpawnAuth(s) {
+    const a = s.auth;
+    if (!this._passwordWord() || a.done) {
+      this._startJoinCommands(s);
+      return;
+    }
+    if (a.pending) {
+      this._authSend(s, a.pending); // просьба пришла ещё до появления в мире
+      return;
+    }
+    // Сервер так и не попросил войти — вход не нужен (или бот уже вошёл): /login не шлём, дальше — команды.
+    this._authWaitThenJoin(s);
+  }
+
+  /** Ни «успешно», ни новой просьбы за authWait — считаем, что вход не нужен или прошёл, и идём дальше. */
+  _authWaitThenJoin(s) {
+    clearTimeout(s.authTimer);
+    s.authTimer = later(() => {
+      s.authTimer = null;
+      const a = s.auth;
+      if (this.cur !== s || s.stopping || a.done || a.failed) return;
+      a.done = true;
+      a.doneAt = Date.now();
+      this._startJoinCommands(s);
+    }, this.timings.authWait);
+  }
+
+  /** Сообщение сервера (не игрока): просьба войти или зарегистрироваться, «вошли», лимит регистраций, неверный пароль. */
+  _onAuthMessage(s, text) {
+    const a = s.auth;
+    if (a.failed || !text) return;
+    if (AUTH_OK_RE.test(text)) {
+      if (a.done && a.sent === null) return;
+      const was = a.sent;
+      const fresh = !a.done;
+      a.done = true;
+      a.confirmed = true; // сервер сам сказал, что вошли
+      a.doneAt = Date.now();
+      a.sent = null;
+      a.tries = 0;
+      clearTimeout(s.authTimer);
+      if (fresh || was) {
+        this.log('ok', was === 'register' ? 'Регистрация: аккаунт зарегистрирован, вход выполнен'
+          : was === 'login' ? 'Автовход: сервер принял пароль' : 'Вход: бот уже авторизован — /login не нужен');
+      }
+      if (s.spawned) this._startJoinCommands(s);
+      return;
+    }
+    if (AUTH_REG_LIMIT_RE.test(text)) {
+      this._authFail(s, `Сервер не даёт зарегистрировать аккаунт: «${text.replace(/^[|\s]+/, '').slice(0, 120)}». ` +
+        'Бот остановлен (заходить заново бессмысленно): зарегистрировать его можно, когда сервер позволит');
+      return;
+    }
+    if (AUTH_WRONG_RE.test(text)) {
+      this._authFail(s, `Автовход не прошёл: «${text.replace(/^[|\s]+/, '').slice(0, 120)}» — проверь пароль: общий в «Автовход» ` +
+        'или у бота в «Боты» (ник:пароль). Бот остановлен, чтобы не заходить по кругу');
+      return;
+    }
+    const kind = AUTH_REGISTER_RE.test(text) ? 'register' : AUTH_LOGIN_RE.test(text) ? 'login' : null;
+    if (!kind) return;
+    if (kind === 'register' && /\/reg/i.test(text)) a.template = text;
+    if (a.done) {
+      // «Вошли», а сервер снова просит: напоминание, ушедшее до ответа, — не в счёт; позже — вход заново (другой
+      // сервер сети). Попытки считаются заново, только если вход подтвердил сам сервер — иначе /login по кругу.
+      if (Date.now() - a.doneAt < this.timings.authRetry) return;
+      a.done = false;
+      if (a.confirmed) {
+        a.confirmed = false;
+        a.tries = 0;
+        a.sentAt = 0;
+      }
+    }
+    this._authSend(s, kind);
+  }
+
+  /** Ответить серверу: /login или /reg (первым словом пароля). Сразу после прошлой — ждём ответа на неё. */
+  _authSend(s, kind) {
+    const a = s.auth;
+    const word = this._passwordWord();
+    if (!word) {
+      if (!a.noted.has('nopass')) {
+        a.noted.add('nopass');
+        this.log('warn', `Сервер просит ${kind === 'register' ? 'зарегистрироваться (/reg)' : 'войти (/login)'}, а пароль не задан — ` +
+          'впиши его в «Автовход» (общий) или у бота в «Боты» (ник:пароль)');
+      }
+      return;
+    }
+    if (!s.spawned) {
+      a.pending = kind; // ответим, как появимся в мире
+      return;
+    }
+    if (a.sentAt && Date.now() - a.sentAt < this.timings.authRetry) return;
+    if (a.tries >= AUTH_MAX_TRIES) {
+      this._authFail(s, `Автовход не прошёл: сервер ${a.tries} раза подряд снова просит ${a.sent === 'register' ? '/reg' : '/login'} — ` +
+        'пароль не подошёл? Проверь его: общий в «Автовход» или у бота в «Боты» (ник:пароль). Бот остановлен, чтобы не заходить по кругу');
+      return;
+    }
+    if (!a.noted.has('words') && String(this.config.loginPassword || '').trim().split(/\s+/).length > 1) {
+      a.noted.add('words');
+      this.log('warn', 'Пароль записан с пробелом (несколько слов) — для входа отправляю только первое слово. Не войдёт — ' +
+        'проверь пароль: общий в «Автовход» или у бота в «Боты» (ник:пароль)');
+    }
+    a.tries += 1;
+    a.sent = kind;
+    a.sentAt = Date.now();
+    a.pending = null;
+    const cmd = kind === 'register' ? registerCommand(a.template, word) : `/login ${word}`;
+    if (this._send(s, cmd, { urgent: true, key: 'auth' })) this.log('info', `${kind === 'register' ? 'Регистрация' : 'Автовход'}: ${maskSecrets(cmd)}`);
+    // Ответа «успешно» нет, но и снова не просят — значит, вошёл (сервер пишет об этом по-своему).
+    this._authWaitThenJoin(s);
+  }
+
+  /** Вход не вышел и не выйдет (лимит регистраций, неверный пароль): сказать почему и остановить бота. */
+  _authFail(s, text) {
+    const a = s.auth;
+    if (a.failed) return;
+    a.failed = true;
+    clearTimeout(s.authTimer);
+    this.log('error', text);
+    if (this.cur === s) this.stop();
+  }
+
+  /** Команды после входа — по очереди с паузами; режим бога — после них. Один раз за сессию. */
+  _startJoinCommands(s) {
+    if (s.joinStarted || this.cur !== s || s.stopping) return;
+    s.joinStarted = true;
+    const cmds = parseJoinCommands(this.config.joinCommands);
     let i = 0;
     const next = () => {
       s.joinTimer = null;
       if (this.cur !== s || s.stopping || !s.loggedIn) return;
-      const { cmd, label } = queue[i];
+      const cmd = cmds[i];
       i += 1;
-      if (this._send(s, cmd)) {
-        this.log('info', `${label}: ${maskSecrets(cmd)}`);
-        if (label === 'Автовход') s.loginSentAt = Date.now();
-      }
-      if (i < queue.length) s.joinTimer = later(next, this.timings.joinStep);
+      if (this._send(s, cmd)) this.log('info', `Команда после входа: ${maskSecrets(cmd)}`);
+      if (i < cmds.length) s.joinTimer = later(next, this.timings.joinStep);
     };
-    s.joinTimer = later(next, this.timings.joinFirst);
-    return queue.length;
+    if (cmds.length) s.joinTimer = later(next, this.timings.joinFirst);
+    // Режим бога — после команд входа (если они переведут на другой сервер, проверка перенесётся туда).
+    s.god.schedule(this.timings.joinFirst + cmds.length * this.timings.joinStep + GOD_AFTER_JOIN_MS);
   }
 
   _forceClose(s, reason) {
@@ -953,6 +1106,10 @@ class BotManager extends EventEmitter {
     this.cur = null;
     this._announceBot();
     this._setPing(null);
+    if (s.captcha) {
+      s.captcha = null; // проверку «я не робот» бот уже не ждёт — очередь входа не держим
+      this.emit('captcha-done', { time: Date.now() });
+    }
 
     const manual = !this.wantRun;
 
