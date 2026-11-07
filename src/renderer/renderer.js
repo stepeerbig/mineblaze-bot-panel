@@ -36,6 +36,9 @@ const el = {
   guardOn: $('guardOn'),
   godOn: $('godOn'),
   liveBg: $('liveBg'),
+  groupInfo: $('groupInfo'),
+  groupCount: $('groupCount'),
+  groupClear: $('groupClear'),
   taskTag: $('taskTag'),
   taskSteps: $('taskSteps'),
   taskTarget: $('taskTarget'),
@@ -119,6 +122,16 @@ const LIST_FIELDS = [el.startInterval, el.viewDistance, el.botsPerProcess];
 
 const bots = new Map(); // номер → { bot, nick, state, chip, dot }
 let selected = null; // чей чат показан и кому уходит сообщение
+// Группа ботов: Ctrl+клик — добавить или убрать, Shift+клик — подряд от прошлого, Ctrl+A — все, Esc — снять.
+// Ей уходят команды («группе сразу / по очереди»), задачи, «Старт» и «Стоп». Помнится между запусками панели.
+const group = new Set();
+let groupAnchor = null; // откуда считать «подряд» для Shift+клика
+let hadGroup = false; // была ли группа при прошлой отрисовке
+try {
+  for (const id of JSON.parse(localStorage.getItem('mbp-group') || '[]')) group.add(String(id));
+} catch (_) {
+  /* нет памяти — пустая группа */
+}
 let summary = { total: 0, online: 0, connected: 0, connecting: 0, queued: 0, reconnecting: 0, offline: 0 };
 let lastConsoleLine = null;
 const history = []; // отправленные сообщения, листаются стрелками ↑/↓
@@ -318,7 +331,66 @@ function renderList(list, sel) {
     chips.push(chip);
   }
   el.botList.replaceChildren(...chips);
+  for (const id of [...group]) if (!bots.has(id)) group.delete(id); // убранные из списка — и из группы
   setSelected(sel);
+  renderGroup();
+}
+
+/** Боты группы по порядку списка (группа из одного — не группа). */
+function groupIds() {
+  return group.size > 1 ? [...bots.keys()].filter((id) => group.has(id)) : [];
+}
+
+function renderGroup() {
+  const n = group.size > 1 ? group.size : 0;
+  for (const b of bots.values()) b.chip.classList.toggle('in-group', n > 0 && group.has(b.bot));
+  el.groupInfo.hidden = !n;
+  el.groupCount.textContent = n ? `${n}` : '';
+  for (const opt of el.sendMode.querySelectorAll('option[value^="group"]')) opt.hidden = !n;
+  const taskGroup = el.taskTarget.querySelector('option[value="group"]');
+  taskGroup.hidden = !n;
+  taskGroup.textContent = n ? `группе (${n})` : 'группе';
+  // Собрал группу — сообщения и задачи по умолчанию ей; разобрал — снова выбранному (только в момент, когда
+  // группа появилась или пропала: выбор человека при обновлении списка не трогаем).
+  if (Boolean(n) !== hadGroup) {
+    if (n && el.sendMode.value === 'one') el.sendMode.value = 'group';
+    if (n && el.taskTarget.value === 'selected') el.taskTarget.value = 'group';
+    hadGroup = Boolean(n);
+  }
+  if (!n && el.sendMode.value.startsWith('group')) el.sendMode.value = 'one';
+  if (!n && el.taskTarget.value === 'group') el.taskTarget.value = 'selected';
+  el.botStart.textContent = n ? '▶ Старт группы' : '▶ Старт';
+  el.botStop.textContent = n ? '■ Стоп группы' : '■ Стоп';
+  try {
+    localStorage.setItem('mbp-group', JSON.stringify([...group]));
+  } catch (_) {
+    /* без памяти — не страшно */
+  }
+  updateSelectedUi();
+}
+
+/** Клик по боту: просто — выбрать его одного; Ctrl — в группу или из неё; Shift — подряд от прошлого клика. */
+function clickBot(id, { ctrl = false, shift = false } = {}) {
+  if (!bots.has(id)) return;
+  const order = [...bots.keys()];
+  if (shift && groupAnchor && bots.has(groupAnchor)) {
+    const a = order.indexOf(groupAnchor);
+    const b = order.indexOf(id);
+    if (!ctrl) group.clear();
+    for (const x of order.slice(Math.min(a, b), Math.max(a, b) + 1)) group.add(x);
+  } else if (ctrl) {
+    if (!group.size && selected) group.add(selected); // первый Ctrl+клик: выбранный уже в группе
+    if (group.has(id) && group.size > 1) group.delete(id);
+    else group.add(id);
+    groupAnchor = id;
+  } else {
+    group.clear();
+    group.add(id);
+    groupAnchor = id;
+  }
+  if (group.has(id)) choose(id); // чат и экран — того, по кому щёлкнули
+  else if (!group.has(selected)) choose([...group][0]);
+  renderGroup();
 }
 
 function setSelected(id) {
@@ -363,15 +435,26 @@ function updateSelectedUi() {
   const b = bots.get(selected);
   const ping = b ? pingOf(b) : null;
   el.chatWho.textContent = b ? `${b.nick} · ${stateTitle(b.state)}${ping === null ? '' : ` · пинг ${ping} мс`}` : '— выбери бота в списке';
-  el.botStart.disabled = !b || b.state !== 'offline';
-  el.botStop.disabled = !b || b.state === 'offline';
+  const members = groupIds().map((id) => bots.get(id));
+  if (members.length) {
+    el.botStart.disabled = !members.some((m) => m.state === 'offline');
+    el.botStop.disabled = !members.some((m) => m.state !== 'offline');
+  } else {
+    el.botStart.disabled = !b || b.state !== 'offline';
+    el.botStop.disabled = !b || b.state === 'offline';
+  }
   const mode = el.sendMode.value;
   const canOne = Boolean(b) && (b.state === 'online' || b.state === 'connected');
   const canAll = summary.online + summary.connected > 0;
-  const can = mode === 'one' ? canOne : canAll;
+  const canGroup = members.some((m) => m.state === 'online' || m.state === 'connected');
+  const can = mode === 'one' ? canOne : mode.startsWith('group') ? canGroup : canAll;
+  if (mode === 'group') el.chatInput.placeholder = canGroup ? `Команда группе (${members.length}) сразу: /… серверу или #… боту` : 'Ни одного бота группы в сети';
+  else if (mode === 'group-turn') el.chatInput.placeholder = canGroup ? `Группе (${members.length}) по очереди: сообщение, /… или #… (когда закончит предыдущий)` : 'Ни одного бота группы в сети';
   el.chatInput.disabled = !can;
   el.chatSend.disabled = !can;
-  if (mode === 'all') el.chatInput.placeholder = canAll ? 'Команда всем ботам в сети сразу: /… серверу или #… боту' : 'Ни одного бота в сети';
+  if (mode.startsWith('group')) {
+    // подсказка — выше
+  } else if (mode === 'all') el.chatInput.placeholder = canAll ? 'Команда всем ботам в сети сразу: /… серверу или #… боту' : 'Ни одного бота в сети';
   else if (mode === 'turn') el.chatInput.placeholder = canAll ? 'Всем по очереди: сообщение, /… серверу (через 2 с друг за другом) или #… боту (когда закончит предыдущий)' : 'Ни одного бота в сети';
   else if (canOne) el.chatInput.placeholder = 'Сообщение, команда серверу (/…) или боту (#помощь), Enter — отправить';
   else el.chatInput.placeholder = b ? 'Бот не в сети' : 'Выбери бота в списке';
@@ -715,11 +798,13 @@ el.btnStop.addEventListener('click', () => {
   bridge.stop(null);
 });
 
+// «Старт» / «Стоп» в чате — выбранному боту или всей группе.
 el.botStart.addEventListener('click', async () => {
-  if (!selected) return;
+  const ids = groupIds().length ? groupIds() : selected ? [selected] : [];
+  if (!ids.length) return;
   el.botStart.disabled = true;
   try {
-    const res = await bridge.start([selected], readForm());
+    const res = await bridge.start(ids, readForm());
     if (res && res.config) fillForm(res.config);
   } finally {
     updateSelectedUi();
@@ -727,12 +812,34 @@ el.botStart.addEventListener('click', async () => {
 });
 
 el.botStop.addEventListener('click', () => {
-  if (selected) bridge.stop([selected]);
+  const ids = groupIds().length ? groupIds() : selected ? [selected] : [];
+  if (ids.length) bridge.stop(ids);
 });
 
 el.botList.addEventListener('click', (event) => {
   const chip = event.target.closest('.bot');
-  if (chip) choose(chip.dataset.bot);
+  if (!chip) return;
+  if (event.shiftKey) event.preventDefault(); // без выделения текста
+  clickBot(chip.dataset.bot, { ctrl: event.ctrlKey || event.metaKey, shift: event.shiftKey });
+});
+el.botList.addEventListener('mousedown', (event) => {
+  if (event.shiftKey) event.preventDefault(); // Shift+клик не выделяет текст ников
+});
+el.botList.addEventListener('keydown', (event) => {
+  if ((event.ctrlKey || event.metaKey) && (event.key === 'a' || event.key === 'ф' || event.code === 'KeyA')) {
+    event.preventDefault();
+    for (const id of bots.keys()) group.add(id);
+    renderGroup();
+  } else if (event.key === 'Escape' && group.size > 1) {
+    group.clear();
+    if (selected) group.add(selected);
+    renderGroup();
+  }
+});
+el.groupClear.addEventListener('click', () => {
+  group.clear();
+  if (selected) group.add(selected);
+  renderGroup();
 });
 
 // Ник в строке консоли — выбрать этого бота.
@@ -934,7 +1041,7 @@ el.taskAdd.addEventListener('click', async () => {
   const text = el.taskSteps.value;
   el.taskAdd.disabled = true;
   try {
-    const r = await bridge.tasksAdd(text, el.taskTarget.value, el.taskRepeat.checked);
+    const r = await bridge.tasksAdd(text, el.taskTarget.value, el.taskRepeat.checked, groupIds());
     if (r && r.ok) {
       el.taskStatus.className = 'ai-status ok';
       el.taskStatus.textContent = r.added > 1 ? `Задача добавлена ботам: ${r.added}` : 'Задача добавлена';
@@ -1021,7 +1128,7 @@ el.chatForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const text = el.chatInput.value.trim();
   if (!text || el.chatInput.disabled) return;
-  const sent = await bridge.say(text, el.sendMode.value);
+  const sent = await bridge.say(text, el.sendMode.value, groupIds());
   if (!sent) return; // причина уже в консоли, текст остаётся в поле
   if (history[history.length - 1] !== text) history.push(text);
   if (history.length > MAX_HISTORY) history.shift();

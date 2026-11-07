@@ -87,6 +87,7 @@
         <div class="task-add">
           <select id="taskTarget" aria-label="Кому задача">
             <option value="selected">выбранному боту</option>
+            <option value="group" hidden>группе</option>
             <option value="online">всем в сети</option>
             <option value="all">всем ботам</option>
           </select>
@@ -257,7 +258,9 @@
     <main class="main">
       <section class="pane bots-pane">
         <header class="pane-head">
-          <h2>Боты <span id="botsCount" class="count"></span></h2>
+          <h2>Боты <span id="botsCount" class="count"></span>
+            <span id="groupInfo" class="group-info" hidden>· группа: <b id="groupCount"></b> <button id="groupClear" class="link" type="button" title="Снять выбор (Esc)">снять</button></span>
+          </h2>
           <div class="pane-tools legend" aria-hidden="true">
             <span><i class="dot" data-state="online"></i>в сети</span>
             <span><i class="dot" data-state="connecting"></i>входит</span>
@@ -266,7 +269,7 @@
             <span><i class="dot" data-state="offline"></i>не в сети</span>
           </div>
         </header>
-        <div id="botList" class="bot-list" role="listbox" aria-label="Боты" data-empty="Впиши ботов слева, в поле «Боты»: ник или ник:пароль, по одному в строке."></div>
+        <div id="botList" class="bot-list" role="listbox" aria-multiselectable="true" aria-label="Боты" title="Клик — выбрать бота; Ctrl+клик — добавить в группу или убрать; Shift+клик — выбрать подряд; Ctrl+A — всех; Esc — снять группу" data-empty="Впиши ботов слева, в поле «Боты»: ник или ник:пароль, по одному в строке."></div>
       </section>
 
       <section class="pane">
@@ -295,6 +298,8 @@
           <input id="chatInput" type="text" maxlength="256" spellcheck="false" aria-label="Сообщение или команда" placeholder="Бот не в сети" disabled>
           <select id="sendMode" class="send-mode" aria-label="Кому отправить" title="Выбранному боту; всем ботам в сети сразу (только команды /… и #…); или всем по очереди — любое сообщение и /… друг за другом через 2 с, команду боту #… — следующий начнёт, когда закончит предыдущий">
             <option value="one">выбранному</option>
+            <option value="group" hidden>группе сразу</option>
+            <option value="group-turn" hidden>группе по очереди</option>
             <option value="all">всем сразу</option>
             <option value="turn">всем по очереди</option>
           </select>

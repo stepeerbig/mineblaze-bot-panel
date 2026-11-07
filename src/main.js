@@ -273,17 +273,25 @@ function registerIpc() {
   // Сообщение или команда: mode 'one' — выбранному боту; 'all' — всем ботам в сети сразу (только команды);
   // 'turn' — всем по очереди: команда боту «#…» — следующий начинает, когда закончил предыдущий; сообщение и
   // «/…» — друг за другом через паузу.
-  ipcMain.handle('bot:say', async (_e, { text, mode = 'one' } = {}) => {
+  // 'group' / 'group-turn' — то же, что «всем сразу» / «всем по очереди», только ботам группы (ids — выбраны в списке).
+  ipcMain.handle('bot:say', async (_e, { text, mode = 'one', ids = null } = {}) => {
     if (typeof text !== 'string' || !text.trim()) return false;
-    if (mode === 'all' || mode === 'turn') {
-      if (mode === 'turn' && autopilot) autopilot.interrupt('идёт «по очереди»'); // ботам — одно дело за раз
-      const r = mode === 'turn' ? fleet.runInTurn(text) : fleet.broadcast(text);
+    if (['all', 'turn', 'group', 'group-turn'].includes(mode)) {
+      const group = mode.startsWith('group');
+      const only = group ? (Array.isArray(ids) ? ids.map(String) : []) : null;
+      if (group && !only.length) {
+        uiLog('warn', 'Не отправлено: группа пуста — выбери ботов в списке (Ctrl+клик, Shift+клик)');
+        return false;
+      }
+      const turn = mode === 'turn' || mode === 'group-turn';
+      if (turn && autopilot) autopilot.interrupt('идёт «по очереди»'); // ботам — одно дело за раз
+      const r = turn ? fleet.runInTurn(text, { ids: only }) : fleet.broadcast(text, { ids: only, who: group ? 'группе' : 'всем' });
       if (r.refused) {
         uiLog('warn', `Не отправлено: ${r.refused}`);
         return false;
       }
-      if (!r.targets) uiLog('warn', 'Всем ботам: в сети нет ни одного');
-      else if (mode === 'all') uiLog('info', `Всем ботам в сети (${r.targets}): ${maskSecrets(text.trim())}`);
+      if (!r.targets) uiLog('warn', group ? 'Группе: в сети нет ни одного её бота' : 'Всем ботам: в сети нет ни одного');
+      else if (!turn) uiLog('info', `${group ? 'Группе' : 'Всем ботам'} в сети (${r.targets}): ${maskSecrets(text.trim())}`);
       return r.targets > 0;
     }
     if (!selectedBot) {
@@ -356,13 +364,17 @@ function registerIpc() {
   });
 
   // Задачи ботам (src/tasks.js). target: 'selected' — выбранному, 'online' — всем в сети, 'all' — всем ботам из списка.
-  ipcMain.handle('tasks:add', (_e, { text, target = 'selected', repeat = false } = {}) => {
+  ipcMain.handle('tasks:add', (_e, { text, target = 'selected', repeat = false, ids: groupIds = null } = {}) => {
     if (!tasks) return { ok: false, error: 'задачи недоступны' };
     let ids;
     if (target === 'all') ids = fleet.list().map((b) => b.bot);
+    else if (target === 'group') ids = Array.isArray(groupIds) ? groupIds.map(String) : [];
     else if (target === 'online') ids = fleet.list().filter((b) => b.state === 'online' || b.state === 'connected').map((b) => b.bot);
     else ids = selectedBot ? [selectedBot] : [];
-    if (!ids.length) return { ok: false, error: target === 'online' ? 'в сети нет ни одного бота' : 'выбери бота в списке' };
+    if (!ids.length) {
+      const why = target === 'online' ? 'в сети нет ни одного бота' : target === 'group' ? 'группа пуста — выбери ботов в списке (Ctrl+клик, Shift+клик)' : 'выбери бота в списке';
+      return { ok: false, error: why };
+    }
     try {
       const r = tasks.add(ids, String(text || ''), { repeat: Boolean(repeat) });
       if (r.added > 1) taskLog({ level: 'info', text: `Задача добавлена ботам: ${r.added}` });

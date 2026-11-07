@@ -14,8 +14,12 @@ contextBridge.exposeInMainWorld('api', {
   stop: (ids) => ipcRenderer.invoke('bots:stop', { ids: Array.isArray(ids) ? ids : null }),
   select: (id) => ipcRenderer.invoke('bots:select', String(id || '')),
   setAutoReconnect: (on) => ipcRenderer.invoke('bot:auto-reconnect', Boolean(on)),
-  // mode: 'one' — выбранному боту, 'all' — всем сразу, 'turn' — всем по очереди (команды «#…»)
-  say: (text, mode) => ipcRenderer.invoke('bot:say', { text: String(text), mode: ['all', 'turn'].includes(mode) ? mode : 'one' }),
+  // mode: 'one' — выбранному боту, 'all' / 'turn' — всем сразу / по очереди, 'group' / 'group-turn' — группе (ids)
+  say: (text, mode, ids) => ipcRenderer.invoke('bot:say', {
+    text: String(text),
+    mode: ['all', 'turn', 'group', 'group-turn'].includes(mode) ? mode : 'one',
+    ids: Array.isArray(ids) ? ids.map(String) : null,
+  }),
   openLogs: () => ipcRenderer.invoke('app:open-logs'),
   openViewer: () => ipcRenderer.invoke('viewer:open'), // окно «Экран бота» выбранного бота; true, если открылось
   // ИИ-помощник: задание словами; settings — поля ИИ из формы (сохранить перед запуском). → { ok, error }
@@ -34,7 +38,9 @@ contextBridge.exposeInMainWorld('api', {
   questsCheckNow: () => ipcRenderer.invoke('quests:check-now'),
   onQuestsStatus: listen('quests:status'), // { running, paused, online, current, levels, needs, … }
   // Задачи ботам: text — шаги по строке, target — 'selected' | 'online' | 'all', repeat — по кругу. → { ok, added, error }
-  tasksAdd: (text, target, repeat) => ipcRenderer.invoke('tasks:add', { text: String(text || ''), target: String(target || 'selected'), repeat: Boolean(repeat) }),
+  tasksAdd: (text, target, repeat, ids) => ipcRenderer.invoke('tasks:add', {
+    text: String(text || ''), target: String(target || 'selected'), repeat: Boolean(repeat), ids: Array.isArray(ids) ? ids.map(String) : null,
+  }),
   // action: 'pause' | 'resume' | 'cancel' | 'clear-done'; id — одна задача (без него — все)
   tasksControl: (action, id) => ipcRenderer.invoke('tasks:control', { action: String(action), id: id === undefined || id === null ? null : String(id) }),
   tasksList: () => ipcRenderer.invoke('tasks:list'),

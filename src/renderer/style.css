@@ -724,3 +724,12 @@ summary:focus-visible {
 .task-note { margin-top: 2px; color: var(--ash); }
 .task[data-state="error"] .task-note { color: #f3b0ac; }
 .task-tools { display: flex; gap: 4px; margin: 3px 0 0 -6px; }
+
+/* ---------- группа ботов (Ctrl+клик, Shift+клик) ---------- */
+
+.bot.in-group { border-color: var(--brass); background: rgba(201, 164, 106, .16); }
+.bot.in-group.is-selected { border-color: var(--crimson); }
+.group-info { margin-left: 4px; color: var(--brass); font-weight: 400; font-size: 12.5px; }
+.group-info[hidden] { display: none; }
+.group-info b { font-weight: 600; }
+.group-info .link { font-size: 12px; }

@@ -172,11 +172,11 @@ class Fleet extends EventEmitter {
    * и то же сообщение от 70 ботов за пару секунд — это спам; сообщение — «по очереди» (runInTurn).
    * Возвращает { targets } сразу, рассылка идёт дальше сама.
    */
-  broadcast(text) {
+  broadcast(text, { ids = null, who = 'всем' } = {}) {
     const msg = String(text || '').trim();
-    if (!/^[/#]/.test(msg)) return { targets: 0, refused: 'всем сразу — только команды «/…» серверу или «#…» боту; обычное сообщение — выбери «всем по очереди»' };
+    if (!/^[/#]/.test(msg)) return { targets: 0, refused: `${who} сразу — только команды «/…» серверу или «#…» боту; обычное сообщение — выбери «${who} по очереди»` };
     if (STOP_RE.test(msg)) this.cancelTurn(); // «#стоп» всем — и очередь тоже
-    const targets = this.order.map((id) => this.bots.get(id)).filter((b) => b.state === 'online' || b.state === 'connected');
+    const targets = this._inGame(ids);
     (async () => {
       for (const [i, b] of targets.entries()) {
         if (this._closed) return;
@@ -198,7 +198,7 @@ class Fleet extends EventEmitter {
    * сундуки. Сообщение или «/…» серверу — конца не дождаться: следующий бот через turnGap (не 70 разом).
    * Возвращает { targets } сразу, очередь идёт дальше сама; остановить — cancelTurn() («#стоп» всем, «Стоп всех»).
    */
-  runInTurn(text, { together = 1 } = {}) {
+  runInTurn(text, { together = 1, ids = null } = {}) {
     const line = String(text || '').trim();
     if (!line) return { targets: 0 };
     const command = line.startsWith('#');
@@ -206,7 +206,7 @@ class Fleet extends EventEmitter {
     if (this._turn) {
       return { targets: 0, refused: `уже идёт очередь «${this._turn.shown}» (${this._turn.done} из ${this._turn.total}); остановить — «#стоп» всем` };
     }
-    const targets = this.order.map((id) => this.bots.get(id)).filter((b) => b.state === 'online' || b.state === 'connected');
+    const targets = this._inGame(ids);
     if (!targets.length) return { targets: 0 };
     const turn = { line, shown, total: targets.length, done: 0, ok: 0, failed: [], cancelled: false };
     this._turn = turn;
@@ -448,6 +448,12 @@ class Fleet extends EventEmitter {
       this.workers.push({ client: null, ready: null, bots: new Set(), resume: [] });
     }
     return index;
+  }
+
+  /** Боты в игре по порядку списка; ids — только эти (группа), без них — все. */
+  _inGame(ids = null) {
+    const only = ids ? new Set(ids.map((id) => String(id).toLowerCase())) : null;
+    return this.order.map((id) => this.bots.get(id)).filter((b) => IN_GAME(b) && (!only || only.has(b.bot)));
   }
 
   _pick(ids) {

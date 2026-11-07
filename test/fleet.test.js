@@ -213,6 +213,23 @@ test('флот: проверка «я не робот» — очередь вх�
   await fleet.shutdown();
 });
 
+test('флот: группе — «сразу» и «по очереди» только её ботам в сети', async () => {
+  const { fleet, managerOf, events } = makeFleet({ perProcess: 2, gapMs: 1, timings: { turnGap: 5 } });
+  fleet.setAccounts(accounts(4));
+  await fleet.start();
+  assert.ok(await waitFor(() => fleet.summary().online === 4));
+  assert.deepEqual(fleet.broadcast('привет', { ids: ['farm02'], who: 'группе' }), { targets: 0, refused: 'группе сразу — только команды «/…» серверу или «#…» боту; обычное сообщение — выбери «группе по очереди»' });
+  assert.deepEqual(fleet.broadcast('/warp ah', { ids: ['Farm02', 'farm04'] }), { targets: 2 });
+  assert.ok(await waitFor(() => managerOf('Farm04').calls.includes('say:/warp ah')));
+  assert.ok(managerOf('Farm02').calls.includes('say:/warp ah'));
+  assert.ok(!managerOf('Farm01').calls.includes('say:/warp ah') && !managerOf('Farm03').calls.includes('say:/warp ah'), 'не группе — не шлём');
+  assert.deepEqual(fleet.runInTurn('#где', { ids: ['farm01', 'farm03'] }), { targets: 2 });
+  assert.ok(await waitFor(() => events.some(([n]) => n === 'turn')));
+  assert.ok(managerOf('Farm01').calls.includes('command:#где') && managerOf('Farm03').calls.includes('command:#где'));
+  assert.ok(!managerOf('Farm02').calls.includes('command:#где'));
+  await fleet.shutdown();
+});
+
 test('флот: «готов к делам» — после события бота; вышел из сети — уже не готов', async () => {
   const { fleet, managerOf } = makeFleet({ perProcess: 2, gapMs: 1 });
   fleet.setAccounts(accounts(2));
