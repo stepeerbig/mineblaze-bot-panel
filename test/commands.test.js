@@ -1478,6 +1478,61 @@ test('команды: #снаряжение — все сундуки склад
   assert.equal(r.ok, false, 'поножей нет — комплект неполный');
 });
 
+test('команды: #очисти — мусор в сундуки «Дома мусора» (полный — в следующий), одна стопка булыжника — себе, нужное остаётся', async () => {
+  const s = setup({
+    inventory: [['cobblestone', 64], ['cobblestone', 64], ['dirt', 40], ['wheat_seeds', 12], ['diamond', 5], ['rotten_flesh', 7], ['soul_sand', 10], ['gravel', 30], ['iron_pickaxe', 1]],
+    storage: {
+      // Ближний сундук почти полон: влезет одна стопка.
+      '2,64,-2': { items: Array.from({ length: 26 }, (_, i) => [i, 'stone', 64]) },
+      '6,64,4': { items: [] },
+    },
+  });
+  s.world.set(new Vec3(2, 64, -2), 'chest');
+  s.world.set(new Vec3(6, 64, 4), 'chest');
+  s.bot.panelConfig = { questJunk: 'мусор' };
+  const sent = [];
+  s.bot.sendCommand = (cmd) => {
+    sent.push(cmd);
+    setImmediate(() => teleport(s.bot, { x: 0.5, y: 64, z: 0.5 }));
+    return true;
+  };
+  const r = await s.run('#очисти', 900000);
+  const text = [].concat(r.message).join('\n');
+  assert.equal(r.ok, true, text);
+  assert.deepEqual(sent, ['/home мусор']);
+  const left = new Map();
+  for (const it of s.bot.inventory.slots.slice(9, 45)) if (it) left.set(it.name, (left.get(it.name) || 0) + it.count);
+  assert.deepEqual([...left].sort(), [['cobblestone', 64], ['diamond', 5], ['iron_pickaxe', 1], ['soul_sand', 10]], text);
+  assert.match(text, /Оставил себе для «столба»: cobblestone×64/);
+  assert.equal(r.data.chests, 2, 'ближний полон — дальше во второй');
+
+  // #добудь с забитым инвентарём: сходит разгрузиться на «Дом мусора» и докопает на новом месте.
+  const m = setup({ storage: { '2,64,-2': { items: [] } } });
+  m.world.set(new Vec3(2, 64, -2), 'chest');
+  m.bot.inventory.slots[36] = { name: 'iron_pickaxe', count: 1, displayName: 'iron_pickaxe' };
+  for (let i = 9; i < 45; i += 1) if (i !== 36) m.bot.inventory.slots[i] = { name: i % 2 ? 'dirt' : 'cobblestone', count: 64, displayName: 'x' };
+  m.bot.panelConfig = { questJunk: 'мусор' };
+  m.world.set(new Vec3(104, 62, 3), 'iron_ore');
+  const msent = [];
+  m.bot.sendCommand = (cmd) => {
+    msent.push(cmd);
+    setImmediate(() => teleport(m.bot, cmd === '/rtp' ? { x: 100.5, y: 64, z: 0.5 } : { x: 0.5, y: 64, z: 0.5 }));
+    return true;
+  };
+  const mr = await m.run('#добудь железо 1', 900000);
+  const mtext = [].concat(mr.message).join('\n');
+  assert.equal(mr.ok, true, mtext);
+  assert.deepEqual(msent, ['/rtp', '/home мусор', '/rtp']);
+  assert.match(mtext, /^Инвентарь забился — мусор в сундуки у дома «мусор»: /m);
+  assert.equal(mr.data.mined, 1);
+
+  // Без «Дома мусора» — понятная подсказка.
+  const n = setup({ inventory: [['dirt', 5]] });
+  const nr = await n.run('#очисти');
+  assert.equal(nr.ok, false);
+  assert.match([].concat(nr.message).join('\n'), /Впиши «Дом мусора» в настройках автопилота/);
+});
+
 test('команды: #добудь без кирки — /home на общий дом, кирка из сундука, потом /rtp и добыча там', async () => {
   const s = setup({ inventory: [['cobblestone', 16]], storage: { '2,64,-2': { items: [[0, 'stone_pickaxe', 1], [1, 'iron_pickaxe', 1]] } } });
   s.world.set(new Vec3(2, 64, -2), 'chest');

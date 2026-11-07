@@ -32,6 +32,7 @@ const DEFAULT_CONFIG = Object.freeze({
   aiModel: 'nvidia/nemotron-3-ultra-550b-a55b:free',
   // Автопилот заданий NPC (src/quest-autopilot.js): боты сами проходят задания Фермера, Алхимика, Оружейника.
   questAuto: false, // включён (после перезапуска панели продолжит сам)
+  questJunk: '', // дом мусора: сундуки, куда бот складывает землю, камень, семена… (#очисти; #добудь — когда инвентарь полон)
   questStorage: '', // дом склада с предметами для «Передайте…» (/home <имя> у каждого бота)
   questRewards: '', // дом склада наград
   questMobHomes: '', // комнаты мобов для «Убейте…»: строки «пауки: пауки» (кто: дом)
@@ -140,7 +141,7 @@ function sanitize(src) {
     out.ollamaModel = src.ollamaModel.trim().replace(/\s+/g, '').slice(0, 200) || DEFAULT_CONFIG.ollamaModel;
   }
   if (typeof src.questAuto === 'boolean') out.questAuto = src.questAuto;
-  for (const key of ['questStorage', 'questRewards', 'questFarm', 'questPen', 'questMine']) {
+  for (const key of ['questStorage', 'questRewards', 'questFarm', 'questPen', 'questMine', 'questJunk']) {
     if (typeof src[key] !== 'string') continue;
     const home = src[key].trim().replace(/^\/?home\s+/i, ''); // «/home урожай» — тоже можно
     if (!home || HOME_RE.test(home)) out[key] = home;

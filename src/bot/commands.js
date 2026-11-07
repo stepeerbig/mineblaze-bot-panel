@@ -1435,6 +1435,96 @@ async function cmdGear({ bot, args, words }) {
   return { ok: !r.data.missing.length, code: r.data.missing.length ? 'incomplete' : undefined, message: [...lines, ...r.lines], data: { home: base || null, ...r.data } };
 }
 
+// ---------- мусор — в отдельные сундуки ----------
+
+// Что бот считает мусором: земля и камень разных видов, гравий, песок, адский камень, семена, гнилая плоть…
+// Не мусор: песок душ, чернокамень (их просит Алхимик), кости, нитки, порох (задания «Принесите…»).
+const JUNK = new Set([
+  'dirt', 'coarse_dirt', 'rooted_dirt', 'mud', 'cobblestone', 'cobbled_deepslate', 'stone', 'deepslate', 'tuff', 'granite',
+  'diorite', 'andesite', 'calcite', 'dripstone_block', 'pointed_dripstone', 'gravel', 'sand', 'red_sand', 'netherrack',
+  'basalt', 'smooth_basalt', 'flint', 'wheat_seeds', 'beetroot_seeds', 'melon_seeds', 'pumpkin_seeds', 'torchflower_seeds',
+  'pitcher_pod', 'rotten_flesh', 'poisonous_potato',
+]);
+const MAX_JUNK_TRIPS = 3; // #добудь: столько раз за одну команду сходить разгрузиться
+
+/** Ячейка инвентаря (9–44) со стопкой, которую оставить себе: самая большая из блоков для «столба» — или null. */
+function keepPillarSlot(bot) {
+  const slots = bot.inventory && bot.inventory.slots ? bot.inventory.slots : [];
+  let best = null;
+  for (let i = 9; i < 45; i += 1) {
+    const it = slots[i];
+    if (it && PILLAR_BLOCKS.includes(it.name) && (best === null || (it.count || 1) > (slots[best].count || 1))) best = i;
+  }
+  return best;
+}
+
+/** Мусор в инвентаре (без стопки для «столба»): [{ name, count }]. */
+function junkItems(bot) {
+  const slots = bot.inventory && bot.inventory.slots ? bot.inventory.slots : [];
+  const keep = keepPillarSlot(bot);
+  const out = new Map();
+  for (let i = 9; i < 45; i += 1) {
+    const it = slots[i];
+    if (it && i !== keep && JUNK.has(it.name)) out.set(it.name, (out.get(it.name) || 0) + (it.count || 1));
+  }
+  return [...out].map(([name, count]) => ({ name, count }));
+}
+
+/**
+ * Сложить мусор в сундуки вокруг бота (до STORAGE_RANGE блоков), от ближнего: сундук полон — в следующий.
+ * Одну стопку блоков для «столба» бот оставляет себе. → { put: Map, left: [{ name, count }], opened, kept }
+ */
+async function depositJunk(bot) {
+  const chests = storageChests(bot);
+  if (!chests.length) throw new CommandError(`рядом нет сундуков для мусора (до ${STORAGE_RANGE} блоков)`);
+  const put = new Map();
+  let opened = 0;
+  const keep = keepPillarSlot(bot);
+  const kept = keep === null ? null : { name: bot.inventory.slots[keep].name, count: bot.inventory.slots[keep].count || 1 };
+  for (const c of chests) {
+    if (!junkItems(bot).length) break;
+    let chest;
+    try {
+      chest = await openStorage(bot, c.pos);
+    } catch (err) {
+      if (isFatal(err)) throw err;
+      continue;
+    }
+    opened += 1;
+    let rejected = false;
+    try {
+      const w = chest.window;
+      const keepObj = keep === null ? null : w.slots[w.inventoryStart + (keep - 9)];
+      const r = await moveStacks(bot, w, playerSlots(w), storageSlots(w), (it) => JUNK.has(it.name) && it !== keepObj);
+      for (const [name, n] of r.moved) put.set(name, (put.get(name) || 0) + n);
+      rejected = r.rejected;
+    } finally {
+      await closeAfter(bot);
+    }
+    if (rejected) break; // сервер не даёт класть (чужой сундук) — дальше не пробуем
+  }
+  return { put, left: junkItems(bot), opened, kept };
+}
+
+/** «#очисти [дом X | здесь]»: мусор из инвентаря — в сундуки «Дома мусора» (или в сундуки рядом). */
+async function cmdClean({ bot, args, words }) {
+  const hereAt = words.findIndex((w) => /^(?:здесь|тут|here)$/.test(w));
+  const { home } = homeArg(args, words, '#очисти дом мусор');
+  const base = hereAt >= 0 ? null : home || String((bot.panelConfig && bot.panelConfig.questJunk) || '').trim();
+  if (hereAt < 0 && !base) {
+    throw new CommandError('куда складывать мусор? Впиши «Дом мусора» в настройках автопилота (дом у сундуков для мусора), ' +
+      'или #очисти дом мусор, или #очисти здесь — в сундуки рядом');
+  }
+  if (!junkItems(bot).length) return { ok: true, message: 'Мусора в инвентаре нет', data: { put: [], left: [] } };
+  const lines = [];
+  if (base) await teleportBy(bot, `/home ${base}`);
+  const r = await depositJunk(bot);
+  lines.push(r.put.size ? `Мусор — в сундуки${base ? ` у дома «${base}»` : ' рядом'}: ${countsText(r.put)}` : 'Мусор положить не вышло');
+  if (r.kept) lines.push(`Оставил себе для «столба»: ${r.kept.name}×${r.kept.count}`);
+  if (r.left.length) lines.push(`Не влезло (сундуки полны или не открылись): ${r.left.map((x) => `${x.name}×${x.count}`).join(', ')}`);
+  return { ok: !r.left.length, code: r.left.length ? 'full' : undefined, message: lines, data: { home: base, put: countsData(r.put), left: r.left, chests: r.opened } };
+}
+
 /**
  * «#квесты принести урожай награды»: задания «Передайте…» целиком. У NPC (/warp ah) — взять новые задания и
  * посчитать, чего не хватает (с учётом инвентаря); /home урожай — взять это из сундуков у дома; /warp ah —
@@ -2775,16 +2865,37 @@ async function cmdMine({ bot, args: allArgs, words = [] }) {
   }
   await bot.actions.equip(pick);
   const progress = { mined: 0 };
+  const junkHome = String((bot.panelConfig && bot.panelConfig.questJunk) || '').trim();
   let r;
-  try {
-    r = await mine(bot, ore, want, pick, progress);
-  } catch (err) {
-    // Прервали (бот вышел, переход на другой сервер): задача (src/tasks.js) продолжит с остатка, а не с начала.
-    if (err && typeof err === 'object' && progress.mined > 0 && progress.mined < want) {
-      err.resume = `#добудь ${text} ${want - progress.mined}${here ? ' здесь' : ''}${home ? ` дом ${home}` : ''}`;
+  let total = 0;
+  let dugTotal = 0;
+  for (let trips = 0; ; trips += 1) {
+    progress.mined = 0;
+    try {
+      r = await mine(bot, ore, want - total, pick, progress);
+    } catch (err) {
+      // Прервали (бот вышел, переход на другой сервер): задача (src/tasks.js) продолжит с остатка, а не с начала.
+      const done = total + progress.mined;
+      if (err && typeof err === 'object' && done > 0 && done < want) {
+        err.resume = `#добудь ${text} ${want - done}${here ? ' здесь' : ''}${home ? ` дом ${home}` : ''}`;
+      }
+      throw err;
     }
-    throw err;
+    total += r.mined;
+    dugTotal += r.dug;
+    // Инвентарь забился — мусор в сундуки «Дома мусора» и дальше копать (на новом месте после /rtp).
+    if (r.note !== 'инвентарь полон' || !junkHome || total >= want || trips >= MAX_JUNK_TRIPS || !junkItems(bot).length) break;
+    await teleportBy(bot, `/home ${junkHome}`);
+    const d = await depositJunk(bot);
+    lines.push(`Инвентарь забился — мусор в сундуки у дома «${junkHome}»: ${d.put.size ? countsText(d.put) : 'положить не вышло'}`);
+    if (!freeSlots(bot) || here) break; // место не освободилось; «здесь» — назад на то место не попасть
+    await teleportBy(bot, RTP_CMD, { waitMs: RTP_WAIT_MS });
+    const p = bot.entity.position;
+    lines.push(`${RTP_CMD}: копаю дальше у ${Math.floor(p.x)} ${Math.floor(p.y)} ${Math.floor(p.z)}`);
+    pick = pickFor(bot, ore) || pick;
+    await bot.actions.equip(pick);
   }
+  r = { ...r, mined: total, dug: dugTotal };
   lines.push(r.mined
     ? `Добыл: ${ore.name} — блоков руды ${r.mined} (выпадает ${ore.item})`
     : r.denied ? `Не добыл «${ore.name}»: ${MINE_DENIED}` : `Руды «${ore.name}» не нашёл`);
@@ -3115,6 +3226,16 @@ const COMMANDS = [
       `до ${STORAGE_RANGE} блоков и взять лучшее, где бы оно ни лежало: броня на 4 места, меч, кирка (незерит → алмаз → железо…), ` +
       `щит во вторую руку, еда — до ${FOOD_WANT} штук (любая, кроме вредной); броню надевает сам; чего нет нигде — скажет`,
     run: cmdGear,
+  },
+  {
+    name: 'очисти',
+    aliases: ['очистить', 'мусор', 'выгрузи', 'clean'],
+    usage: ['#очисти', '#очисти дом мусор', '#очисти здесь'],
+    about: 'сложить мусор из инвентаря в сундуки: землю, камень разных видов, гравий, песок, адский камень, кремень, семена, ' +
+      'гнилую плоть, ядовитый картофель — на «Дом мусора» из настроек (или дом X; «здесь» — в сундуки рядом); сундук полон — в ' +
+      'следующий; одну стопку блоков (булыжник) оставляет себе для «столба»; песок душ, чернокамень, кости, нитки — не мусор. ' +
+      '#добудь делает это сам, когда инвентарь забился',
+    run: cmdClean,
   },
   {
     name: 'рентген',
