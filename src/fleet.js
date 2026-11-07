@@ -23,6 +23,8 @@ const DEFAULT_TIMINGS = Object.freeze({
   // Бот ждёт проверку «я не робот» (её проходит человек по ссылке) — столько новых в очередь входа не пускаем:
   // иначе ссылки сыплются пачкой, и сервер не дожидается проверки у остальных.
   captchaHoldMs: 90 * 1000,
+  // Сервер заблокировал IP («заблокирован на 10 минут»): новые входы ждут конца блокировки и ещё столько.
+  ipBlockExtraMs: 15 * 1000,
 });
 const STOP_RE = /^#\s*(?:стоп|stop|хватит|стой)(?:\s|$)/i;
 const REPLY_LINES = 6; // строк ответа сервера на «/…» — каждому боту
@@ -53,6 +55,8 @@ class Fleet extends EventEmitter {
     this._turn = null; // идущая очередь «по очереди» (см. runInTurn)
     this._captcha = new Map(); // номер бота → { since, url }: ждёт проверку «я не робот»
     this._lastAdmitAt = -Infinity;
+    this._ipBlockUntil = 0; // до какого времени сервер не пускает с нашего IP (кик «IP адрес заблокирован»)
+    this._batch = null; // последний «Старт»: кого запустили — чтобы, когда все войдут (или нет), сказать итог
     this._queueTimer = null;
     this._summaryPending = false;
     this._closed = false;
@@ -131,15 +135,26 @@ class Fleet extends EventEmitter {
       this._log('error', `Процесс ботов №${index + 1} не запустился: ${errText(err)}`);
     })));
     let started = 0;
+    const startedIds = [];
+    for (const b of list) b.lastProblem = '';
     // По одному и по порядку: в каком порядке боты попросятся в очередь входа, в таком и войдут.
     for (const b of list) {
       const w = this.workers[b.worker];
       if (failed.has(b.worker) || !w || !w.client || !this.bots.has(b.bot)) continue;
       try {
-        if (await w.client.request('start', { bot: b.bot })) started += 1;
+        if (await w.client.request('start', { bot: b.bot })) {
+          started += 1;
+          startedIds.push(b.bot);
+        }
       } catch (err) {
         this._log('error', `Не запустился: ${errText(err)}`, b.bot);
       }
+    }
+    if (startedIds.length > 1) {
+      const ids = new Set(this._batch ? this._batch.ids : []);
+      for (const id of startedIds) ids.add(id);
+      this._batch = { ids };
+      this._checkBatch();
     }
     return started;
   }
@@ -147,6 +162,9 @@ class Fleet extends EventEmitter {
   /** Остановить ботов (по номерам; без них — всех). Возвращает, скольких. */
   async stop(ids = null) {
     if (!ids) this.cancelTurn(); // «Стоп всех» останавливает и очередь
+    // Остановленных итог входа не ждёт (человек сам их остановил).
+    if (!ids) this._batch = null;
+    else if (this._batch) for (const id of ids) this._batch.ids.delete(String(id).toLowerCase());
     const list = this._pick(ids).filter((b) => RUNNING(b.state));
     const stopping = new Set(list.map((b) => b.bot));
     this.queue = this.queue.filter((id) => !stopping.has(id));
@@ -412,7 +430,7 @@ class Fleet extends EventEmitter {
         this.queue.shift(); // остановили, убрали из списка или уже входит
         continue;
       }
-      const hold = this._captchaHoldLeft();
+      const hold = this._holdLeft();
       if (hold > 0) {
         this._queueTimer = later(() => {
           this._queueTimer = null;
@@ -504,6 +522,10 @@ class Fleet extends EventEmitter {
       timings: this._clientTimings,
     });
     client.on('log', (e) => {
+      if (e && e.bot) {
+        const b = this.bots.get(e.bot);
+        if (b && (e.level === 'error' || e.level === 'kick')) b.lastProblem = String(e.text || '');
+      }
       if (e && e.bot) this._emitBot('log', e);
       else this.emit('log', { ...e, bot: null, nick: null });
     });
@@ -513,6 +535,7 @@ class Fleet extends EventEmitter {
     client.on('ready', (p) => this._onReady(p && p.bot));
     client.on('captcha', (c) => this._onCaptcha(c));
     client.on('captcha-done', (c) => this._onCaptchaDone(c && c.bot));
+    client.on('ip-block', (p) => this._onIpBlock(p));
     client.on('msa', (d) => this._emitBot('msa', d));
     client.on('ping', (p) => {
       const b = p && this.bots.get(p.bot);
@@ -549,6 +572,48 @@ class Fleet extends EventEmitter {
     this._pump();
   }
 
+  /** Кик «IP адрес заблокирован на N минут»: IP у всех ботов общий — новые входы ждут, пока блокировка не кончится. */
+  _onIpBlock(p) {
+    const b = p && this.bots.get(p.bot);
+    const until = Number(p && p.until) || 0;
+    if (!b || until <= this._ipBlockUntil) return;
+    const fresh = this._ipBlockUntil <= Date.now();
+    this._ipBlockUntil = until;
+    if (fresh) {
+      const at = new Date(until + this.timings.ipBlockExtraMs);
+      const hhmm = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`;
+      this._log('warn', `Сервер заблокировал наш IP на ${p.minutes} мин (кик ${b.nick}): входить сейчас бессмысленно — ` +
+        `каждая попытка продлевает блокировку. Новые входы ждут до ${hhmm}; боты в сети остаются в игре`);
+    }
+    clearTimeout(this._queueTimer); // очередь пересчитает, сколько ждать
+    this._queueTimer = null;
+    this._pump();
+  }
+
+  /** Сколько ещё очередь входа стоит: проверка «я не робот» или блокировка IP (0 — не стоит). */
+  _holdLeft() {
+    const ip = this._ipBlockUntil ? this._ipBlockUntil + this.timings.ipBlockExtraMs - Date.now() : 0;
+    return Math.max(this._captchaHoldLeft(), ip, 0);
+  }
+
+  /** Все из последнего «Старт» вошли или окончательно не вошли — итог одной строкой (кто не вошёл и почему). */
+  _checkBatch() {
+    const batch = this._batch;
+    if (!batch) return;
+    const list = [...batch.ids].map((id) => this.bots.get(id)).filter(Boolean);
+    if (list.some((b) => b.state === 'queued' || b.state === 'connecting' || b.state === 'reconnecting')) return;
+    this._batch = null;
+    const inGame = list.filter(IN_GAME);
+    const out = list.filter((b) => !IN_GAME(b));
+    if (!out.length) {
+      this._log('ok', `Вход окончен: в сети все ${list.length} из ${list.length}`);
+      return;
+    }
+    const shown = out.slice(0, 8).map((b) => `${b.nick}${b.lastProblem ? ` (${b.lastProblem.replace(/^Не удалось подключиться: /, '').slice(0, 90)})` : ''}`);
+    const more = out.length > shown.length ? `; и ещё ${out.length - shown.length}` : '';
+    this._log('warn', `Вход окончен: в сети ${inGame.length} из ${list.length}. Не вошли (${out.length}): ${shown.join('; ')}${more}`);
+  }
+
   /** Сколько ещё очередь входа ждёт проверку «я не робот» (0 — не ждёт). */
   _captchaHoldLeft() {
     let left = 0;
@@ -580,6 +645,7 @@ class Fleet extends EventEmitter {
     if (state === 'offline') b.ping = null;
     this.emit('state', { bot: id, nick: b.nick, state });
     this._summary();
+    this._checkBatch();
   }
 
   _onCrash(index, code, restarting) {

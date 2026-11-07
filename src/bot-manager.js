@@ -81,7 +81,12 @@ function later(fn, ms) {
 }
 
 const DEFAULT_TIMINGS = Object.freeze({
-  loginTimeout: 40 * 1000, // столько ждём входа на сервер, потом считаем попытку неудачной
+  // Столько ждём входа на сервер, потом считаем попытку неудачной. На MineBlaze вход — 1 с (95% — до 3 с), а повисший
+  // (прокси держит подключение и не пускает) не проходит и за 40 с: дольше ждать незачем — лучше повторить.
+  loginTimeout: 30 * 1000,
+  // Вход повис или сорвался ещё до входа (не кик за пароль, не бан) — повторить, даже без автореконнекта: паузы
+  // перед повторами, мс. Повторы встают в общую очередь входа (в её конец).
+  loginRetryDelays: [15 * 1000, 30 * 1000, 60 * 1000],
   msaTimeout: 15 * 60 * 1000, // вход через Microsoft: время, чтобы ввести код в браузере
   joinFirst: 1500, // пауза после появления в мире (или входа с паролем) перед первой командой
   joinStep: 1200, // пауза между командами после входа
@@ -104,6 +109,17 @@ const OUTBOX_SWITCH_WAIT_MS = 500; // пока прокси переводит �
 // чтобы не долбить лежащий сервер и не попасть под защиту от частых подключений.
 const BACKOFF_FREE_ATTEMPTS = 3;
 const BACKOFF_MAX_SECONDS = 60;
+// «Ваш IP адрес заблокирован на 10 минут» (MineBlaze — после череды неудачных входов): IP у всех ботов общий.
+const IP_BLOCK_RE = /(?:\bip\b|айпи)[^]{0,40}?(?:заблокир|блокир|blocked|banned|ban)/i;
+const IP_BLOCK_DEFAULT_MIN = 10;
+// Этапы входа (minecraft-protocol, client.state) — для понятной причины, когда вход повис.
+const STAGE_TEXT = {
+  tcp: 'сервер не ответил на подключение',
+  handshaking: 'подключение есть, а сервер не начал вход',
+  login: 'сервер принял подключение, но не ответил на вход (этап «login»)',
+  configuration: 'прокси держит бота на этапе настройки (configuration) и не пускает на сервер',
+  play: 'бот уже на сервере, но тот не прислал вход в мир',
+};
 
 // Ссылки от сервера (например, браузерная проверка «я не робот») могут прийти где угодно: в причине кика,
 // в окне-диалоге 1.21.6+, в заголовке на экране, в меню, на табличке. Смотрим все пакеты, кроме тяжёлых
@@ -153,6 +169,17 @@ const LINK_SOURCES = {
 };
 const MAX_LINKS_PER_SESSION = 30; // чтобы спам ссылками не забил консоль
 
+/** Кик «Ваш IP адрес заблокирован на 10 минут» — на сколько минут (нет числа — 10); не про блокировку IP — 0. */
+function ipBlockMinutes(text) {
+  const t = String(text || '');
+  if (!IP_BLOCK_RE.test(t)) return 0;
+  const m = t.match(/(\d+)\s*(?:мин|minute|min\b)/i);
+  const h = t.match(/(\d+)\s*(?:час|hour)/i);
+  if (m) return Math.min(24 * 60, parseInt(m[1], 10));
+  if (h) return Math.min(24 * 60, parseInt(h[1], 10) * 60);
+  return IP_BLOCK_DEFAULT_MIN;
+}
+
 /**
  * Управляет одним ботом mineflayer.
  *
@@ -168,7 +195,9 @@ const MAX_LINKS_PER_SESSION = 30; // чтобы спам ссылками не �
  *   'captcha' { time, url }          сервер ждёт проверку «я не робот» (её проходит человек по ссылке)
  *   'captcha-done' { time }          проверку прошли (или бот её больше не ждёт: отключился)
  *   'ping'  мс | null   пинг бота, как его считает сервер (он же — в Tab у игроков); null — бот не в сети
+ *   'ip-block' { time, until, minutes }  кик «IP адрес заблокирован»: до until входить бессмысленно (IP общий)
  */
+
 class BotManager extends EventEmitter {
   /**
    * @param {object}   opts
@@ -200,6 +229,7 @@ class BotManager extends EventEmitter {
     this.wantRun = false; // true между «Старт» и «Стоп» (или окончательным отказом)
     this.reconnectTimer = null;
     this.attempt = 0;
+    this.loginRetries = 0; // повторы входа без автореконнекта (timings.loginRetryDelays)
     this.announced = null; // какой бот последним объявлен событием 'bot'
     this.godMemory = new Map(); // ник → был ли включён режим бога (сервер помнит его и после перезахода)
     this.ping = null; // пинг, как его считает сервер (см. событие 'ping')
@@ -225,6 +255,7 @@ class BotManager extends EventEmitter {
     }
     this.wantRun = true;
     this.attempt = 0;
+    this.loginRetries = 0;
     this._begin();
     return true;
   }
@@ -527,6 +558,7 @@ class BotManager extends EventEmitter {
     s.journal.attach(bot._client);
     if (this.compat.profile) applyClientProfile(bot._client);
     this._watchSilence(s);
+    this._watchStage(s);
 
     // Охрана вне спавна и режим бога (src/bot/guard.js). Настройки берут живые: белый список меняется на ходу.
     const guardCtx = {
@@ -616,6 +648,7 @@ class BotManager extends EventEmitter {
       if (!s.spawned) {
         s.spawned = true;
         this.attempt = 0;
+        this.loginRetries = 0;
         this._setState('online');
         this.log('ok', 'В сети: бот появился в мире');
         this._afterSpawnAuth(s);
@@ -740,6 +773,11 @@ class BotManager extends EventEmitter {
       s.kickText = text;
       if (s.journal) s.journal.mark(`Кик: ${text}`);
       this.log('kick', `Кик${loggedIn === false ? ' при входе' : ''}: ${text}`);
+      const block = ipBlockMinutes(text);
+      if (block) {
+        s.ipBlockUntil = Date.now() + block * 60 * 1000;
+        this.emit('ip-block', { time: Date.now(), until: s.ipBlockUntil, minutes: block });
+      }
     });
 
     bot.on('clickHashUnknown', (type) => {
@@ -868,8 +906,29 @@ class BotManager extends EventEmitter {
   _loginTimeout(s, why) {
     if (this.cur !== s || s.loggedIn || s.stopping) return;
     s.reported = true;
-    this.log('error', `Не удалось подключиться: ${why}`);
+    const client = s.bot && s.bot._client;
+    const stage = s.stage ? STAGE_TEXT[s.stage] || `этап «${s.stage}»` : '';
+    const bytes = socketBytes(client);
+    const detail = stage ? ` — ${stage}${bytes !== null ? `; получено байт: ${bytes}` : ''}` : '';
+    this.log('error', `Не удалось подключиться: ${why}${detail}`);
+    if (s.journal && stage) {
+      s.journal.mark(`Вход повис: ${stage}; ${pipelineInfo(client)}`);
+      this._saveJournal(s, `вход повис: ${stage}`);
+    }
     this._forceClose(s, 'timeout');
+  }
+
+  /** Этап входа (TCP, handshaking, login, configuration, play) — чтобы по повисшему входу было видно, где. */
+  _watchStage(s) {
+    const client = s.bot && s.bot._client;
+    if (!client || typeof client.on !== 'function') return;
+    s.stage = 'tcp';
+    client.on('connect', () => {
+      if (s.stage === 'tcp') s.stage = 'handshaking';
+    });
+    client.on('state', (state) => {
+      if (typeof state === 'string') s.stage = state;
+    });
   }
 
   /**
@@ -1183,7 +1242,11 @@ class BotManager extends EventEmitter {
       this.log('error', `Не удалось подключиться: ${describeEnd(reason)}`);
     }
 
-    this._setState('offline');
+    // Будет повтор — сразу «переподключается», без мигания «не в сети» (по нему флот решил бы, что вход окончен).
+    const delays = this.timings.loginRetryDelays || [];
+    const willRetry = !manual && !s.noRetry &&
+      (this.config.autoReconnect || (!s.loggedIn && this.loginRetries < delays.length));
+    if (!willRetry) this._setState('offline');
     if (manual) {
       this.log('warn', 'Не в сети: бот остановлен');
     } else if (s.kicked) {
@@ -1214,21 +1277,39 @@ class BotManager extends EventEmitter {
       this._saveJournal(s, s.kickText ? `кик: ${s.kickText}` : `соединение прервано: ${describeEnd(reason)}`);
     }
 
-    if (!manual && this.config.autoReconnect && s.noRetry) {
-      this.log('warn', `Автореконнект не запущен: ${s.noRetry}`);
+    if (!manual && s.noRetry) {
+      if (this.config.autoReconnect) this.log('warn', `Автореконнект не запущен: ${s.noRetry}`);
+      else if (!s.loggedIn) this.log('warn', `Повторять вход не буду: ${s.noRetry}`);
       this.wantRun = false;
       return;
     }
+    // IP заблокирован — раньше, чем блокировка кончится, входить бессмысленно (и каждая попытка её продлевает).
+    const blockLeft = s.ipBlockUntil ? Math.max(0, Math.ceil((s.ipBlockUntil - Date.now()) / 1000)) + 15 : 0;
     if (!manual && this.config.autoReconnect) {
-      this._scheduleReconnect();
-    } else {
-      this.wantRun = false;
+      this._scheduleReconnect(blockLeft);
+      return;
     }
+    // Без автореконнекта: вход повис или сорвался ещё до входа — повторить несколько раз (через очередь входа).
+    if (!manual && !s.loggedIn && this.loginRetries < delays.length) {
+      const ms = Math.max(delays[this.loginRetries], blockLeft * 1000);
+      this.loginRetries += 1;
+      this._setState('reconnecting');
+      this.log('warn', `Вход не удался — попробую ещё раз через ${Math.max(1, Math.round(ms / 1000))} с (повтор ${this.loginRetries} из ${delays.length})`);
+      this.reconnectTimer = later(() => {
+        this.reconnectTimer = null;
+        if (this.wantRun) this._begin();
+      }, ms);
+      return;
+    }
+    if (!manual && !s.loggedIn && delays.length) {
+      this.log('error', `Не вошёл и после ${delays.length} повторов — запусти бота позже (или включи «Переподключаться»)`);
+    }
+    this.wantRun = false;
   }
 
-  _scheduleReconnect() {
+  _scheduleReconnect(minDelay = 0) {
     this.attempt += 1;
-    const delay = this.reconnectDelayFor(this.attempt);
+    const delay = Math.max(this.reconnectDelayFor(this.attempt), minDelay);
     this._setState('reconnecting');
     this.log('warn', `Автореконнект: подключение через ${delay} с (попытка ${this.attempt})…`);
     this.reconnectTimer = later(() => {
@@ -1238,4 +1319,4 @@ class BotManager extends EventEmitter {
   }
 }
 
-module.exports = { BotManager };
+module.exports = { BotManager, ipBlockMinutes };

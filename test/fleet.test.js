@@ -213,6 +213,34 @@ test('флот: проверка «я не робот» — очередь вх�
   await fleet.shutdown();
 });
 
+test('флот: «IP заблокирован» — очередь входа ждёт конца блокировки у всех; итог входа — кто не вошёл и почему', async () => {
+  const { fleet, managerOf, events } = makeFleet({ perProcess: 3, gapMs: 200, timings: { ipBlockExtraMs: 0 } });
+  fleet.setAccounts(accounts(3));
+  await fleet.start();
+  assert.ok(await waitFor(() => fleet.get('Farm01').state === 'online'));
+  const since = Date.now();
+  managerOf('Farm01').emit('ip-block', { time: since, until: since + 500, minutes: 10 });
+  assert.ok(await waitFor(() => events.some(([n, p]) => n === 'log' && /^Сервер заблокировал наш IP на 10 мин \(кик Farm01\)/.test(p.text))));
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(fleet.get('Farm02').state, 'queued', 'пока IP заблокирован, следующий не входит');
+  // Farm03 так и не вошёл (в его консоли — причина): итог входа это скажет.
+  managerOf('Farm03').emit('log', { time: 1, level: 'error', text: 'Не удалось подключиться: вход не завершился за 30 с — прокси держит бота' });
+  managerOf('Farm03')._set('offline');
+  assert.ok(await waitFor(() => fleet.get('Farm02').state === 'online', 2000), 'блокировка кончилась — входит');
+  assert.ok(Date.now() - since >= 450, `ждала ${Date.now() - since} мс`);
+  assert.ok(await waitFor(() => events.some(([n, p]) => n === 'log' && p.text ===
+    'Вход окончен: в сети 2 из 3. Не вошли (1): Farm03 (вход не завершился за 30 с — прокси держит бота)')),
+  events.filter(([n]) => n === 'log').map(([, p]) => p.text).join(' | '));
+
+  // Все вошли — так и сказано.
+  await fleet.stop();
+  await waitFor(() => fleet.summary().offline === 3);
+  events.length = 0;
+  await fleet.start();
+  assert.ok(await waitFor(() => events.some(([n, p]) => n === 'log' && p.text === 'Вход окончен: в сети все 3 из 3'), 3000));
+  await fleet.shutdown();
+});
+
 test('флот: группе — «сразу» и «по очереди» только её ботам в сети', async () => {
   const { fleet, managerOf, events } = makeFleet({ perProcess: 2, gapMs: 1, timings: { turnGap: 5 } });
   fleet.setAccounts(accounts(4));

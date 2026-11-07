@@ -8,7 +8,7 @@ const path = require('node:path');
 const EventEmitter = require('node:events');
 
 const SRC = path.join(__dirname, '..', 'src');
-const { BotManager } = require(path.join(SRC, 'bot-manager.js'));
+const { BotManager, ipBlockMinutes } = require(path.join(SRC, 'bot-manager.js'));
 const { chatToText, describeError, describeEnd, noRetryReason, maskSecrets } = require(path.join(SRC, 'chat-utils.js'));
 const { parseMotd, readableHex } = require(path.join(SRC, 'renderer', 'motd.js'));
 const { sanitize, validate, parseJoinCommands, parseAccounts, accountsOf, DEFAULT_CONFIG, MAX_ACCOUNTS } = require(path.join(SRC, 'config.js'));
@@ -53,7 +53,8 @@ function setup(over = {}, timings = {}, extra = {}) {
     config,
     authCacheDir: '/tmp/auth',
     // Паузы между командами в чат проверяются отдельно (см. «очередь команд»); здесь команды уходят сразу.
-    timings: { commandGap: 0, ...timings },
+    // Повторы входа (loginRetryDelays) проверяются отдельно; здесь неудачный вход — сразу «не в сети».
+    timings: { commandGap: 0, loginRetryDelays: [], ...timings },
     createBot: (opts) => {
       const b = new FakeBot(opts);
       bots.push(b);
@@ -415,6 +416,91 @@ test('сервер молчит: «Подключение…» не висит �
   assert.equal(mgr.state, 'offline');
   assert.ok(bots[0].socketDestroyed);
   assert.ok(lines(logs).some((x) => x.startsWith('error:Не удалось подключиться: вход не завершился')));
+});
+
+// Бот, у которого видно этапы входа (minecraft-protocol: 'connect', 'state').
+function setupStaged(over = {}, timings = {}) {
+  const made = [];
+  const t = setup(over, timings, {
+    createBot: (opts) => {
+      const b = new FakeBot(opts);
+      b._client = Object.assign(new EventEmitter(), { socket: { destroy: () => { b.socketDestroyed = true; } } });
+      made.push(b);
+      return b;
+    },
+  });
+  return { ...t, bots: made };
+}
+const waitUntil = async (check, ms = 2000) => {
+  for (let t = 0; t < ms; t += 5) {
+    if (check()) return true;
+    await sleep(5);
+  }
+  return false;
+};
+
+test('вход повис: в причине — этап, повтор и без автореконнекта (по очереди пауз), потом — «не вошёл»', async () => {
+  const { mgr, bots, logs, states } = setupStaged({ autoReconnect: false }, { loginTimeout: 40, loginRetryDelays: [30, 30] });
+  mgr.start();
+  bots[0]._client.emit('connect');
+  bots[0]._client.emit('state', 'configuration', 'login');
+  assert.ok(await waitUntil(() => mgr.state === 'reconnecting'));
+  assert.deepEqual(states, ['connecting', 'reconnecting'], 'перед повтором — без «не в сети» (флот решил бы, что вход окончен)');
+  assert.ok(lines(logs).some((x) => x.startsWith('error:Не удалось подключиться: вход не завершился') &&
+    x.includes('прокси держит бота на этапе настройки (configuration)')), lines(logs).join(' | '));
+  assert.ok(lines(logs).includes('warn:Вход не удался — попробую ещё раз через 1 с (повтор 1 из 2)'));
+  assert.ok(await waitUntil(() => bots.length === 2), 'повтор — новое подключение');
+  assert.ok(await waitUntil(() => bots.length === 3 && mgr.state === 'offline'), `${bots.length} ${mgr.state}`);
+  assert.ok(lines(logs).includes('warn:Вход не удался — попробую ещё раз через 1 с (повтор 2 из 2)'));
+  assert.ok(lines(logs).includes('error:Не вошёл и после 2 повторов — запусти бота позже (или включи «Переподключаться»)'));
+  // Сервер не ответил даже на подключение — так и сказано.
+  assert.ok(lines(logs).some((x) => x.includes('сервер не ответил на подключение')));
+});
+
+test('вход повис, а повтор прошёл — счётчик повторов с нуля; «Стоп» во время паузы — повтора нет', async () => {
+  const { mgr, bots, logs } = setupStaged({}, { loginTimeout: 30, loginRetryDelays: [20, 20] });
+  mgr.start();
+  assert.ok(await waitUntil(() => bots.length === 2));
+  goOnline(bots[1]);
+  assert.equal(mgr.state, 'online');
+  assert.equal(mgr.loginRetries, 0);
+  bots[1].emit('end', 'socketClosed'); // обрыв уже после входа: без автореконнекта — не повторяем
+  assert.equal(mgr.state, 'offline');
+  mgr.start();
+  assert.ok(await waitUntil(() => mgr.state === 'reconnecting'));
+  mgr.stop();
+  assert.equal(mgr.state, 'offline');
+  await sleep(60);
+  assert.equal(bots.length, 3, 'после «Стоп» нового подключения нет');
+  assert.ok(lines(logs).includes('warn:Не в сети: переподключение отменено'));
+});
+
+test('кик «IP адрес заблокирован на 10 минут»: событие ip-block, повтор — не раньше конца блокировки; бан — без повторов', async () => {
+  const { mgr, bots, logs } = setupStaged({}, { loginTimeout: 1000, loginRetryDelays: [20] });
+  const blocks = [];
+  mgr.on('ip-block', (b) => blocks.push(b));
+  mgr.start();
+  bots[0].emit('kicked', { type: 'string', value: '§cВаш IP адрес заблокирован на 10 минут' }, false);
+  bots[0].emit('end', 'socketClosed');
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0].minutes, 10);
+  assert.ok(blocks[0].until - Date.now() > 9 * 60 * 1000);
+  assert.equal(mgr.state, 'reconnecting');
+  assert.ok(lines(logs).some((x) => /^warn:Вход не удался — попробую ещё раз через 61\d с/.test(x)), lines(logs).join(' | '));
+  mgr.stop();
+
+  const banned = setupStaged({}, { loginTimeout: 1000, loginRetryDelays: [20] });
+  banned.mgr.start();
+  banned.bots[0].emit('kicked', { type: 'string', value: 'Вы забанены' }, false);
+  banned.bots[0].emit('end', 'socketClosed');
+  assert.equal(banned.mgr.state, 'offline');
+  assert.ok(lines(banned.logs).includes('warn:Повторять вход не буду: аккаунт забанен'));
+
+  assert.equal(ipBlockMinutes('Ваш IP адрес заблокирован на 10 минут'), 10);
+  assert.equal(ipBlockMinutes('Your IP is banned for 2 hours'), 120);
+  assert.equal(ipBlockMinutes('IP заблокирован'), 10);
+  assert.equal(ipBlockMinutes('Вы забанены'), 0);
+  assert.equal(ipBlockMinutes('Вы не успели авторизироваться'), 0);
 });
 
 test('нельзя запустить второй раз', () => {
