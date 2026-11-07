@@ -36,6 +36,16 @@ const el = {
   guardOn: $('guardOn'),
   godOn: $('godOn'),
   liveBg: $('liveBg'),
+  taskTag: $('taskTag'),
+  taskSteps: $('taskSteps'),
+  taskTarget: $('taskTarget'),
+  taskRepeat: $('taskRepeat'),
+  taskAdd: $('taskAdd'),
+  taskStatus: $('taskStatus'),
+  taskList: $('taskList'),
+  taskTools: $('taskTools'),
+  taskPauseAll: $('taskPauseAll'),
+  taskResumeAll: $('taskResumeAll'),
   whitelist: $('whitelist'),
   questTag: $('questTag'),
   questToggle: $('questToggle'),
@@ -176,6 +186,9 @@ function appendLinkified(target, text) {
 
 const hiddenByFilter = (row) => el.onlySelected.checked && Boolean(row.dataset.bot) && row.dataset.bot !== selected;
 
+// Метка у строки консоли: кто её написал, кроме бота и панели.
+const SOURCE_TAGS = { ai: ['ИИ', 'ИИ-помощник'], quests: ['Авто', 'Автопилот заданий'], tasks: ['Задача', 'Задачи ботам'] };
+
 function addConsole({ bot = null, nick = null, source = null, time, level, text }) {
   const lv = LEVELS.includes(level) ? level : 'info';
 
@@ -190,11 +203,10 @@ function addConsole({ bot = null, nick = null, source = null, time, level, text 
 
   const { row, ts, tx } = makeRow(time, `lv-${lv}`);
   row.dataset.bot = bot || '';
-  if (source === 'ai' || source === 'quests') {
+  if (SOURCE_TAGS[source]) {
     const tag = document.createElement('span');
     tag.className = 'ai-tag';
-    tag.title = source === 'ai' ? 'ИИ-помощник' : 'Автопилот заданий';
-    tag.textContent = source === 'ai' ? 'ИИ' : 'Авто';
+    [tag.textContent, tag.title] = SOURCE_TAGS[source];
     tx.append(tag, ' ');
   }
   if (nick) {
@@ -318,6 +330,7 @@ function setSelected(id) {
   }
   updateSelectedUi();
   applyConsoleFilter();
+  renderTasks(taskItems); // сначала — задачи выбранного бота
 }
 
 async function choose(id) {
@@ -830,6 +843,112 @@ for (const field of [el.questStorage, el.questRewards, el.questFarm, el.questPen
 }
 el.questStorage.addEventListener('input', updateQuestSetupTag);
 bridge.onQuestsStatus(renderQuests);
+
+// ---------- задачи ботам (src/tasks.js) ----------
+
+let taskItems = [];
+const TASK_ROWS = 12; // строк в списке — не больше (у 70 ботов задач много: остальные — числом)
+
+function taskRow(t) {
+  const row = document.createElement('div');
+  row.className = 'task';
+  row.dataset.state = t.state;
+  const head = document.createElement('div');
+  head.className = 'task-head';
+  const state = document.createElement('span');
+  state.className = 'task-state';
+  state.textContent = t.stateText;
+  const who = document.createElement('span');
+  who.className = 'task-who';
+  who.textContent = t.nick;
+  const step = document.createElement('span');
+  step.className = 'task-step';
+  step.textContent = `шаг ${t.step}/${t.total}${t.repeat ? ` · круг ${t.rounds + 1}` : ''}`;
+  head.append(state, who, step);
+  row.append(head);
+  const now = document.createElement('div');
+  now.className = 'task-now';
+  now.textContent = t.state === 'done' ? t.steps.join(' → ') : t.current;
+  now.title = t.steps.join('\n');
+  row.append(now);
+  if (t.note && t.state !== 'running') {
+    const note = document.createElement('div');
+    note.className = 'task-note';
+    note.textContent = t.note;
+    row.append(note);
+  }
+  const tools = document.createElement('div');
+  tools.className = 'task-tools';
+  const button = (label, action, title) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'link';
+    b.textContent = label;
+    b.title = title;
+    b.addEventListener('click', () => bridge.tasksControl(action, t.id));
+    tools.append(b);
+  };
+  if (t.state === 'paused' || t.state === 'error') button('▶ Продолжить', 'resume', t.state === 'error' ? 'Повторить шаг, на котором остановилась' : 'Продолжить с того же шага');
+  else if (t.state !== 'done') button('⏸ Пауза', 'pause', 'Приостановить (боту — #стоп); продолжить можно с того же шага');
+  button(t.state === 'done' ? 'Убрать' : '✕ Убрать', 'cancel', 'Убрать задачу из списка');
+  row.append(tools);
+  return row;
+}
+
+function renderTasks(list) {
+  taskItems = Array.isArray(list) ? list : [];
+  const active = taskItems.filter((t) => t.state !== 'done');
+  const count = (st) => taskItems.filter((t) => t.state === st).length;
+  const parts = [['идут', count('running')], ['ждут бота', count('waiting')], ['в очереди', count('queued')], ['на паузе', count('paused')], ['с ошибкой', count('error')], ['готово', count('done')]]
+    .filter(([, n]) => n).map(([w, n]) => `${w} ${n}`);
+  el.taskStatus.textContent = taskItems.length ? `Задач: ${active.length}${parts.length ? ` — ${parts.join(', ')}` : ''}` : '';
+  el.taskStatus.className = count('error') ? 'ai-status warn' : active.length ? 'ai-status ok' : 'ai-status';
+  const errors = count('error');
+  el.taskTag.hidden = !active.length;
+  el.taskTag.className = errors ? 'tag warn' : 'tag';
+  el.taskTag.textContent = errors ? `ошибок ${errors}` : `${active.length}`;
+  el.taskTools.hidden = active.length < 2;
+  // Сначала — задачи выбранного бота (и его готовые), потом незаконченные у остальных.
+  const mine = taskItems.filter((t) => t.bot === selected);
+  const others = active.filter((t) => t.bot !== selected);
+  const shown = [...mine.filter((t) => t.state !== 'done'), ...mine.filter((t) => t.state === 'done').slice(-3), ...others].slice(0, TASK_ROWS);
+  el.taskList.replaceChildren(...shown.map(taskRow));
+  const hidden = mine.length + others.length - shown.length;
+  if (hidden > 0) {
+    const more = document.createElement('p');
+    more.className = 'hint';
+    more.textContent = `…и ещё задач: ${hidden} (выбери бота в списке — покажу его задачи первыми)`;
+    el.taskList.append(more);
+  }
+  if (taskItems.some((t) => t.state === 'done')) {
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'link';
+    clear.textContent = 'Убрать готовые';
+    clear.addEventListener('click', () => bridge.tasksControl('clear-done'));
+    el.taskList.append(clear);
+  }
+}
+
+el.taskAdd.addEventListener('click', async () => {
+  const text = el.taskSteps.value;
+  el.taskAdd.disabled = true;
+  try {
+    const r = await bridge.tasksAdd(text, el.taskTarget.value, el.taskRepeat.checked);
+    if (r && r.ok) {
+      el.taskStatus.className = 'ai-status ok';
+      el.taskStatus.textContent = r.added > 1 ? `Задача добавлена ботам: ${r.added}` : 'Задача добавлена';
+    } else {
+      el.taskStatus.className = 'ai-status warn';
+      el.taskStatus.textContent = `Не добавлено: ${(r && r.error) || 'ошибка'}`;
+    }
+  } finally {
+    el.taskAdd.disabled = false;
+  }
+});
+el.taskPauseAll.addEventListener('click', () => bridge.tasksControl('pause'));
+el.taskResumeAll.addEventListener('click', () => bridge.tasksControl('resume'));
+bridge.onTasks(renderTasks);
 // «Следующая проверка через …» и кто чем занят — освежать, пока автопилот включён.
 setInterval(async () => {
   if (questState && questState.running && !document.hidden) renderQuests(await bridge.questsStatus());
@@ -939,7 +1058,7 @@ bridge.onList(({ bots: list, selected: sel }) => {
   if (changed && sel) choose(sel);
 });
 
-bridge.init().then(({ config, bots: list, summary: s, selected: sel, chat, ai, quests }) => {
+bridge.init().then(({ config, bots: list, summary: s, selected: sel, chat, ai, quests, tasks }) => {
   fillForm(config);
   renderList(list, sel);
   applySummary(s);
@@ -947,4 +1066,5 @@ bridge.init().then(({ config, bots: list, summary: s, selected: sel, chat, ai, q
   setAiRunning(ai && ai.running);
   refreshAiStatus();
   renderQuests(quests);
+  renderTasks(tasks);
 });

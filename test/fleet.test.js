@@ -213,6 +213,26 @@ test('флот: проверка «я не робот» — очередь вх�
   await fleet.shutdown();
 });
 
+test('флот: «готов к делам» — после события бота; вышел из сети — уже не готов', async () => {
+  const { fleet, managerOf } = makeFleet({ perProcess: 2, gapMs: 1 });
+  fleet.setAccounts(accounts(2));
+  const ready = [];
+  fleet.on('ready', (p) => ready.push(p.nick));
+  await fleet.start();
+  assert.ok(await waitFor(() => fleet.isReady('farm01') && fleet.isReady('farm02')));
+  assert.deepEqual(ready.sort(), ['Farm01', 'Farm02']);
+  const whileOut = [];
+  fleet.on('state', (p) => {
+    if (p.bot === 'farm01' && p.state !== 'online') whileOut.push(fleet.isReady('farm01'));
+  });
+  managerOf('Farm01').drop(); // обрыв: бот снова в очереди входа
+  assert.ok(await waitFor(() => ready.length === 3), 'вошёл снова — снова готов');
+  assert.ok(whileOut.length && whileOut.every((r) => r === false), `пока не в сети — не готов: ${whileOut}`);
+  assert.equal(fleet.isReady('farm01'), true);
+  assert.equal(fleet.isReady('nobody'), false);
+  await fleet.shutdown();
+});
+
 test('флот: упал процесс — его боты не в сети; после перезапуска с автореконнектом снова входят', async () => {
   const { fleet, mem, events } = makeFleet({ perProcess: 2, gapMs: 1, autoReconnect: true });
   fleet.setAccounts(accounts(3));

@@ -504,6 +504,7 @@ class Fleet extends EventEmitter {
     client.on('chat', (m) => this._emitBot('chat', m));
     client.on('state', (p) => this._onState(p && p.bot, p && p.state));
     client.on('link', (l) => this._emitBot('link', l));
+    client.on('ready', (p) => this._onReady(p && p.bot));
     client.on('captcha', (c) => this._onCaptcha(c));
     client.on('captcha-done', (c) => this._onCaptchaDone(c && c.bot));
     client.on('msa', (d) => this._emitBot('msa', d));
@@ -550,10 +551,25 @@ class Fleet extends EventEmitter {
     return left;
   }
 
+  /** Бот готов к делам: вход с паролем и команды после входа прошли (BotManager, событие 'ready'). */
+  _onReady(id) {
+    const b = this.bots.get(id);
+    if (!b || !IN_GAME(b)) return;
+    b.ready = true;
+    this.emit('ready', { bot: b.bot, nick: b.nick });
+  }
+
+  /** В игре и готов к делам (задачи, src/tasks.js): вошёл, автовход и команды после входа прошли. */
+  isReady(id) {
+    const b = this.get(id);
+    return Boolean(b && b.ready && IN_GAME(b));
+  }
+
   _onState(id, state) {
     const b = this.bots.get(id);
     if (!b || !state || b.state === state) return;
     b.state = state;
+    if (!IN_GAME(b)) b.ready = false;
     if (state === 'offline' || state === 'reconnecting') this._onCaptchaDone(id); // проверку он уже не ждёт
     if (state === 'offline') b.ping = null;
     this.emit('state', { bot: id, nick: b.nick, state });

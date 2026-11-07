@@ -596,6 +596,52 @@ test('проверка «я не робот»: ссылка — в консол�
   assert.deepEqual(events, [['captcha', url], ['done'], ['captcha', `${url.replace('abc', 'xyz')}`], ['done']]);
 });
 
+test('готов к делам (для задач): без пароля — после команд входа; с паролем — только после входа; переход на другой сервер — после него', async () => {
+  const readyAt = (mgr) => new Promise((r) => mgr.once('ready', () => r(Date.now())));
+  const a = setup({ joinCommands: '/g5' }, { joinFirst: 10, joinStep: 10, readySettle: 30 });
+  const at = readyAt(a.mgr);
+  a.mgr.start();
+  const t0 = Date.now();
+  goOnline(a.bots[0]);
+  assert.ok((await at) - t0 >= 35, 'после /g5 и паузы');
+  a.mgr.shutdown();
+
+  const b = setup({ loginPassword: 'pw' }, { joinFirst: 10, readySettle: 20, authWait: 5000 });
+  let ready = false;
+  b.mgr.on('ready', () => { ready = true; });
+  b.mgr.start();
+  goOnline(b.bots[0]);
+  serverSays(b.bots[0], '| Авторизируйтесь » /login [пароль]');
+  await sleep(60);
+  assert.equal(ready, false, 'пока не вошёл — не готов');
+  serverSays(b.bots[0], '| Вы успешно авторизовались');
+  await sleep(60);
+  assert.equal(ready, true);
+  b.mgr.shutdown();
+
+  // Команда входа перевела на другой сервер: готов — когда переход закончился (и бот устоялся).
+  let fake = null;
+  const c = setup({ joinCommands: '/g5' }, { joinFirst: 10, readySettle: 20 }, {
+    createBot: (opts) => {
+      fake = new FakeBot(opts);
+      fake._client = Object.assign(new EventEmitter(), { socket: { destroy() {} } }); // у клиента есть события протокола
+      return fake;
+    },
+  });
+  let readyC = false;
+  c.mgr.on('ready', () => { readyC = true; });
+  c.mgr.start();
+  goOnline(fake);
+  await sleep(15);
+  fake._client.emit('start_configuration'); // прокси переводит бота на другой сервер
+  await sleep(60);
+  assert.equal(readyC, false, 'идёт переход — не готов');
+  fake.emit('login'); // переход выполнен
+  await sleep(60);
+  assert.equal(readyC, true);
+  c.mgr.shutdown();
+});
+
 test('автовход отменяется, если бот отключился раньше', async () => {
   const { mgr, bots } = setup({ loginPassword: 'pw' }, { joinFirst: 40 });
   mgr.start();

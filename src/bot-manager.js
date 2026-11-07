@@ -90,6 +90,9 @@ const DEFAULT_TIMINGS = Object.freeze({
   // Сервер снова просит войти — повторить не раньше, чем через столько после прошлой команды: напоминание
   // (MineBlaze — каждые ~3 с) могло уйти ещё до неё, а команду сразу за другой MineBlaze молча пропускает.
   authRetry: 4000,
+  // Готов к делам (событие 'ready' — задачи, src/tasks.js): столько после последней команды входа (или после перехода
+  // на другой сервер, если она его начала) — команда вроде /g5 переводит не сразу.
+  readySettle: 4000,
   // Между командами (и сообщениями) в чат. MineBlaze молча пропускает команду, пришедшую меньше чем через
   // ~1 с после предыдущей: так терялся /spawn охраны сразу за /near и второй /god подряд.
   commandGap: 1500,
@@ -160,6 +163,7 @@ const MAX_LINKS_PER_SESSION = 30; // чтобы спам ссылками не �
  *   'msa'   { verification_uri, user_code }                                  (вход через Microsoft)
  *   'bot'   bot | null   бот появился в мире / пропал (для «Экрана бота»; без повторов, см. getBot)
  *   'link'  { time, url, source }   сервер прислал ссылку для человека (например, проверка «я не робот»)
+ *   'ready' { time }                 готов к делам: вошёл, автовход и команды после входа прошли (раз за сессию)
  *   'captcha' { time, url }          сервер ждёт проверку «я не робот» (её проходит человек по ссылке)
  *   'captcha-done' { time }          проверку прошли (или бот её больше не ждёт: отключился)
  *   'ping'  мс | null   пинг бота, как его считает сервер (он же — в Tab у игроков); null — бот не в сети
@@ -381,6 +385,7 @@ class BotManager extends EventEmitter {
     clearTimeout(s.loginTimer);
     clearTimeout(s.joinTimer);
     clearTimeout(s.authTimer);
+    clearTimeout(s.readyTimer);
     clearInterval(s.silenceTimer);
     clearTimeout(s.outboxTimer);
     s.outboxTimer = null;
@@ -470,6 +475,9 @@ class BotManager extends EventEmitter {
       auth: { done: false, confirmed: false, doneAt: 0, failed: false, tries: 0, sent: null, sentAt: 0, pending: null, template: '', noted: new Set() },
       authTimer: null,
       joinStarted: false, // команды после входа уже пошли
+      ready: false, // готов к делам (событие 'ready')
+      readyTimer: null,
+      readyAfterSwitch: false, // пора бы быть готовым, но идёт переход на другой сервер — после него
       captcha: null, // ссылка проверки «я не робот», которую ждёт сервер
     };
     const alive = () => this.cur === s;
@@ -589,6 +597,11 @@ class BotManager extends EventEmitter {
       if (!alive() || !s.switching) return;
       s.switching = false;
       this.log('ok', 'Переход на другой сервер выполнен');
+      if (s.readyAfterSwitch) {
+        s.readyAfterSwitch = false;
+        clearTimeout(s.readyTimer);
+        s.readyTimer = later(() => this._checkReady(s), this.timings.readySettle);
+      }
       s.god.schedule(GOD_AFTER_SWITCH_MS); // на новом сервере режим бога — свой
     });
 
@@ -1083,6 +1096,21 @@ class BotManager extends EventEmitter {
     if (cmds.length) s.joinTimer = later(next, this.timings.joinFirst);
     // Режим бога — после команд входа (если они переведут на другой сервер, проверка перенесётся туда).
     s.god.schedule(this.timings.joinFirst + cmds.length * this.timings.joinStep + GOD_AFTER_JOIN_MS);
+    // Готов к делам — когда команды входа ушли и бот устоялся (переход на другой сервер — после него).
+    clearTimeout(s.readyTimer);
+    s.readyTimer = later(() => this._checkReady(s), (cmds.length ? this.timings.joinFirst + (cmds.length - 1) * this.timings.joinStep : 0) + this.timings.readySettle);
+  }
+
+  /** Бот готов к делам (событие 'ready', один раз за сессию): вошёл, автовход и команды после входа прошли. */
+  _checkReady(s) {
+    s.readyTimer = null;
+    if (this.cur !== s || s.stopping || s.ready) return;
+    if (s.switching) {
+      s.readyAfterSwitch = true; // переход на другой сервер ещё идёт — после него
+      return;
+    }
+    s.ready = true;
+    this.emit('ready', { time: Date.now() });
   }
 
   _forceClose(s, reason) {

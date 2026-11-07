@@ -1201,6 +1201,23 @@ test('команды: #добудь — подошёл зомби: бросае�
   assert.equal(s.bot.heldItem && s.bot.heldItem.name, 'iron_pickaxe', 'после боя и еды снова кирка');
 });
 
+test('команды: #добудь прервали (бот вышел) после первой руды — в ответе, с чего продолжить задаче: остаток', async () => {
+  const s = setup({ inventory: [['iron_pickaxe', 1], ['cobblestone', 32]] });
+  const ores = [new Vec3(3, 62, 0), new Vec3(-5, 60, 3)];
+  for (const p of ores) s.world.set(p, 'iron_ore');
+  let tick = 0;
+  let dugAt = null;
+  s.bot.on('physicsTick', () => {
+    tick += 1;
+    if (dugAt === null && ores.some((p) => s.world.get(p) !== 'iron_ore')) dugAt = tick;
+    if (dugAt !== null && tick - dugAt === 10) s.bot.emit('end', 'socketClosed'); // обрыв, когда первая руда уже засчитана
+  });
+  const r = await s.run('#добудь железо 3 здесь', 600000);
+  assert.equal(r.ok, false, [].concat(r.message).join('\n'));
+  assert.equal(r.code, 'interrupted');
+  assert.deepEqual(r.data, { resume: '#добудь железо 2 здесь' });
+});
+
 test('команды: #добудь — зомби рядом с самого начала: щит всё равно сначала во вторую руку, потом бой и добыча', async () => {
   const s = setup({ inventory: [['iron_pickaxe', 1], ['iron_sword', 1], ['shield', 1], ['cobblestone', 32]] });
   s.world.set(new Vec3(6, 58, 0), 'iron_ore');

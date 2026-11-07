@@ -33,6 +33,12 @@ contextBridge.exposeInMainWorld('api', {
   questsStatus: () => ipcRenderer.invoke('quests:status'),
   questsCheckNow: () => ipcRenderer.invoke('quests:check-now'),
   onQuestsStatus: listen('quests:status'), // { running, paused, online, current, levels, needs, … }
+  // Задачи ботам: text — шаги по строке, target — 'selected' | 'online' | 'all', repeat — по кругу. → { ok, added, error }
+  tasksAdd: (text, target, repeat) => ipcRenderer.invoke('tasks:add', { text: String(text || ''), target: String(target || 'selected'), repeat: Boolean(repeat) }),
+  // action: 'pause' | 'resume' | 'cancel' | 'clear-done'; id — одна задача (без него — все)
+  tasksControl: (action, id) => ipcRenderer.invoke('tasks:control', { action: String(action), id: id === undefined || id === null ? null : String(id) }),
+  tasksList: () => ipcRenderer.invoke('tasks:list'),
+  onTasks: listen('tasks:update'), // [{ id, bot, nick, state, stateText, step, total, current, note, repeat, rounds }]
   onLog: listen('bot:log'),
   onChat: listen('bot:chat'),
   onState: listen('bot:state'), // { bot, nick, state }

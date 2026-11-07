@@ -2296,7 +2296,7 @@ async function climbBack(bot, start, opts, guarded = (fn) => fn()) {
  * камень (анти-X-ray показывает ненастоящую) — дальше только руда у воздуха и у своих ходов (antiXray).
  * → { mined, dug, hops, note, denied, antiXray, fails: [{ text, count }], y, startY, back }
  */
-async function mine(bot, ore, want, pick) {
+async function mine(bot, ore, want, pick, progress = {}) {
   const ids = new Set(ore.blocks);
   const start = bot.entity.position.clone();
   const skip = new Set();
@@ -2321,6 +2321,7 @@ async function mine(bot, ore, want, pick) {
     if (pos) dugAt.add(posKey(pos));
     if (block && ids.has(block.name)) {
       mined += 1; // руда на пути — тоже добыча
+      progress.mined = mined; // сколько уже есть — если прервут, задача продолжит с остатка
       if (pos) lastOre = pos.clone();
     }
   };
@@ -2584,7 +2585,17 @@ async function cmdMine({ bot, args: allArgs, words = [] }) {
     lines.push(`${RTP_CMD}: копаю у ${Math.floor(p.x)} ${Math.floor(p.y)} ${Math.floor(p.z)}`);
   }
   await bot.actions.equip(pick);
-  const r = await mine(bot, ore, want, pick);
+  const progress = { mined: 0 };
+  let r;
+  try {
+    r = await mine(bot, ore, want, pick, progress);
+  } catch (err) {
+    // Прервали (бот вышел, переход на другой сервер): задача (src/tasks.js) продолжит с остатка, а не с начала.
+    if (err && typeof err === 'object' && progress.mined > 0 && progress.mined < want) {
+      err.resume = `#добудь ${text} ${want - progress.mined}${here ? ' здесь' : ''}${home ? ` дом ${home}` : ''}`;
+    }
+    throw err;
+  }
   lines.push(r.mined
     ? `Добыл: ${ore.name} — блоков руды ${r.mined} (выпадает ${ore.item})`
     : r.denied ? `Не добыл «${ore.name}»: ${MINE_DENIED}` : `Руды «${ore.name}» не нашёл`);
@@ -2993,6 +3004,8 @@ async function runCommand(bot, line, log = () => {}) {
     } catch (err) {
       const code = err && err.code ? err.code : 'failed';
       result = { ok: false, code, message: `#${cmd.name}: ${err && err.message ? err.message : err}` };
+      // Команда знает, где остановилась (#добудь — сколько осталось): задача продолжит с этого места.
+      if (err && typeof err.resume === 'string') result.data = { resume: err.resume };
     }
   }
   let level = 'ok';

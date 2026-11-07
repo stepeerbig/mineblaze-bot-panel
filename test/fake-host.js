@@ -53,6 +53,7 @@ class FakeManager extends EventEmitter {
     this._set('online');
     this.emit('log', { time: 1, level: 'ok', text: 'В сети: бот появился в мире' });
     this.emit('bot', this.getBot());
+    if (!this.holdReady) this.emit('ready'); // готов к делам (у настоящего — после автовхода и команд входа)
   }
 
   /** Обрыв связи: бот сам встаёт в очередь на переподключение. */

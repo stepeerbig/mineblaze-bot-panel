@@ -685,3 +685,42 @@ summary:focus-visible {
 .lv-warn { color: var(--warn); border-left-color: var(--warn); }
 .lv-error { color: var(--bad); border-left-color: var(--bad); }
 .lv-kick { color: var(--ember); border-left-color: var(--ember); }
+
+/* ---------- задачи ботам ---------- */
+
+.task-add { display: flex; align-items: center; gap: 10px; }
+.task-add select { flex: 1; min-width: 0; }
+.task-add .check { flex: none; }
+.row[hidden] { display: none; }
+
+.task-list { display: flex; flex-direction: column; gap: 6px; }
+.task-list:empty { display: none; }
+.task-list > .link { align-self: flex-start; margin-left: -6px; }
+
+.task {
+  padding: 6px 9px;
+  border-left: 2px solid var(--line);
+  border-radius: 4px;
+  background: var(--field);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.task[data-state="running"] { border-left-color: var(--ok); }
+.task[data-state="waiting"], .task[data-state="queued"] { border-left-color: var(--steel); }
+.task[data-state="paused"] { border-left-color: var(--warn); }
+.task[data-state="error"] { border-left-color: var(--bad); }
+.task[data-state="done"] { opacity: .7; }
+
+.task-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.task-state { flex: none; font-weight: 600; color: var(--ash); }
+.task[data-state="running"] .task-state { color: var(--ok); }
+.task[data-state="waiting"] .task-state, .task[data-state="queued"] .task-state { color: var(--steel); }
+.task[data-state="paused"] .task-state { color: var(--warn); }
+.task[data-state="error"] .task-state { color: var(--bad); }
+.task-who { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--brass); }
+.task-step { flex: none; margin-left: auto; color: var(--ash); font-size: 11px; }
+.task-now { margin-top: 2px; color: var(--bone); font: 12px/1.4 var(--mono); overflow-wrap: anywhere; }
+.task-note { margin-top: 2px; color: var(--ash); }
+.task[data-state="error"] .task-note { color: #f3b0ac; }
+.task-tools { display: flex; gap: 4px; margin: 3px 0 0 -6px; }

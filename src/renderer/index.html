@@ -79,6 +79,29 @@
         </details>
       </details>
 
+      <details id="taskGroup" class="group fold" open>
+        <summary class="group-title">Задачи <span id="taskTag" class="tag" hidden></span></summary>
+        <label class="field">Шаги — по одному в строке
+          <textarea id="taskSteps" rows="4" spellcheck="false" placeholder="#добудь алмазы 5&#10;#положи склад&#10;ждать 10 мин"></textarea>
+        </label>
+        <div class="task-add">
+          <select id="taskTarget" aria-label="Кому задача">
+            <option value="selected">выбранному боту</option>
+            <option value="online">всем в сети</option>
+            <option value="all">всем ботам</option>
+          </select>
+          <label class="check" title="После последнего шага — снова с первого, пока не нажмёшь «Пауза» или «Убрать»"><input id="taskRepeat" type="checkbox"><span>По кругу</span></label>
+        </div>
+        <button id="taskAdd" class="btn quest-toggle" type="button">Добавить задачу</button>
+        <p id="taskStatus" class="ai-status" role="status"></p>
+        <div id="taskList" class="task-list"></div>
+        <div id="taskTools" class="row" hidden>
+          <button id="taskPauseAll" class="btn ai-get" type="button">Пауза всем</button>
+          <button id="taskResumeAll" class="btn ai-get" type="button">Продолжить всем</button>
+        </div>
+        <p class="hint">Шаг — <b>#команда</b> боту (следующий шаг — когда закончит), <b>/команда</b> серверу, <b>скажи текст</b> или <b>ждать 30</b> (секунд; «ждать 2 мин»). У каждого бота задачи идут по очереди. Бот вылетел или панель перезапустили — задача продолжит с того же шага, когда бот снова войдёт; <b>#добудь</b> — с оставшейся руды. Ботов с задачами автопилот не трогает.</p>
+      </details>
+
       <details id="aiGroup" class="group fold" open>
         <summary class="group-title">ИИ-помощник <span id="aiTag" class="tag" hidden></span></summary>
         <label class="field">Задание словами

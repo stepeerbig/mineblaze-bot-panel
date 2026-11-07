@@ -7,6 +7,7 @@ const path = require('path');
 const { Fleet } = require('./fleet');
 const { AiAgent, formatDuration } = require('./ai');
 const { QuestAutopilot } = require('./quest-autopilot');
+const { TaskBoard } = require('./tasks');
 const { DEFAULT_CONFIG, sanitize, validate, accountsOf } = require('./config');
 const { maskSecrets } = require('./chat-utils');
 
@@ -31,6 +32,7 @@ let win = null;
 let fleet = null; // все боты (src/fleet.js)
 let ai = null; // ИИ-помощник (src/ai.js)
 let autopilot = null; // автопилот заданий NPC (src/quest-autopilot.js)
+let tasks = null; // задачи ботам (src/tasks.js)
 let selectedBot = null; // чей чат в панели и кого показывает экран бота
 let appliedAccounts = null; // список ботов, который уже отдан флоту
 let viewerWin = null; // окно «Экран бота»
@@ -227,6 +229,7 @@ function registerIpc() {
       chat: chatHistory.get(selectedBot) || [],
       ai: { running: Boolean(ai && ai.busy) },
       quests: autopilot ? autopilot.status() : null,
+      tasks: tasks ? tasks.list() : [],
     };
   });
 
@@ -351,6 +354,33 @@ function registerIpc() {
     autopilot.checkNow();
     return autopilot.status();
   });
+
+  // Задачи ботам (src/tasks.js). target: 'selected' — выбранному, 'online' — всем в сети, 'all' — всем ботам из списка.
+  ipcMain.handle('tasks:add', (_e, { text, target = 'selected', repeat = false } = {}) => {
+    if (!tasks) return { ok: false, error: 'задачи недоступны' };
+    let ids;
+    if (target === 'all') ids = fleet.list().map((b) => b.bot);
+    else if (target === 'online') ids = fleet.list().filter((b) => b.state === 'online' || b.state === 'connected').map((b) => b.bot);
+    else ids = selectedBot ? [selectedBot] : [];
+    if (!ids.length) return { ok: false, error: target === 'online' ? 'в сети нет ни одного бота' : 'выбери бота в списке' };
+    try {
+      const r = tasks.add(ids, String(text || ''), { repeat: Boolean(repeat) });
+      if (r.added > 1) taskLog({ level: 'info', text: `Задача добавлена ботам: ${r.added}` });
+      return { ok: true, added: r.added };
+    } catch (err) {
+      return { ok: false, error: errText(err) };
+    }
+  });
+  // action: 'pause' | 'resume' | 'cancel' (id — одна задача, без id — все) | 'clear-done' (убрать готовые)
+  ipcMain.handle('tasks:control', (_e, { action, id = null } = {}) => {
+    if (!tasks) return 0;
+    if (action === 'pause') return tasks.pause(id);
+    if (action === 'resume') return tasks.resume(id);
+    if (action === 'cancel') return tasks.cancel(id);
+    if (action === 'clear-done') return tasks.cancel(null, { done: true });
+    return 0;
+  });
+  ipcMain.handle('tasks:list', () => (tasks ? tasks.list() : []));
 
   ipcMain.handle('ai:stop', () => {
     const stopped = ai.stop();
@@ -658,7 +688,8 @@ function createAi() {
     // Сеть Chromium, а не fetch из Node: прокси и сертификаты Windows (антивирус с проверкой HTTPS иначе мешает).
     fetch: (url, opts) => net.fetch(url, opts),
     env: {
-      listBots: () => fleet.list(),
+      // Боты, у которых есть задачи (src/tasks.js), автопилот не трогает: ботам — одно дело за раз.
+      listBots: () => fleet.list().filter((b) => !tasks || !tasks.hasWork(b.bot)),
       // Ответы ботов уходят сервису ИИ — пароли из них (если вдруг попали) прячем.
       runCommand: async (ids, line, signal) => (await fleet.commandEach(ids, line, { signal }))
         .map((r) => ({ ...r, message: r.message.map(hideSecrets) })),
@@ -729,6 +760,36 @@ function createAutopilot() {
   return ap;
 }
 
+// ---------- задачи ботам ----------
+
+function createTasks() {
+  const file = path.join(app.getPath('userData'), 'tasks.json'); // очередь задач каждого бота: где остановились
+  const board = new TaskBoard({
+    fleet,
+    store: {
+      load: () => JSON.parse(fs.readFileSync(file, 'utf8')),
+      save: (state) => writeFileSafe(file, JSON.stringify(state)),
+    },
+  });
+  board.on('log', taskLog);
+  let pending = null; // в панель — не чаще раза в 0,3 с
+  board.on('update', () => {
+    if (pending) return;
+    pending = setTimeout(() => {
+      pending = null;
+      send('tasks:update', board.list());
+    }, 300);
+  });
+  return board;
+}
+
+/** Строка задач: в консоль (с меткой «Задача», у бота — как его строки) и в лог. */
+function taskLog({ level, text, bot, nick }) {
+  const entry = { bot: bot || null, nick: nick || null, source: 'tasks', time: Date.now(), level, text: hideSecrets(text) };
+  send('bot:log', entry);
+  appendLog('events', entry.time, `[Задача] ${level.toUpperCase().padEnd(5)} ${tagOf(entry.nick)}${entry.text}`);
+}
+
 function reportFatal(err) {
   uiLog('error', `Необработанная ошибка: ${errText(err)}`);
 }
@@ -754,7 +815,9 @@ function startApp() {
     fleet = createFleet();
     ai = createAi();
     autopilot = createAutopilot();
+    tasks = createTasks();
     syncFleet(); // процессы ботов запускаются, когда нужны (по «Старт» или для экрана бота)
+    tasks.start(); // задачи из файла продолжатся, когда их боты войдут
     selectBot(null);
     if (config.questAuto) autopilot.start(); // был включён — продолжает (ждёт ботов в сети)
 
@@ -776,6 +839,7 @@ function startApp() {
     quitting = true;
     if (ai) ai.stop();
     if (autopilot) autopilot.stop().catch(() => {});
+    if (tasks) tasks.stop(); // список задач — в файл; продолжатся при следующем запуске
     Promise.resolve(fleet && fleet.shutdown())
       .catch(() => {})
       .finally(() => {
@@ -811,6 +875,8 @@ function runSelftest() {
     fleet = createFleet();
     ai = createAi();
     autopilot = createAutopilot(); // не включается: самопроверке хватит панели и сводки
+    tasks = createTasks(); // папка настроек самопроверки — временная: задач в ней нет
+    tasks.start();
     syncFleet();
     selectBot(null);
     try {
