@@ -1,5 +1,7 @@
 'use strict';
-
+const { CaptchaService } = require('./captcha-service');
+// ...
+let captchaService = null; // добавь глобальную переменную
 const { app, BrowserWindow, Menu, clipboard, ipcMain, net, safeStorage, session, shell, utilityProcess } = require('electron');
 const fs = require('fs');
 const os = require('os');
@@ -593,14 +595,15 @@ function createViewerWindow(id) {
 
 // ---------- боты ----------
 
-function createFleet() {
+function createFleet(captchaService) { // <--- АРГУМЕНТ ЕСТЬ
   const f = new Fleet({
     config,
     fork: (index) => utilityProcess.fork(path.join(__dirname, 'bot-process.js'), [], { serviceName: `MineBlaze Bots ${index + 1}`, stdio: 'pipe' }),
     initPayload: () => ({
       authCacheDir: path.join(app.getPath('userData'), 'auth-cache'),
-      journalDir: path.join(logsDir, 'packets'), // журнал пакетов при кике и возврате в лобби
+      journalDir: path.join(logsDir, 'packets'), 
     }),
+    captchaService: captchaService, // <--- ПЕРЕДАЕТСЯ В FLEET
   });
   f.on('log', (entry) => {
     send('bot:log', entry);
@@ -820,18 +823,26 @@ function startApp() {
   });
 
   app.whenReady().then(() => {
+    // 1. СНАЧАЛА задаем пути и загружаем настройки!
     configFile = path.join(app.getPath('userData'), 'config.json');
     logsDir = path.join(app.getPath('userData'), 'logs');
     loadConfig();
 
-    fleet = createFleet();
+    // 2. Создаем сервис капчи
+    captchaService = new CaptchaService();
+    captchaService.on('log', (e) => uiLog(e.level, e.text));
+
+    // 3. Создаем флот и ПЕРЕДАЕМ ему сервис капчи (и больше не пересоздаем его!)
+    fleet = createFleet(captchaService); 
+
+    // 4. Остальные сервисы
     ai = createAi();
     autopilot = createAutopilot();
     tasks = createTasks();
-    syncFleet(); // процессы ботов запускаются, когда нужны (по «Старт» или для экрана бота)
-    tasks.start(); // задачи из файла продолжатся, когда их боты войдут
+    syncFleet(); 
+    tasks.start(); 
     selectBot(null);
-    if (config.questAuto) autopilot.start(); // был включён — продолжает (ждёт ботов в сети)
+    if (config.questAuto) autopilot.start(); 
 
     // Странице экрана бота не нужны камера, уведомления и прочие разрешения.
     session.fromPartition(VIEWER_PARTITION).setPermissionRequestHandler((_wc, permission, callback) => {
@@ -851,7 +862,7 @@ function startApp() {
     quitting = true;
     if (ai) ai.stop();
     if (autopilot) autopilot.stop().catch(() => {});
-    if (tasks) tasks.stop(); // список задач — в файл; продолжатся при следующем запуске
+    if (tasks) tasks.stop(); 
     Promise.resolve(fleet && fleet.shutdown())
       .catch(() => {})
       .finally(() => {
@@ -863,7 +874,6 @@ function startApp() {
 
   app.on('window-all-closed', () => app.quit());
 }
-
 function runSelftest() {
   const finish = (result, code) => {
     try {

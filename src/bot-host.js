@@ -81,6 +81,7 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
       journalDir: dirs.journalDir,
       requestConnect: () => emit('want-connect', { bot: id }),
       journalLimits: JOURNAL_LIMITS,
+       proxy: account.proxy,
     });
     entry.manager = manager;
     manager.on('log', (e) => emit('log', { bot: id, ...e }));
@@ -88,7 +89,10 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
     manager.on('state', (state) => emit('state', { bot: id, state }));
     manager.on('link', (l) => emit('link', { bot: id, ...l }));
     manager.on('ready', () => emit('ready', { bot: id }));
-    manager.on('captcha', (c) => emit('captcha', { bot: id, ...c }));
+     manager.on('captcha', (c) => {
+      emit('captcha', { bot: id, ...c });
+      emit('solve-captcha', { bot: id, url: c.url }); // <--- ДОБАВЛЯЕМ ОТПРАВКУ СОБЫТИЯ НАВЕРХ
+    });
     manager.on('captcha-done', (c) => emit('captcha-done', { bot: id, ...c }));
     manager.on('ip-block', (b) => emit('ip-block', { bot: id, ...b }));
     manager.on('login-hung', (h) => emit('login-hung', { bot: id, ...h }));
@@ -179,7 +183,7 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
         if (!entry) {
           addBot(id, account);
         } else {
-          entry.account = { username: account.username, password: account.password || '' };
+               entry.account = { username: account.username, password: account.password || '', proxy: account.proxy }; 
           refresh(entry);
         }
       }
