@@ -10,6 +10,7 @@ const { createActionsPlugin } = require('./bot/actions');
 const { windowClicksPlugin } = require('./bot/window-clicks');
 const { Guard, GodKeeper, worldNameOf } = require('./bot/guard');
 const { runCommand } = require('./bot/commands');
+
 // Что бот делает как обычный клиент, а не как mineflayer (см. src/bot/). Выключать нужно только для сравнения
 // на тестовом стенде: physics — своя физика (ровные тики, движение по правилам клиента), tickEnd — пакет
 // tick_end в конце каждого тика, profile — бренд и настройки клиента один раз при входе, clicks — клики
@@ -211,6 +212,7 @@ class BotManager extends EventEmitter {
    *   входят по одному); бот ждёт в состоянии 'queued', пока ему не скажут admit(). Нет — входит сразу.
    * @param {object}   [opts.journalLimits]  { keepMs, maxEntries } журнала пакетов (у множества ботов — меньше:
    *   на людном спавне журнал каждого — мегабайты)
+   * @param {object}   [opts.proxy]       { host, port, username, password } — входить через SOCKS5-прокси (пул прокси, fleet.js)
    */
   constructor({ config, authCacheDir, journalDir = null, compat, createBot, timings, requestConnect = null, journalLimits = {}, proxy = null } = {}) {
     super();
@@ -222,7 +224,7 @@ class BotManager extends EventEmitter {
     this._createBot = createBot;
     this.timings = { ...DEFAULT_TIMINGS, ...timings };
     this._requestConnect = requestConnect;
-      this.proxy = proxy;
+    this.proxy = proxy;
 
     this.state = 'offline';
     this.cur = null; // текущая сессия (см. _connect)
@@ -531,7 +533,7 @@ class BotManager extends EventEmitter {
         version: cfg.version || false,
         ...this._compatOptions(),
       };
-        if (this.proxy && this.proxy.host) {
+      if (this.proxy && this.proxy.host) {
         const { SocksProxyAgent } = require('socks-proxy-agent');
         const auth = this.proxy.username ? `${this.proxy.username}:${this.proxy.password}@` : '';
         const proxyUrl = `socks5://${auth}${this.proxy.host}:${this.proxy.port}`;
@@ -588,6 +590,10 @@ class BotManager extends EventEmitter {
     });
     bot.guard = s.guard;
     bot.panelConfig = this.config; // живые настройки панели — командам (#рентген берёт отсюда список блоков)
+    // Рыбалка (#рыбалка) сообщает, что делает и сколько поймала, — для вкладки «Авто фиш» в панели.
+    bot.on('fishing', (p) => {
+      if (alive()) this.emit('fishing', p);
+    });
     // Команды серверу из команд боту (#квесты принести пишет /home и /warp ah): та же очередь, что у чата панели,
     // и охрана с режимом бога видят их так же.
     bot.sendCommand = (cmd) => (alive() && s.loggedIn && !s.stopping ? this._send(s, cmd) : false);
@@ -726,8 +732,7 @@ class BotManager extends EventEmitter {
       });
     }
 
-    // Сообщения сервера (не игроков): вход с паролем, проверка «я не робот», возврат в лобби, охрана, режим бога.
-        bot.on('message', (jsonMsg, position) => {
+    bot.on('message', (jsonMsg, position) => {
       if (!alive()) return;
       // Адрес часто спрятан в кликабельном тексте («[Нажми сюда]»), toString() его не показывает.
       const links = extractLinks(jsonMsg && jsonMsg.json !== undefined ? jsonMsg.json : String(jsonMsg));
@@ -756,20 +761,18 @@ class BotManager extends EventEmitter {
       const important = s.spawned ? links.filter((url) => !shown.includes(url)) : links;
       const captcha = position !== 'chat' && links.length > 0 && CAPTCHA_RE.test(shown);
       this._reportLinks(s, important, captcha ? 'проверка «я не робот» — открой ссылку и нажми «Да»' : 'сообщение в чате');
-      
       // Сообщения сервера (не игроков): вход с паролем, проверка «я не робот», возврат в лобби, охрана, режим бога.
       if (position !== 'chat') {
+        // Проверку проходит человек по ссылке (её показали в консоли выше); пройденную ссылку второй раз не ждём.
         if (captcha && !s.captcha && !s.captchaDone.has(links[0])) {
           s.captcha = links[0];
           this.emit('captcha', { time: Date.now(), url: links[0] });
-          this.log('info', 'Обнаружена проверка «я не робот». Передаю в браузер...');
         } else if (s.captcha && CAPTCHA_DONE_RE.test(shown)) {
           s.captchaDone.add(s.captcha);
           s.captcha = null;
           this.log('ok', 'Проверка «я не робот» пройдена');
           this.emit('captcha-done', { time: Date.now() });
         }
-        
         this._onAuthMessage(s, shown);
         const forced = forcedMoveReason(shown);
         if (forced) this._onForcedMove(s, forced);

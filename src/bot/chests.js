@@ -40,11 +40,16 @@ function hasRoom(window, [start, end], item) {
   return false;
 }
 
+// Сундук общий (у склада много ботов): пока бот тянулся к стопке, её забрал другой — ячейка уже пуста. Тогда
+// взять следующую, но не больше стольких раз подряд.
+const MAX_TAKEN_BY_OTHERS = 12;
+
 /**
  * Перенести shift-кликом стопки, подходящие под test, из ячеек from в ячейки to, пока не наберётся want
  * предметов (Infinity — все). Стопки идут целиком, поэтому перенести можно чуть больше want.
- * @returns {Promise<{ moved: Map<string, number>, total: number, full: boolean, rejected: boolean }>}
- *   full — какой-то стопке не хватило места; rejected — сервер не дал перенести (ячейки остались как были).
+ * @returns {Promise<{ moved: Map<string, number>, total: number, full: boolean, rejected: boolean, lost: number }>}
+ *   full — какой-то стопке не хватило места; rejected — сервер не дал перенести (ячейки остались как были);
+ *   lost — сколько раз стопку из-под руки забрал кто-то другой.
  */
 async function moveStacks(bot, window, from, to, test, want = Infinity) {
   const moved = new Map();
@@ -52,6 +57,7 @@ async function moveStacks(bot, window, from, to, test, want = Infinity) {
   let total = 0;
   let full = false;
   let rejected = false;
+  let lost = 0;
   while (total < want && bot.currentWindow === window) {
     let slot = -1;
     for (let i = from[0]; i < from[1]; i += 1) {
@@ -70,9 +76,15 @@ async function moveStacks(bot, window, from, to, test, want = Infinity) {
     }
     const name = item.name;
     const before = countIn(window, to, (x) => x.name === name);
-    await bot.actions.clickSlot(slot, { mode: 1 });
+    // Пустую ячейку не щёлкаем: стопку, пока бот тянулся, забрал другой (это видно по ячейкам от сервера).
+    const gone = () => !window.slots[slot] || window.slots[slot].name !== name;
+    const r = await bot.actions.clickSlot(slot, { mode: 1, unless: gone });
     const n = countIn(window, to, (x) => x.name === name) - before;
     if (n <= 0) {
+      if ((r && r.skipped) || gone()) {
+        lost += 1;
+        if (lost <= MAX_TAKEN_BY_OTHERS) continue; // взять другую стопку
+      }
       rejected = true;
       break;
     }
@@ -83,7 +95,7 @@ async function moveStacks(bot, window, from, to, test, want = Infinity) {
       skip.add(slot);
     }
   }
-  return { moved, total, full, rejected };
+  return { moved, total, full, rejected, lost };
 }
 
 module.exports = { moveStacks, countIn, itemsIn, hasRoom, storageSlots, playerSlots };

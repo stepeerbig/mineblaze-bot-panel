@@ -1378,6 +1378,7 @@ function inject(bot, { random, now }) {
   // Блоки, на которых правая кнопка что-то делает (открыть, нажать, посадить): есть и поднимать щит, глядя на них, нельзя.
   const INTERACTIVE_RE = /(?:chest|barrel|shulker_box|furnace|smoker|crafting_table|crafter|_door$|trapdoor|fence_gate|button|lever|_bed$|anvil|enchanting_table|brewing_stand|hopper|dispenser|dropper|note_block|repeater|comparator|cake|bell|beacon|lectern|loom|grindstone|stonecutter|smithing_table|cartography_table|fletching_table|composter|cauldron|respawn_anchor|_sign$|campfire|jukebox|flower_pot|daylight_detector|farmland|decorated_pot|chiseled_bookshelf|vault|trial_spawner|command_block|structure_block|jigsaw|redstone_ore|dragon_egg|end_portal_frame|beehive|bee_nest|copper_bulb|crafter)/;
   const PICKABLE_TYPES = new Set(['player', 'mob', 'hostile', 'animal', 'passive', 'ambient', 'water_creature', 'other']);
+  const NOT_PICKABLE = new Set(['item', 'experience_orb', 'area_effect_cloud', 'marker']);
   const USE_RELEASE = { status: 5, location: { x: 0, y: 0, z: 0 }, face: 0, sequence: 0 }; // отпустить правую кнопку
 
   /** Сущность на луче взгляда ближе блока и не дальше ENTITY_REACH: { entity, t, point } или null. */
@@ -1388,6 +1389,7 @@ function inject(bot, { random, now }) {
     let best = null;
     for (const e of Object.values(bot.entities || {})) {
       if (!e || e === bot.entity || !e.position || !(PICKABLE_TYPES.has(e.type) || /boat|minecart/.test(e.name || ''))) continue;
+      if (NOT_PICKABLE.has(e.name)) continue; // предметы на земле и опыт игра «сквозь» себя пропускает (isPickable — нет)
       const t = rayBox(eye, dir, entityBox(e));
       if (t === null || t > limit || (best && t >= best.t)) continue;
       best = { entity: e, t, point: eye.plus(dir.scaled(t)) };
@@ -1537,6 +1539,177 @@ function inject(bot, { random, now }) {
     });
   }
 
+  // ---------- рыбалка: заброс, поклёвка, подсечка ----------
+
+  // Свой поплавок: сервер присылает сущность fishing_bobber, в objectData — номер хозяина (FishingHook.getAddEntityPacket).
+  // Ботов у воды много — чужие поплавки рядом не путаем со своим.
+  const bobberInfo = bot.registry.entitiesByName ? bot.registry.entitiesByName.fishing_bobber : null;
+  const bobberType = bobberInfo ? (bobberInfo.internalId !== undefined ? bobberInfo.internalId : bobberInfo.id) : -1;
+  const bobberKeys = bobberInfo && Array.isArray(bobberInfo.metadataKeys) ? bobberInfo.metadataKeys : [];
+  const BITING_KEY = bobberKeys.indexOf('biting'); // «клюёт» (DATA_BITING)
+  const HOOKED_KEY = bobberKeys.indexOf('hooked_entity'); // кого зацепил: номер + 1, 0 — никого
+  let ownBobber = null;
+  if (bot._client && typeof bot._client.on === 'function') {
+    bot._client.on('spawn_entity', (p) => {
+      if (p && p.type === bobberType && bot.entity && p.objectData === bot.entity.id) ownBobber = p.entityId;
+    });
+    bot._client.on('entity_destroy', (p) => {
+      if (ownBobber !== null && p && Array.isArray(p.entityIds) && p.entityIds.includes(ownBobber)) ownBobber = null;
+    });
+  }
+  bot.on('respawn', () => {
+    ownBobber = null;
+  });
+  // Правой кнопкой с удочкой нельзя попасть в жителя (торговля), лошадь, лодку, рамку…: игрок и враг — можно (ничего не будет).
+  const rodSafe = (e) => e && (e.type === 'player' || e.type === 'hostile');
+  const isWaterCell = (pos) => {
+    const b = blockAt(pos.floored());
+    if (!b) return false;
+    if (/^(?:water|bubble_column|kelp|kelp_plant|seagrass|tall_seagrass)$/.test(b.name)) return true;
+    try {
+      return Boolean(typeof b.getProperties === 'function' && b.getProperties().waterlogged === true);
+    } catch (_) {
+      return false;
+    }
+  };
+
+  /** Правая кнопка с удочкой (заброс или подсечка), как у клиента: use_item, потом взмах руки. Внутри тика. */
+  function rodClick() {
+    const t = useTarget(rodSafe);
+    if (!t.ok) return false;
+    pressUse(0, t);
+    swing();
+    return true;
+  }
+
+  /** Вытащить поплавок: правая кнопка с удочкой (взгляд туда, где она ничего не откроет). */
+  async function reelIn(signal) {
+    while (ticks() - lastUseTick < USE_DELAY_TICKS) await inTick(() => {}, signal);
+    if (!useTarget(rodSafe).ok) await aimForUse(signal, rodSafe);
+    const ok = await inTick(() => rodClick(), signal);
+    if (!ok) throw new ActionError('не вытащить: правая кнопка что-нибудь откроет');
+  }
+
+  /**
+   * Порыбачить один заход: удочка в руку, взгляд yaw/pitch (куда упадёт поплавок, считает src/bot/fishing.js),
+   * заброс — правая кнопка, как у клиента (use_item и взмах руки); ждать свой поплавок. Клюнуло (у поплавка
+   * «biting» или всплеск рыбы у него) — через 3–7 тиков, как человек, правая кнопка ещё раз: подсечь; улов
+   * подлетает к боту сам — подождать, пока подберёт. Поплавок лёг на берег, зацепил кого-то или рыба не клюёт
+   * дольше maxWaitTicks — вытащить. Прервали (#стоп) — поплавок вытащить, как человек, который закончил.
+   * → { outcome: 'caught' | 'ground' | 'hooked' | 'lost' | 'timeout' | 'no_bobber', collected, waitTicks, landed }
+   */
+  function fish({ yaw, pitch, maxWaitTicks = 1800 } = {}) {
+    return run('рыбачить', async (signal) => {
+      if (!bobberInfo) throw new ActionError('в этой версии игры нет удочки с поплавком');
+      await equipItem('fishing_rod', signal);
+      await standStill(signal);
+      // Остался поплавок с прошлого раза — сначала вытащить (иначе правая кнопка его и вытащит, а не забросит).
+      if (ownBobber !== null && bot.entities && bot.entities[ownBobber]) {
+        await reelIn(signal);
+        for (let i = 0; i < 20 && ownBobber !== null; i += 1) await inTick(() => {}, signal);
+      }
+      await settleLook(yaw, pitch, signal);
+      while (ticks() - lastUseTick < USE_DELAY_TICKS) await inTick(() => {}, signal);
+
+      let biting = false;
+      let hooked = false;
+      let collected = false;
+      let mine = null; // номер поплавка этого заброса
+      const onMeta = (p) => {
+        if (mine === null || !p || p.entityId !== mine || !Array.isArray(p.metadata)) return;
+        for (const m of p.metadata) {
+          if (m.key === BITING_KEY && m.value === true) biting = true;
+          if (m.key === HOOKED_KEY && typeof m.value === 'number' && m.value > 0) hooked = true;
+        }
+      };
+      // Всплеск рыбы (запасной признак — если сервер не пришлёт «biting»): только у своего поплавка — тот, что ближе
+      // всех к звуку. У соседнего бота в паре блоков клюёт своё: его всплеск — не наша поклёвка.
+      const onSound = (name, pos) => {
+        const e = mine !== null && bot.entities ? bot.entities[mine] : null;
+        if (!e || !pos || !/fishing_bobber\.splash$/.test(String(name))) return;
+        const d = Math.hypot(pos.x - e.position.x, pos.z - e.position.z);
+        if (d > 0.8) return;
+        const closer = Object.values(bot.entities).some((o) => o && o !== e && o.name === 'fishing_bobber' && o.position &&
+          Math.hypot(pos.x - o.position.x, pos.z - o.position.z) < d);
+        if (!closer) biting = true;
+      };
+      // Подобрал улов — предмет (опыт за улов появляется прямо у бота и подбирается раньше, чем долетит рыба).
+      const onCollect = (collector, item) => {
+        if (collector && collector === bot.entity && item && item.name === 'item') collected = true;
+      };
+      bot._client.on('entity_metadata', onMeta);
+      bot.on('soundEffectHeard', onSound);
+      bot.on('playerCollect', onCollect);
+      let out = false; // поплавок в воде (или летит) — при прерывании вытащить
+      try {
+        const before = ownBobber;
+        const cast = await inTick(() => rodClick(), signal);
+        if (!cast) throw new ActionError('заброс некуда: правая кнопка что-нибудь откроет', 'blocked');
+        const castTick = ticks();
+        while (ownBobber === null || ownBobber === before) {
+          if (ticks() - castTick > 40) return { outcome: 'no_bobber', collected: false, waitTicks: 0, landed: null };
+          await inTick(() => {}, signal);
+        }
+        mine = ownBobber;
+        out = true;
+        let landed = null;
+        let still = 0;
+        let last = null;
+        for (;;) {
+          await inTick(() => {}, signal);
+          const e = bot.entities ? bot.entities[mine] : null;
+          if (ownBobber !== mine || !e) {
+            out = false;
+            return { outcome: 'lost', collected, waitTicks: ticks() - castTick, landed };
+          }
+          const wait = ticks() - castTick;
+          if (hooked) {
+            await reelIn(signal);
+            out = false;
+            return { outcome: 'hooked', collected, waitTicks: wait, landed };
+          }
+          if (biting) {
+            await waitTicks(3 + Math.floor(random() * 5), signal);
+            await reelIn(signal);
+            out = false;
+            for (let i = 0; i < 40 && !collected; i += 1) await inTick(() => {}, signal);
+            return { outcome: 'caught', collected, waitTicks: wait, landed };
+          }
+          const p = e.position;
+          const wet = isWaterCell(p) || isWaterCell(p.offset(0, -0.2, 0));
+          if (wet && !landed) landed = p.clone();
+          // Не в воде и не двигается секунду — лежит на берегу (там не клюёт).
+          if (!wet && last && p.distanceTo(last) < 0.005) still += 1;
+          else still = 0;
+          last = p.clone();
+          if (still >= 20 && wait > 20) {
+            await reelIn(signal);
+            out = false;
+            return { outcome: 'ground', collected, waitTicks: wait, landed };
+          }
+          if (wait > maxWaitTicks) {
+            await reelIn(signal);
+            out = false;
+            return { outcome: 'timeout', collected, waitTicks: wait, landed };
+          }
+        }
+      } catch (err) {
+        // #стоп посреди рыбалки — поплавок вытащить (как человек, который закончил). Новое действие (поесть,
+        // отбиться) уберёт удочку из руки — тогда поплавок пропадёт и сам.
+        if (out && err && err.code === 'stopped') {
+          inTick(() => {
+            if (ownBobber !== null && bot.heldItem && bot.heldItem.name === 'fishing_rod' && entries.size === 0) rodClick();
+          }).catch(() => {});
+        }
+        throw err;
+      } finally {
+        bot._client.removeListener('entity_metadata', onMeta);
+        bot.removeListener('soundEffectHeard', onSound);
+        bot.removeListener('playerCollect', onCollect);
+      }
+    });
+  }
+
   /** Положить предмет во вторую руку (щит): переносом в инвентаре, стоя на месте, с паузами, как человек. */
   function equipOffhand(name) {
     return equipTo(name, 'off-hand');
@@ -1674,9 +1847,11 @@ function inject(bot, { random, now }) {
    * как у человека. После клика ждёт ответа сервера (он поправляет ячейки и курсор), чтобы следующий клик
    * исходил из того, что на самом деле лежит в меню.
    * @param {number} slot    номер ячейки (как в #окно)
-   * @param {object} [opts]  button: 0 — левая, 1 — правая; mode: 0 — обычный клик, 1 — с Shift (перенос стопки)
+   * @param {object} [opts]  button: 0 — левая, 1 — правая; mode: 0 — обычный клик, 1 — с Shift (перенос стопки);
+   *                         unless() — проверить перед самым кликом (после паузы): да — не кликать ({ skipped: true }),
+   *                         например, стопку в общем сундуке уже забрал другой
    */
-  function clickSlot(slot, { button = 0, mode = 0 } = {}) {
+  function clickSlot(slot, { button = 0, mode = 0, unless = null } = {}) {
     return run('клик в меню', async (signal) => {
       const window = bot.currentWindow;
       if (!window) throw new ActionError('меню не открыто');
@@ -1690,6 +1865,10 @@ function inject(bot, { random, now }) {
       const notBefore = Math.max(afterOpen, afterClick);
       while (ticks() < notBefore) await inTick(() => {}, signal);
       if (bot.currentWindow !== window) throw new ActionError('меню закрылось');
+      if (unless && unless()) {
+        lastClickTick = ticks(); // «перевёл мышь» на другую ячейку — следующий клик тоже не сразу
+        return { slot, skipped: true };
+      }
       const sentTick = ticks();
       try {
         await bot.clickWindow(slot, button, mode);
@@ -1759,8 +1938,10 @@ function inject(bot, { random, now }) {
   }
 
   /** Остановить всё: текущее действие и очередь; клавиши отпускаются. */
+  let stopCount = 0; // сколько раз останавливали: долгая команда (рыбалка) видит #стоп и между действиями
   function stop() {
     const had = entries.size > 0;
+    stopCount += 1;
     abortAll(new ActionError('остановлено', 'stopped'));
     releaseControls();
     return had;
@@ -1781,6 +1962,11 @@ function inject(bot, { random, now }) {
     canHit,
     eat,
     drink,
+    fish,
+    /** Номер своего поплавка в воде (или null). */
+    get bobber() {
+      return ownBobber;
+    },
     equipOffhand,
     equipTo,
     shield,
@@ -1797,6 +1983,10 @@ function inject(bot, { random, now }) {
     lookedAtBlock: () => (bot.serverView ? lookedAtBlock() : null),
     get busy() {
       return entries.size > 0;
+    },
+    /** Сколько раз звали stop() (#стоп): изменилось — долгой команде пора заканчивать. */
+    get stops() {
+      return stopCount;
     },
     get current() {
       return current ? current.name : null;

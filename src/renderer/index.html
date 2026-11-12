@@ -34,6 +34,12 @@
         </button>
       </div>
 
+      <nav class="side-tabs" role="tablist" aria-label="Разделы панели">
+        <button id="tabMain" class="side-tab is-on" type="button" role="tab" aria-selected="true" aria-controls="pageMain">Управление</button>
+        <button id="tabFish" class="side-tab" type="button" role="tab" aria-selected="false" aria-controls="pageFish">Авто фиш <span id="fishTag" class="tag busy" hidden></span></button>
+      </nav>
+
+      <div id="pageMain" class="side-page" role="tabpanel" aria-labelledby="tabMain">
       <details id="questGroup" class="group fold" open>
         <summary class="group-title">Автопилот заданий <span id="questTag" class="tag" hidden></span></summary>
         <button id="questToggle" class="btn quest-toggle" type="button">Включить автопилот</button>
@@ -185,22 +191,21 @@
             <input id="port" type="number" min="1" max="65535">
           </label>
           <label class="field">Версия
-            <input id="version" type="text" list="versions" placeholder="авто" autocomplete="off" spellcheck="false">
+            <!-- Версии 1.16.1–1.21.11, которые знает minecraft-data; «авто» — версию скажет сервер. -->
+            <select id="version">
+              <option value="">авто</option>
+              <option>1.21.11</option><option>1.21.10</option><option>1.21.9</option><option>1.21.8</option>
+              <option>1.21.6</option><option>1.21.5</option><option>1.21.4</option><option>1.21.3</option>
+              <option>1.21.1</option><option>1.21</option>
+              <option>1.20.6</option><option>1.20.5</option><option>1.20.4</option><option>1.20.3</option>
+              <option>1.20.2</option><option>1.20.1</option><option>1.20</option>
+              <option>1.19.4</option><option>1.19.3</option><option>1.19.2</option><option>1.19</option>
+              <option>1.18.2</option><option>1.18.1</option><option>1.18</option>
+              <option>1.17.1</option><option>1.17</option>
+              <option>1.16.5</option><option>1.16.4</option><option>1.16.3</option><option>1.16.2</option><option>1.16.1</option>
+            </select>
           </label>
         </div>
-        <datalist id="versions">
-          <option value="1.21.11"></option>
-          <option value="1.21.10"></option>
-          <option value="1.21.8"></option>
-          <option value="1.21.4"></option>
-          <option value="1.21.1"></option>
-          <option value="1.20.4"></option>
-          <option value="1.20.1"></option>
-          <option value="1.19.4"></option>
-          <option value="1.18.2"></option>
-          <option value="1.16.5"></option>
-          <option value="1.12.2"></option>
-        </datalist>
         <label class="field">Вход
           <select id="auth">
             <option value="offline">Offline (без лицензии)</option>
@@ -258,6 +263,30 @@
       <div class="group">
         <div class="group-title">Вид</div>
         <label class="check" title="Рисует только окно — на ботов не влияет. Свёрнутое окно фон не рисует"><input id="liveBg" type="checkbox" checked><span>Живой фон: вороны разлетаются от курсора</span></label>
+      </div>
+      </div>
+
+      <div id="pageFish" class="side-page" role="tabpanel" aria-labelledby="tabFish" hidden>
+        <div class="group">
+          <div class="group-title">Авто фиш — автоматическая рыбалка</div>
+          <label class="field" title="Тот же «Дом склада», что у автопилота заданий: /home у каждого бота свой, имя дома — одно">Дом склада — сундуки с удочками, вода рядом
+            <input id="fishHome" type="text" autocomplete="off" spellcheck="false" placeholder="база">
+          </label>
+          <select id="fishTarget" aria-label="Кому рыбачить">
+            <option value="selected">выбранному боту</option>
+            <option value="group" hidden>группе</option>
+            <option value="online" selected>всем ботам в сети</option>
+          </select>
+          <div class="row">
+            <button id="fishStart" class="btn fish-start" type="button" title="Боту уходит «#рыбалка дом …»: рыбачит, пока не нажмёшь «Стоп»">Начать рыбалку</button>
+            <button id="fishStop" class="btn fish-stop" type="button" disabled title="Каждому, кто рыбачит, — #стоп: вытащит удочку и остановится">Стоп</button>
+          </div>
+          <p id="fishStatus" class="ai-status" role="status"></p>
+          <div id="fishList" class="fish-list"></div>
+          <button id="fishClear" class="link fish-clear" type="button" hidden>Убрать остановленных</button>
+          <p class="hint">Бот пишет <b>/home</b> на дом склада, берёт из сундуков у дома (до 12 блоков от точки дома) <b>3 удочки</b> и ищет ближайшую воду (до 24 блоков). Встаёт на берег и закидывает так, чтобы поплавок упал в воду. Клюнуло — подсекает и закидывает снова, пока не нажмёшь <b>Стоп</b> или не напишешь боту <b>#стоп</b>.</p>
+          <p class="hint">Удочка сломалась — берёт следующую, кончились — новые со склада. Инвентарь забился — складывает улов в сундуки склада. Каждый бот встаёт на своё место у воды — на бота нужно 2 блока берега. Сам ест и отбивается от мобов.</p>
+        </div>
       </div>
     </aside>
 

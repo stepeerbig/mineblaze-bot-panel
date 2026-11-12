@@ -25,6 +25,11 @@
 //         npm run stand:check -- --survive       — добыча с выживанием: алмазная кирка «Эффективность V», меч, щит, хлеб;
 //                                                  голод и мобы (зомби, крипер); бот добывает алмазы, отбивается, ест,
 //                                                  от крипера — щитом. Grim смотрит копание, еду, щит, удары и движение
+//         npm run stand:check -- --fish          — «Авто фиш»: 10 ботов (StandBot1…10, как процесс ботов панели) на
+//                                                  одном «доме»: пруд, сундуки с удочками; все сразу #рыбалка здесь —
+//                                                  берут удочки, расходятся по берегу, ловят; через 180 с (или N с) —
+//                                                  #стоп. --bots=N — другое число ботов. Grim смотрит заброс, подсечку,
+//                                                  клики в сундуках и движение
 // Перед первым запуском один раз открой test-server\start-test-server.bat: он скачает сервер и спросит про EULA.
 // Код выхода 0 — бот простоял всё время, его не кикнули, и ни Grim, ни сервер ничего не заметили.
 // Журнал пакетов каждой проверки: test-server\server\journals.
@@ -46,7 +51,7 @@ const BOT_NAME = 'StandBot';
 const HELPER_NAME = 'Helper'; // второй игрок в сценарии — для команд по нику
 
 const ARGS = process.argv.slice(2);
-const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--no-clicks', '--scenario', '--clicks', '--fight', '--mine', '--survive', '--gear', '--nether', '--electron']);
+const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--no-clicks', '--scenario', '--clicks', '--fight', '--mine', '--survive', '--gear', '--nether', '--fish', '--electron']);
 const SCENARIO = ARGS.includes('--scenario');
 const CLICKS = ARGS.includes('--clicks');
 const FIGHT = ARGS.includes('--fight');
@@ -54,15 +59,16 @@ const MINE = ARGS.includes('--mine');
 const SURVIVE = ARGS.includes('--survive');
 const GEAR = ARGS.includes('--gear');
 const NETHER = ARGS.includes('--nether');
-const ANY_CHECK = SCENARIO || CLICKS || FIGHT || MINE || SURVIVE || GEAR || NETHER;
+const FISH = ARGS.includes('--fish');
+const ANY_CHECK = SCENARIO || CLICKS || FIGHT || MINE || SURVIVE || GEAR || NETHER || FISH;
 const ELECTRON_ARG = ARGS.find((a) => a === '--electron' || a.startsWith('--electron='));
 const ELECTRON = Boolean(ELECTRON_ARG);
 const ELECTRON_EXE = ELECTRON_ARG && ELECTRON_ARG.includes('=') ? ELECTRON_ARG.slice(ELECTRON_ARG.indexOf('=') + 1).replace(/^"|"$/g, '') : '';
 const BOTS_ARG = ARGS.find((a) => a.startsWith('--bots='));
-const BOTS = BOTS_ARG ? Math.max(1, Math.min(200, parseInt(BOTS_ARG.slice('--bots='.length), 10) || 1)) : 1;
+const BOTS = BOTS_ARG ? Math.max(1, Math.min(200, parseInt(BOTS_ARG.slice('--bots='.length), 10) || 1)) : FISH ? 10 : 1;
 const isStandBot = (name) => name === BOT_NAME || (BOTS > 1 && new RegExp(`^${BOT_NAME}\\d+$`).test(name));
 const ROOT = path.join(__dirname, '..');
-const STAY_MS = Math.max(5, parseInt(ARGS.find((a) => /^\d+$/.test(a)), 10) || (ANY_CHECK ? 10 : 60)) * 1000;
+const STAY_MS = Math.max(5, parseInt(ARGS.find((a) => /^\d+$/.test(a)), 10) || (FISH ? 180 : ANY_CHECK ? 10 : 60)) * 1000;
 const LEGACY = ARGS.includes('--legacy');
 const COMPAT = {
   physics: !LEGACY && !ARGS.includes('--no-physics'),
@@ -723,6 +729,164 @@ async function runClickCheck(manager, cmd) {
   return failed;
 }
 
+/**
+ * «Авто фиш» (--fish): BOTS ботов (по умолчанию 10 — как один процесс ботов панели) в одном процессе, каждый — свой
+ * BotManager, как в панели. Консоль сервера строит «дом»: каменная площадка в небе, пруд 13×13, два сундука с
+ * удочками (по 15); все боты — в одну точку дома (как после /home). Всем сразу «#рыбалка здесь» (с паузой 150 мс,
+ * как «всем сразу» в панели); через STAY_MS — каждому «#стоп» (кнопка «Стоп» во вкладке). Ход — событиями
+ * «fishing» в FishBoard (то же, что видит вкладка). → { online, onlineMs, kick, problem, stats } (как runBot)
+ */
+async function runFishCheck(host, port, version, cmd) {
+  if (!cmd) throw new Error('для рыбалки сервер должна запускать сама проверка: закрой окно тестового сервера и запусти снова');
+  const { FishBoard } = require('../src/fish-board');
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const nicks = Array.from({ length: BOTS }, (_, i) => `${BOT_NAME}${i + 1}`);
+  const board = new FishBoard();
+  const spots = new Map(); // ник → последнее место (из событий)
+  const kicks = [];
+  const result = { online: false, onlineMs: 0, kick: null, problem: null, stats: null };
+  const managers = nicks.map((nick) => new BotManager({
+    config: {
+      ...DEFAULT_CONFIG, host, port, username: nick, version, auth: 'offline', autoReconnect: false,
+      loginPassword: '', joinCommands: '', godMode: false, guard: false, fleetNicks: nicks.join('\n'),
+    },
+    authCacheDir: path.join(os.tmpdir(), 'mineblaze-stand-auth'),
+    journalDir: JOURNAL_DIR,
+    compat: COMPAT,
+    journalLimits: { keepMs: 10 * 60 * 1000, maxEntries: 400000 },
+  }));
+  managers.forEach((m, i) => {
+    const nick = nicks[i];
+    m.on('log', ({ level, text }) => {
+      if (level === 'kick') kicks.push(`${nick}: ${text}`);
+      if (level !== 'info' && level !== 'ok') console.log(`  [${nick}] ${text}`);
+    });
+    m.on('fishing', (p) => {
+      board.update({ bot: nick.toLowerCase(), nick, ...p });
+      if (p.spot) spots.set(nick, p.spot);
+    });
+  });
+  const onlineAt = Date.now();
+  let journalFrom = 0;
+  try {
+    // Входят по одному раз в секунду (как очередь входа панели).
+    for (const m of managers) {
+      m.start();
+      await wait(1000);
+    }
+    const deadline = Date.now() + 60 * 1000;
+    while (Date.now() < deadline && !managers.every((m) => m.state === 'online')) await wait(250);
+    const online = managers.filter((m) => m.state === 'online').length;
+    console.log(`  [рыбалка] вошли ${online} из ${BOTS}`);
+    if (online < BOTS) throw new Error(`вошли не все: ${online} из ${BOTS}`);
+
+    // «Дом»: площадка 61×61 на y 149, пруд 13×13 глубиной 3 (вода — x 314…326, z 314…326), точка дома — к западу от
+    // пруда, сундуки с удочками — рядом с ней. Небо открыто (рыба клюёт как обычно), мобов нет.
+    const HOME = '308.5 150 320.5';
+    const rods = (n) => Array.from({ length: n }, (_, i) => `{Slot:${i}b,id:"minecraft:fishing_rod",count:1}`).join(',');
+    for (const c of [
+      'forceload add 288 288 352 352',
+      'difficulty peaceful',
+      'gamerule spawn_mobs false',
+      'time set day',
+      'weather clear',
+      'fill 290 149 290 350 149 350 minecraft:stone',
+      'fill 290 150 290 350 156 350 minecraft:air',
+      'fill 313 145 313 327 149 327 minecraft:stone',
+      'fill 314 147 314 326 149 326 minecraft:water',
+      `setblock 306 150 318 minecraft:chest{Items:[${rods(15)}]}`,
+      `setblock 306 150 322 minecraft:chest{Items:[${rods(15)}]}`,
+      'kill @e[type=minecraft:item]',
+      'kill @e[type=minecraft:fishing_bobber]',
+      ...nicks.flatMap((n) => [`clear ${n}`, `effect clear ${n}`, `gamemode survival ${n}`, `tp ${n} ${HOME}`]),
+    ]) cmd(c);
+    // Сервер строит площадку и грузит чанки (бывает, замирает на секунды): ждём, пока каждый бот окажется на доме
+    // и увидит оба сундука и воду, — как после /home, когда чанки догрузились.
+    const { Vec3 } = require('vec3');
+    const home = new Vec3(308.5, 150, 320.5);
+    const ready = (m) => {
+      const b = m.getBot();
+      if (!b || !b.entity) return false;
+      const name = (x, y, z) => (b.blockAt(new Vec3(x, y, z)) || {}).name;
+      return b.entity.position.distanceTo(home) < 2 && name(306, 150, 318) === 'chest' && name(306, 150, 322) === 'chest' && name(320, 149, 320) === 'water';
+    };
+    const until = Date.now() + 60 * 1000;
+    while (Date.now() < until && !managers.every(ready)) await wait(250);
+    const notReady = nicks.filter((n, i) => !ready(managers[i]));
+    if (notReady.length) throw new Error(`не на доме (или не видят сундуки и воду): ${notReady.join(', ')}`);
+    await wait(2000); // постоять после телепорта, как человек
+    journalFrom = performance.timeOrigin + performance.now(); // тики и пакеты — за рыбалку (без стройки площадки)
+
+    // Всем сразу (как «Начать рыбалку» во вкладке «Авто фиш» → «всем в сети»).
+    const runs = [];
+    for (const [i, m] of managers.entries()) {
+      const bot = m.getBot();
+      board.started(nicks[i].toLowerCase(), nicks[i]);
+      runs.push(runCommand(bot, '#рыбалка здесь').then((r) => ({ nick: nicks[i], r }), (err) => ({ nick: nicks[i], r: { ok: false, code: 'crash', message: String(err && err.stack ? err.stack : err) } })));
+      await wait(150);
+    }
+    const started = Date.now();
+    while (Date.now() - started < STAY_MS) {
+      await wait(Math.min(30000, STAY_MS - (Date.now() - started)));
+      const l = board.list();
+      const per = l.rows.map((r) => `${r.nick.replace(BOT_NAME, '#')}:${r.caught}${r.active ? '' : `(${r.stateText})`}`).join(' ');
+      console.log(`  [рыбалка] ${Math.round((Date.now() - started) / 1000)} с: рыбачат ${l.active}, поймано ${l.caught} — ${per}`);
+      for (const r of l.rows.filter((x) => !x.active)) console.log(`  [рыбалка]   ${r.nick}: ${r.stateText} — ${r.text}`);
+      if (!l.active) break; // все уже закончили сами — ждать нечего
+    }
+
+    // «Стоп» — каждому, кто рыбачит, «#стоп» (как кнопка во вкладке).
+    for (const [i, m] of managers.entries()) {
+      if (board.isActive(nicks[i].toLowerCase()) && m.getBot()) await runCommand(m.getBot(), '#стоп');
+    }
+    const finished = await Promise.race([Promise.all(runs), wait(30000).then(() => null)]);
+    if (!finished) throw new Error('после #стоп рыбалка не закончилась за 30 с');
+    await wait(2000);
+
+    // Итог по каждому боту.
+    const problems = [];
+    for (const { nick, r } of finished) {
+      const text = [].concat(r.message).join(' | ');
+      console.log(`  [${nick}] ${r.code || (r.ok ? 'ok' : '?')}: ${text}`);
+      if (r.code !== 'stopped') problems.push(`${nick}: закончил не по #стоп (${r.code || 'ok'})`);
+      if (!(r.data && r.data.caught > 0)) problems.push(`${nick}: ничего не поймал`);
+    }
+    // Места: каждый на своём, не ближе 2 блоков к другому.
+    const list = [...spots].map(([nick, p]) => ({ nick, p }));
+    for (let a = 0; a < list.length; a += 1) {
+      for (let b = a + 1; b < list.length; b += 1) {
+        const d = Math.hypot(list[a].p.x - list[b].p.x, list[a].p.z - list[b].p.z);
+        if (d < 2 && Math.abs(list[a].p.y - list[b].p.y) < 2) problems.push(`${list[a].nick} и ${list[b].nick} стоят рядом (${d.toFixed(1)} бл.)`);
+      }
+    }
+    console.log(`  [рыбалка] места: ${list.map(({ nick, p }) => `${nick.replace(BOT_NAME, '#')} ${p.x} ${p.y} ${p.z}`).join('; ')}`);
+    // После #стоп поплавков в воде не осталось (каждый вытащил свой).
+    const viewer = managers[0].getBot();
+    const bobbers = viewer ? Object.values(viewer.entities || {}).filter((e) => e && e.name === 'fishing_bobber').length : 0;
+    if (bobbers) problems.push(`после #стоп в воде осталось поплавков: ${bobbers}`);
+    const l = board.list();
+    console.log(`  [рыбалка] всего поймано ${l.caught}, рыбачат после «Стоп»: ${l.active}`);
+    if (l.active) problems.push(`после «Стоп» рыбачат ещё ${l.active}`);
+    const still = managers.filter((m) => m.state === 'online').length;
+    if (still < BOTS) problems.push(`в игре остались ${still} из ${BOTS}`);
+    result.online = still === BOTS;
+    result.problem = problems.length ? `рыбалка: ${problems.join('; ')}` : null;
+  } catch (err) {
+    result.problem = `рыбалка: ${err.message}`;
+  } finally {
+    result.onlineMs = Date.now() - onlineAt;
+    result.kick = kicks[0] || null;
+    const j = managers[0] && managers[0].journal;
+    if (j) result.stats = j.stats(journalFrom ? { sinceMs: journalFrom } : {});
+    for (const m of managers) {
+      if (m.state !== 'offline') m.saveJournal(result.problem ? `рыбалка на стенде: ${result.problem}` : 'рыбалка на стенде');
+      m.stop();
+    }
+    await wait(3000);
+  }
+  return result;
+}
+
 /** Бот заходит через настоящий Electron: самопроверка панели с сервером (см. MBP_SELFTEST_* в src/main.js). */
 function runElectron(host, port, version) {
   return new Promise((resolve) => {
@@ -864,16 +1028,16 @@ function runBot(host, port, version, cmd) {
 
 async function main() {
   const unknown = ARGS.filter((a) => a.startsWith('-') && !KNOWN_FLAGS.has(a) && !a.startsWith('--electron=') && !a.startsWith('--bots='));
-  if (BOTS > 1 && !ELECTRON) {
-    console.error('--bots=N — только вместе с --electron (боты заходят через панель, как «Старт всех»)');
+  if (BOTS > 1 && !ELECTRON && !FISH) {
+    console.error('--bots=N — только вместе с --electron (боты заходят через панель, как «Старт всех») или --fish');
     return 2;
   }
   if (ELECTRON && (ANY_CHECK || ARGS.some((a) => /^--(legacy|no-)/.test(a)))) {
     console.error('--electron проверяет бота таким, какой он в панели: без --scenario, --clicks, --fight, --mine, --survive, --legacy и --no-…');
     return 2;
   }
-  if ([SCENARIO, CLICKS, FIGHT, MINE, SURVIVE].filter(Boolean).length > 1) {
-    console.error('--scenario, --clicks, --fight, --mine и --survive — разные проверки: запусти их по очереди');
+  if ([SCENARIO, CLICKS, FIGHT, MINE, SURVIVE, FISH].filter(Boolean).length > 1) {
+    console.error('--scenario, --clicks, --fight, --mine, --survive и --fish — разные проверки: запусти их по очереди');
     return 2;
   }
   if (unknown.length) {
@@ -911,7 +1075,7 @@ async function main() {
 
     const offset = logSize();
     const cmd = server ? (text) => server.child.stdin.write(`${text}\n`) : null; // консоль — только у своего сервера
-    const result = ELECTRON ? await runElectron(host, port, version) : await runBot(host, port, version, cmd);
+    const result = ELECTRON ? await runElectron(host, port, version) : FISH ? await runFishCheck(host, port, version, cmd) : await runBot(host, port, version, cmd);
     await sleep(2000); // сервер успеет дописать лог
     const { checks, other } = summarize(readLogFrom(offset));
 

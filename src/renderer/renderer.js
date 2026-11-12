@@ -104,6 +104,18 @@ const el = {
   chatInput: $('chatInput'),
   sendMode: $('sendMode'),
   chatSend: $('chatSend'),
+  tabMain: $('tabMain'),
+  tabFish: $('tabFish'),
+  pageMain: $('pageMain'),
+  pageFish: $('pageFish'),
+  fishTag: $('fishTag'),
+  fishHome: $('fishHome'),
+  fishTarget: $('fishTarget'),
+  fishStart: $('fishStart'),
+  fishStop: $('fishStop'),
+  fishStatus: $('fishStatus'),
+  fishList: $('fishList'),
+  fishClear: $('fishClear'),
 };
 
 const STATE_TITLES = {
@@ -352,15 +364,20 @@ function renderGroup() {
   const taskGroup = el.taskTarget.querySelector('option[value="group"]');
   taskGroup.hidden = !n;
   taskGroup.textContent = n ? `группе (${n})` : 'группе';
+  const fishGroup = el.fishTarget.querySelector('option[value="group"]');
+  fishGroup.hidden = !n;
+  fishGroup.textContent = n ? `группе (${n})` : 'группе';
   // Собрал группу — сообщения и задачи по умолчанию ей; разобрал — снова выбранному (только в момент, когда
   // группа появилась или пропала: выбор человека при обновлении списка не трогаем).
   if (Boolean(n) !== hadGroup) {
     if (n && el.sendMode.value === 'one') el.sendMode.value = 'group';
     if (n && el.taskTarget.value === 'selected') el.taskTarget.value = 'group';
+    if (n && el.fishTarget.value === 'selected') el.fishTarget.value = 'group';
     hadGroup = Boolean(n);
   }
   if (!n && el.sendMode.value.startsWith('group')) el.sendMode.value = 'one';
   if (!n && el.taskTarget.value === 'group') el.taskTarget.value = 'selected';
+  if (!n && el.fishTarget.value === 'group') el.fishTarget.value = 'selected';
   el.botStart.textContent = n ? '▶ Старт группы' : '▶ Старт';
   el.botStop.textContent = n ? '■ Стоп группы' : '■ Стоп';
   try {
@@ -532,7 +549,10 @@ function updateGuardTag() {
 function fillForm(cfg) {
   el.host.value = cfg.host;
   el.port.value = cfg.port;
-  el.version.value = cfg.version;
+  // Сохранённой версии нет в списке (вписали раньше вручную) — добавить, чтобы выбор не потерялся.
+  const version = cfg.version || '';
+  if (![...el.version.options].some((o) => o.value === version)) el.version.add(new Option(version, version));
+  el.version.value = version;
   el.auth.value = cfg.auth;
   el.delay.value = cfg.reconnectDelay;
   // Поля, которые человек сейчас правит, не трогаем (иначе прыгнет курсор).
@@ -555,6 +575,7 @@ function fillForm(cfg) {
   for (const key of ['questStorage', 'questRewards', 'questFarm', 'questPen', 'questJunk', 'netherCommand', 'questMobHomes', 'questTogether', 'questPause']) {
     if (document.activeElement !== el[key]) el[key].value = cfg[key] === undefined || cfg[key] === null ? '' : cfg[key];
   }
+  if (document.activeElement !== el.fishHome) el.fishHome.value = cfg.questStorage || ''; // «Авто фиш» — тот же дом склада
   updateQuestSetupTag();
   setAutoReconnectUi(cfg.autoReconnect);
   updateLabels();
@@ -1060,6 +1081,129 @@ el.taskAdd.addEventListener('click', async () => {
 el.taskPauseAll.addEventListener('click', () => bridge.tasksControl('pause'));
 el.taskResumeAll.addEventListener('click', () => bridge.tasksControl('resume'));
 bridge.onTasks(renderTasks);
+
+// ---------- вкладки левой панели: «Управление» и «Авто фиш» ----------
+
+const TABS = { main: [el.tabMain, el.pageMain], fish: [el.tabFish, el.pageFish] };
+
+function showTab(name) {
+  const tab = TABS[name] ? name : 'main';
+  for (const [key, [button, page]] of Object.entries(TABS)) {
+    const on = key === tab;
+    button.classList.toggle('is-on', on);
+    button.setAttribute('aria-selected', String(on));
+    page.hidden = !on;
+  }
+  try {
+    localStorage.setItem('mbp-tab', tab);
+  } catch (_) {
+    /* без памяти — вкладка по умолчанию */
+  }
+}
+el.tabMain.addEventListener('click', () => showTab('main'));
+el.tabFish.addEventListener('click', () => showTab('fish'));
+try {
+  showTab(localStorage.getItem('mbp-tab') || 'main');
+} catch (_) {
+  showTab('main');
+}
+
+// ---------- «Авто фиш»: рыбалка ботов (#рыбалка), кто что делает и сколько поймал ----------
+
+let fishState = { rows: [], active: 0, caught: 0 };
+const FISH_ROWS = 40; // строк не больше: у 70 ботов остальные — числом
+
+function fishRow(r) {
+  const row = document.createElement('div');
+  row.className = 'task fish';
+  // Цвет полоски — как у задач: рыбачит — зелёная, в пути — синяя, не вышло — красная, остановлен — бледная.
+  row.dataset.state = r.active ? (r.state === 'fishing' ? 'running' : 'waiting') : (r.state === 'error' || r.state === 'offline' ? 'error' : 'done');
+  const head = document.createElement('div');
+  head.className = 'task-head';
+  const state = document.createElement('span');
+  state.className = 'task-state';
+  state.textContent = r.stateText;
+  const who = document.createElement('span');
+  who.className = 'task-who';
+  who.textContent = r.nick;
+  who.title = 'Выбрать этого бота';
+  who.addEventListener('click', () => choose(r.bot));
+  const count = document.createElement('span');
+  count.className = 'fish-count';
+  count.textContent = `поймал ${r.caught}`;
+  head.append(state, who, count);
+  row.append(head);
+  if (r.text) {
+    const now = document.createElement('div');
+    now.className = 'task-now';
+    now.textContent = r.text;
+    row.append(now);
+  }
+  const parts = [];
+  if (r.items && r.items.length) parts.push(r.items.map((i) => `${i.label} ×${i.count}`).join(', '));
+  if (r.rods !== null && r.active) parts.push(`удочек: ${r.rods}`);
+  if (parts.length) {
+    const note = document.createElement('div');
+    note.className = 'task-note';
+    note.textContent = parts.join(' · ');
+    row.append(note);
+  }
+  return row;
+}
+
+function renderFish(s) {
+  if (!s || !Array.isArray(s.rows)) return;
+  fishState = s;
+  el.fishList.replaceChildren(...s.rows.slice(0, FISH_ROWS).map(fishRow));
+  if (s.rows.length > FISH_ROWS) {
+    const more = document.createElement('p');
+    more.className = 'hint';
+    more.textContent = `…и ещё ботов: ${s.rows.length - FISH_ROWS}`;
+    el.fishList.append(more);
+  }
+  el.fishStop.disabled = !s.active;
+  el.fishClear.hidden = !s.rows.some((r) => !r.active);
+  el.fishTag.textContent = s.active ? String(s.active) : '';
+  el.fishTag.hidden = !s.active;
+  el.fishTag.title = s.active ? `Рыбачат ботов: ${s.active}` : '';
+  if (s.rows.length) {
+    el.fishStatus.textContent = `${s.active ? `Рыбачат: ${s.active}` : 'Сейчас никто не рыбачит'} · поймано всего: ${s.caught}`;
+    el.fishStatus.className = s.active ? 'ai-status ok' : 'ai-status';
+  } else if (!el.fishStatus.dataset.keep) {
+    el.fishStatus.textContent = '';
+  }
+}
+
+function showFishNote(text, kind) {
+  el.fishStatus.textContent = text;
+  el.fishStatus.className = `ai-status ${kind || ''}`;
+  el.fishStatus.dataset.keep = '1';
+  setTimeout(() => {
+    delete el.fishStatus.dataset.keep;
+    renderFish(fishState);
+  }, 6000);
+}
+
+el.fishStart.addEventListener('click', async () => {
+  el.fishStart.disabled = true; // защита от двойного клика
+  try {
+    const r = await bridge.fishStart(el.fishTarget.value, groupIds(), el.fishHome.value.trim());
+    if (r && r.ok) showFishNote(r.targets > 1 ? `Рыбачить пошли ботов: ${r.targets}` : 'Бот пошёл рыбачить', 'ok');
+    else showFishNote(`Не начато: ${(r && r.error) || 'ошибка'}`, 'warn');
+  } finally {
+    el.fishStart.disabled = false;
+  }
+});
+el.fishStop.addEventListener('click', async () => {
+  el.fishStop.disabled = true;
+  const r = await bridge.fishStop();
+  if (!r || !r.ok) showFishNote(`Не остановлено: ${(r && r.error) || 'ошибка'}`, 'warn');
+  else renderFish(fishState);
+});
+el.fishClear.addEventListener('click', async () => renderFish(await bridge.fishClear()));
+// Дом склада — тот же, что у автопилота: сохраняется сразу, поле автопилота обновится само.
+el.fishHome.addEventListener('change', async () => fillForm(await bridge.saveConfig({ questStorage: el.fishHome.value })));
+bridge.onFish(renderFish);
 // «Следующая проверка через …» и кто чем занят — освежать, пока автопилот включён.
 setInterval(async () => {
   if (questState && questState.running && !document.hidden) renderQuests(await bridge.questsStatus());
@@ -1169,7 +1313,7 @@ bridge.onList(({ bots: list, selected: sel }) => {
   if (changed && sel) choose(sel);
 });
 
-bridge.init().then(({ config, bots: list, summary: s, selected: sel, chat, ai, quests, tasks }) => {
+bridge.init().then(({ config, bots: list, summary: s, selected: sel, chat, ai, quests, tasks, fish }) => {
   fillForm(config);
   renderList(list, sel);
   applySummary(s);
@@ -1178,4 +1322,5 @@ bridge.init().then(({ config, bots: list, summary: s, selected: sel, chat, ai, q
   refreshAiStatus();
   renderQuests(quests);
   renderTasks(tasks);
+  renderFish(fish);
 });

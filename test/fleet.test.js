@@ -404,6 +404,12 @@ test('флот: события ботов — с ником; убранный и
   managerOf('Farm01').emit('ping', 133);
   assert.ok(await waitFor(() => fleet.get('Farm01').ping === 133));
   assert.equal(fleet.list()[0].ping, 133);
+  // Рыбалка (#рыбалка) — ход и улов доходят из процесса ботов до вкладки «Авто фиш» (с ником).
+  const fished = [];
+  fleet.on('fishing', (p) => fished.push(p));
+  managerOf('Farm01').emit('fishing', { state: 'fishing', text: 'поймал: треска', caught: 3, items: [{ name: 'cod', label: 'треска', count: 3 }] });
+  assert.ok(await waitFor(() => fished.length === 1));
+  assert.deepEqual({ ...fished[0], items: fished[0].items.length }, { bot: 'farm01', nick: 'Farm01', state: 'fishing', text: 'поймал: треска', caught: 3, items: 1 });
   managerOf('Farm01').stop();
   assert.ok(await waitFor(() => fleet.get('Farm01').state === 'offline'));
   assert.equal(fleet.get('Farm01').ping, null);

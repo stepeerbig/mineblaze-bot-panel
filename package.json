@@ -1,7 +1,7 @@
 {
   "name": "mineblaze-bot-panel",
   "productName": "MineBlaze Bot Panel",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Панель управления Minecraft-ботом на mineflayer",
   "main": "src/main.js",
   "author": "MineBlaze",
@@ -15,12 +15,8 @@
   },
   "dependencies": {
     "express": "^4.22.3",
-    "geofront": "^0.1.1",
-    "ioredis": "^6.0.0",
     "mineflayer": "^4.37.1",
-    "playwright": "^1.65.0",
     "prismarine-viewer": "1.33.0",
-    "proxy-chain": "^3.0.1",
     "socket.io": "^4.8.4",
     "socks-proxy-agent": "^10.1.0"
   },
@@ -36,9 +32,6 @@
     "directories": {
       "output": "dist"
     },
-    "asarUnpack": [
-      "node_modules/playwright-core/.local-browsers/**"
-    ],
     "files": [
       "src/**/*",
       "package.json",
@@ -48,8 +41,7 @@
       "!node_modules/prismarine-viewer/public/textures/{1.8.8,1.9.4,1.10.2,1.11.2,1.12.2,1.13.2,1.14.4,1.15.2,1.16.1,1.17.1,1.18.1,1.19,1.20.1,1.21.1,1.21.4}/**",
       "!node_modules/prismarine-viewer/public/textures/1.16.4/{blocks,colormap,effect,environment,font,gui,items,map,misc,mob_effect,models,painting,particle}/**",
       "!node_modules/prismarine-viewer/public/textures/1.16.4/*.json",
-      "!node_modules/{three,three.meshline,@tweenjs}/**",
-      "node_modules/playwright-core/.local-browsers/**"
+      "!node_modules/{three,three.meshline,@tweenjs}/**"
     ],
     "win": {
       "icon": "build/icon.ico",

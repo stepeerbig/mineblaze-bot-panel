@@ -81,7 +81,7 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
       journalDir: dirs.journalDir,
       requestConnect: () => emit('want-connect', { bot: id }),
       journalLimits: JOURNAL_LIMITS,
-       proxy: account.proxy,
+      proxy: account.proxy, // прокси бота из пула (config.json на ПК), см. fleet.setAccounts
     });
     entry.manager = manager;
     manager.on('log', (e) => emit('log', { bot: id, ...e }));
@@ -89,15 +89,13 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
     manager.on('state', (state) => emit('state', { bot: id, state }));
     manager.on('link', (l) => emit('link', { bot: id, ...l }));
     manager.on('ready', () => emit('ready', { bot: id }));
-     manager.on('captcha', (c) => {
-      emit('captcha', { bot: id, ...c });
-      emit('solve-captcha', { bot: id, url: c.url }); // <--- ДОБАВЛЯЕМ ОТПРАВКУ СОБЫТИЯ НАВЕРХ
-    });
+    manager.on('captcha', (c) => emit('captcha', { bot: id, ...c }));
     manager.on('captcha-done', (c) => emit('captcha-done', { bot: id, ...c }));
     manager.on('ip-block', (b) => emit('ip-block', { bot: id, ...b }));
     manager.on('login-hung', (h) => emit('login-hung', { bot: id, ...h }));
     manager.on('msa', (d) => emit('msa', { bot: id, ...d }));
     manager.on('ping', (ping) => emit('ping', { bot: id, ping }));
+    manager.on('fishing', (p) => emit('fishing', { bot: id, ...p })); // вкладка «Авто фиш»: что делает, сколько поймал
     // Экран показывает своего бота: тот появился в мире или пропал — экран узнаёт сразу.
     manager.on('bot', (bot) => {
       if (viewer && viewerBot === id) viewer.setBot(bot);
@@ -183,7 +181,7 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
         if (!entry) {
           addBot(id, account);
         } else {
-               entry.account = { username: account.username, password: account.password || '', proxy: account.proxy }; 
+          entry.account = { username: account.username, password: account.password || '', proxy: account.proxy };
           refresh(entry);
         }
       }

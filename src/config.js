@@ -6,9 +6,10 @@ const DEFAULT_CONFIG = Object.freeze({
   host: 'mineblaze.net',
   port: 25565,
   username: 'TestBot', // один бот (как было до списка ботов): если «Боты» пусты — запускается он
-  proxyPool: '', // свои прокси — только в настройках на ПК (config.json), не в коде: репозиторий публичный
-   // Пул прокси: ссылки по одной на строку (socks5://user:pass@host:port)
-  botsPerProxy: 4, // Сколько ботов пускать через один прокси
+  // Пул прокси: ссылки по одной на строку (socks5://user:pass@host:port). Свои прокси — только в настройках на ПК
+  // (config.json), не в коде: репозиторий публичный.
+  proxyPool: '',
+  botsPerProxy: 4, // сколько ботов пускать через один прокси
   accounts: '', // боты: «ник» или «ник:пароль», по одному в строке (хранится зашифрованным)
   version: '1.21.11',
   auth: 'offline',
@@ -80,7 +81,6 @@ function parseMobHomes(text) {
   return out;
 }
 
-/** Приводит присланные значения к безопасному виду; неверные поля просто отбрасывает. */
 /** Приводит присланные значения к безопасному виду; неверные поля просто отбрасывает. */
 function sanitize(src) {
   const out = {};
@@ -161,14 +161,12 @@ function sanitize(src) {
     if (n !== undefined) out[key] = n;
   }
   if (src.xray && typeof src.xray === 'object') out.xray = sanitizeXray(src.xray);
-
-  // === ДОБАВЛЕННЫЕ НАСТРОЙКИ ПРОКСИ ===
+  // Пул прокси (только в config.json на ПК).
   if (typeof src.proxyPool === 'string') out.proxyPool = src.proxyPool.slice(0, 5000);
   if (src.botsPerProxy !== undefined) {
     const n = parseInt(src.botsPerProxy, 10);
     if (n >= 1 && n <= 100) out.botsPerProxy = n;
   }
-
   return out;
 }
 

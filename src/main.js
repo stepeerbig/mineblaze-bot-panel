@@ -1,7 +1,5 @@
 'use strict';
-const { CaptchaService } = require('./captcha-service');
-// ...
-let captchaService = null; // добавь глобальную переменную
+
 const { app, BrowserWindow, Menu, clipboard, ipcMain, net, safeStorage, session, shell, utilityProcess } = require('electron');
 const fs = require('fs');
 const os = require('os');
@@ -10,6 +8,7 @@ const { Fleet } = require('./fleet');
 const { AiAgent, formatDuration } = require('./ai');
 const { QuestAutopilot } = require('./quest-autopilot');
 const { TaskBoard } = require('./tasks');
+const { FishBoard } = require('./fish-board');
 const { DEFAULT_CONFIG, sanitize, validate, accountsOf } = require('./config');
 const { maskSecrets } = require('./chat-utils');
 
@@ -43,6 +42,16 @@ let viewerTarget = null; // { bot, client, url } — кого показывае
 let quitting = false;
 let shutdownDone = false;
 const chatHistory = new Map(); // номер бота → последние строки его чата
+// Вкладка «Авто фиш»: кто рыбачит и сколько поймал (src/fish-board.js); в окно — не чаще раза в 0,3 с.
+const fishBoard = new FishBoard();
+let fishPending = null;
+fishBoard.on('update', () => {
+  if (fishPending) return;
+  fishPending = setTimeout(() => {
+    fishPending = null;
+    send('fish:update', fishBoard.list());
+  }, 300);
+});
 
 const errText = (err) => (err && err.message ? err.message : String(err));
 
@@ -232,6 +241,7 @@ function registerIpc() {
       ai: { running: Boolean(ai && ai.busy) },
       quests: autopilot ? autopilot.status() : null,
       tasks: tasks ? tasks.list() : [],
+      fish: fishBoard.list(),
     };
   });
 
@@ -395,6 +405,58 @@ function registerIpc() {
     return 0;
   });
   ipcMain.handle('tasks:list', () => (tasks ? tasks.list() : []));
+
+  // Вкладка «Авто фиш». target: 'selected' — выбранному, 'group' — группе (ids), 'online' — всем в сети; home — дом
+  // склада (сундуки с удочками, вода рядом). Боту уходит «#рыбалка дом X»: рыбачит, пока не «#стоп».
+  ipcMain.handle('fish:start', (_e, { target = 'selected', ids: groupIds = null, home = '' } = {}) => {
+    let ids;
+    if (target === 'group') ids = Array.isArray(groupIds) ? groupIds.map(String) : [];
+    else if (target === 'online') ids = fleet.list().map((b) => b.bot);
+    else ids = selectedBot ? [selectedBot] : [];
+    const inGame = (id) => {
+      const b = fleet.get(id);
+      return Boolean(b && (b.state === 'online' || b.state === 'connected'));
+    };
+    ids = ids.filter(inGame);
+    if (!ids.length) {
+      const why = target === 'group' ? 'в группе нет ботов в сети (выбери ботов: Ctrl+клик, Shift+клик)' : target === 'online' ? 'в сети нет ни одного бота' : 'выбранный бот не в сети';
+      return { ok: false, error: why };
+    }
+    const h = String(home || '').trim().replace(/^\/?home\s+/i, '');
+    if (h && !/^[\p{L}\p{N}_-]{1,32}$/u.test(h)) return { ok: false, error: `странное имя дома «${h}»: буквы, цифры, _ и -` };
+    if (!h && !String(config.questStorage || '').trim()) return { ok: false, error: 'впиши «Дом склада» — дом, где сундуки с удочками и вода рядом' };
+    const line = `#рыбалка${h ? ` дом ${h}` : ''}`;
+    const r = fleet.broadcast(line, { ids, who: ids.length > 1 ? 'рыбакам' : 'боту' });
+    if (r.refused) return { ok: false, error: r.refused };
+    for (const id of ids) fishBoard.started(id, fleet.get(id).nick);
+    uiLog('info', `Авто фиш: ${ids.length > 1 ? `ботов ${ids.length}` : fleet.get(ids[0]).nick} — ${line} (рыбачат, пока не «Стоп»)`);
+    return { ok: true, targets: ids.length };
+  });
+  // Остановить рыбалку: ids — кого (нет — всех, кто рыбачит). Каждому — «#стоп».
+  ipcMain.handle('fish:stop', async (_e, { ids = null } = {}) => {
+    const list = (Array.isArray(ids) && ids.length ? ids.map(String) : fishBoard.activeIds()).filter((id) => fleet.get(id));
+    if (!list.length) return { ok: false, error: 'никто не рыбачит' };
+    let sent = 0;
+    for (const id of list) {
+      const b = fleet.get(id);
+      if (!b || (b.state !== 'online' && b.state !== 'connected')) {
+        fishBoard.offline(id); // не в сети — его рыбалка и так кончилась
+        continue;
+      }
+      try {
+        if (await fleet.say(id, '#стоп')) sent += 1; // в сети — ответит сам («остановлен»)
+      } catch (_) {
+        fishBoard.offline(id);
+      }
+    }
+    uiLog('info', `Авто фиш: стоп — ботов ${sent}`);
+    return { ok: true, targets: sent };
+  });
+  ipcMain.handle('fish:list', () => fishBoard.list());
+  ipcMain.handle('fish:clear', () => {
+    fishBoard.clearDone();
+    return fishBoard.list();
+  });
 
   ipcMain.handle('ai:stop', () => {
     const stopped = ai.stop();
@@ -595,15 +657,14 @@ function createViewerWindow(id) {
 
 // ---------- боты ----------
 
-function createFleet(captchaService) { // <--- АРГУМЕНТ ЕСТЬ
+function createFleet() {
   const f = new Fleet({
     config,
     fork: (index) => utilityProcess.fork(path.join(__dirname, 'bot-process.js'), [], { serviceName: `MineBlaze Bots ${index + 1}`, stdio: 'pipe' }),
     initPayload: () => ({
       authCacheDir: path.join(app.getPath('userData'), 'auth-cache'),
-      journalDir: path.join(logsDir, 'packets'), 
+      journalDir: path.join(logsDir, 'packets'), // журнал пакетов при кике и возврате в лобби
     }),
-    captchaService: captchaService, // <--- ПЕРЕДАЕТСЯ В FLEET
   });
   f.on('log', (entry) => {
     send('bot:log', entry);
@@ -617,11 +678,16 @@ function createFleet(captchaService) { // <--- АРГУМЕНТ ЕСТЬ
     if (msg.bot === selectedBot) send('bot:chat', msg); // в панели — чат выбранного бота
     logChat(msg);
   });
-  f.on('state', (s) => send('bot:state', s));
+  f.on('state', (s) => {
+    send('bot:state', s);
+    if (s && s.state !== 'online' && s.state !== 'connected') fishBoard.offline(s.bot); // вышел — рыбалка кончилась
+  });
+  f.on('fishing', (p) => fishBoard.update(p)); // #рыбалка: что делает, сколько поймал — вкладке «Авто фиш»
   f.on('ping', (p) => send('bot:ping', p)); // пинг бота, как его считает сервер (Tab)
   f.on('summary', (s) => send('fleet:summary', s));
   f.on('list', (bots) => {
     for (const id of [...chatHistory.keys()]) if (!f.get(id)) chatHistory.delete(id);
+    fishBoard.retain(bots.map((b) => b.bot)); // убранных из списка — и из «Авто фиш»
     selectBot(selectedBot);
     send('fleet:list', { bots, selected: selectedBot });
   });
@@ -750,7 +816,8 @@ function createAutopilot() {
   const ap = new QuestAutopilot({
     getConfig: () => config,
     env: {
-      listBots: () => fleet.list(),
+      // Боты, которые рыбачат («Авто фиш»), автопилот не трогает: ботам — одно дело за раз.
+      listBots: () => fleet.list().filter((b) => !fishBoard.isActive(b.bot)),
       runCommand: (bot, line, { signal, quiet } = {}) => fleet.commandOne(bot, line, { signal, quiet }),
       // Ботам — одно дело за раз: пока работает ИИ или идёт «по очереди», автопилот их не трогает.
       busy: () => (ai && ai.busy ? 'ИИ выполняет задание' : fleet && fleet.turnRunning ? 'идёт «по очереди»' : ''),
@@ -823,26 +890,18 @@ function startApp() {
   });
 
   app.whenReady().then(() => {
-    // 1. СНАЧАЛА задаем пути и загружаем настройки!
     configFile = path.join(app.getPath('userData'), 'config.json');
     logsDir = path.join(app.getPath('userData'), 'logs');
     loadConfig();
 
-    // 2. Создаем сервис капчи
-    captchaService = new CaptchaService();
-    captchaService.on('log', (e) => uiLog(e.level, e.text));
-
-    // 3. Создаем флот и ПЕРЕДАЕМ ему сервис капчи (и больше не пересоздаем его!)
-    fleet = createFleet(captchaService); 
-
-    // 4. Остальные сервисы
+    fleet = createFleet();
     ai = createAi();
     autopilot = createAutopilot();
     tasks = createTasks();
-    syncFleet(); 
-    tasks.start(); 
+    syncFleet(); // процессы ботов запускаются, когда нужны (по «Старт» или для экрана бота)
+    tasks.start(); // задачи из файла продолжатся, когда их боты войдут
     selectBot(null);
-    if (config.questAuto) autopilot.start(); 
+    if (config.questAuto) autopilot.start(); // был включён — продолжает (ждёт ботов в сети)
 
     // Странице экрана бота не нужны камера, уведомления и прочие разрешения.
     session.fromPartition(VIEWER_PARTITION).setPermissionRequestHandler((_wc, permission, callback) => {
@@ -862,7 +921,7 @@ function startApp() {
     quitting = true;
     if (ai) ai.stop();
     if (autopilot) autopilot.stop().catch(() => {});
-    if (tasks) tasks.stop(); 
+    if (tasks) tasks.stop(); // список задач — в файл; продолжатся при следующем запуске
     Promise.resolve(fleet && fleet.shutdown())
       .catch(() => {})
       .finally(() => {
@@ -874,6 +933,7 @@ function startApp() {
 
   app.on('window-all-closed', () => app.quit());
 }
+
 function runSelftest() {
   const finish = (result, code) => {
     try {
@@ -955,10 +1015,16 @@ async function checkUi(expected) {
     out.ai = Boolean(document.getElementById('aiRun') && document.getElementById('aiProvider').value === 'ollama' && document.getElementById('ollamaModel').value);
     for (let i = 0; i < 20 && !document.getElementById('questStatus').textContent; i += 1) await sleep(50);
     out.quests = document.getElementById('questStatus').textContent;
+    // Вкладка «Авто фиш»: открывается, там дом склада и кнопки; «Управление» на это время скрыто; назад — как было.
+    document.getElementById('tabFish').click();
+    out.fishTab = !document.getElementById('pageFish').hidden && document.getElementById('pageMain').hidden &&
+      Boolean(document.getElementById('fishStart')) && document.getElementById('fishStop').disabled;
+    document.getElementById('tabMain').click();
+    out.fishTab = out.fishTab && document.getElementById('pageFish').hidden && !document.getElementById('pageMain').hidden;
     return out;
   })()`, true);
   const wantSelected = fleet.order.length > 1 ? fleet.get(fleet.order[1]).nick : fleet.order.length ? fleet.get(fleet.order[0]).nick : null;
-  const ok = errors.length === 0 && result.bots === expected && result.selected === wantSelected && result.ai && /^Выключен/.test(result.quests);
+  const ok = errors.length === 0 && result.bots === expected && result.selected === wantSelected && result.ai && /^Выключен/.test(result.quests) && result.fishTab;
   return { ok, ...result, errors };
 }
 

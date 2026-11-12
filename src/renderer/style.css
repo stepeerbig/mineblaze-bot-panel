@@ -733,3 +733,50 @@ summary:focus-visible {
 .group-info[hidden] { display: none; }
 .group-info b { font-weight: 600; }
 .group-info .link { font-size: 12px; }
+
+/* ---------- вкладки левой панели: «Управление» и «Авто фиш» ---------- */
+
+.side-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px;
+  padding: 3px;
+  background: var(--field);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+
+.side-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 32px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ash);
+  font: 600 13px var(--ui);
+  cursor: pointer;
+}
+
+.side-tab:hover { color: var(--bone); }
+.side-tab.is-on { background: var(--raised-hover); color: var(--bone); box-shadow: inset 0 -2px 0 var(--brass); }
+
+.side-page { display: flex; flex-direction: column; gap: 24px; }
+.side-page[hidden] { display: none; }
+
+/* ---------- «Авто фиш» ---------- */
+
+.btn.fish-start { height: 38px; background: var(--go); color: var(--go-text); font-size: 13.5px; }
+.btn.fish-start:hover:not(:disabled) { background: var(--go-hover); }
+.btn.fish-stop { height: 38px; background: var(--raised); color: var(--bone); font-size: 13.5px; }
+.btn.fish-stop:hover:not(:disabled) { background: rgba(92, 40, 38, .95); color: #f3b0ac; }
+
+.fish-list { display: flex; flex-direction: column; gap: 6px; }
+.fish-list:empty { display: none; }
+.fish-count { flex: none; margin-left: auto; color: var(--brass); font-weight: 600; font-size: 11.5px; }
+.fish .task-who { cursor: pointer; }
+.fish .task-who:hover { text-decoration: underline; }
+.fish-clear { align-self: flex-start; margin-left: -6px; }
+.fish-clear[hidden] { display: none; }

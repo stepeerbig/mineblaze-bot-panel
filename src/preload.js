@@ -45,6 +45,14 @@ contextBridge.exposeInMainWorld('api', {
   tasksControl: (action, id) => ipcRenderer.invoke('tasks:control', { action: String(action), id: id === undefined || id === null ? null : String(id) }),
   tasksList: () => ipcRenderer.invoke('tasks:list'),
   onTasks: listen('tasks:update'), // [{ id, bot, nick, state, stateText, step, total, current, note, repeat, rounds }]
+  // «Авто фиш»: target — 'selected' | 'group' | 'online', ids — группа, home — дом склада. → { ok, targets, error }
+  fishStart: (target, ids, home) => ipcRenderer.invoke('fish:start', {
+    target: String(target || 'selected'), ids: Array.isArray(ids) ? ids.map(String) : null, home: String(home || ''),
+  }),
+  fishStop: (ids) => ipcRenderer.invoke('fish:stop', { ids: Array.isArray(ids) ? ids.map(String) : null }), // без ids — всех рыбаков
+  fishList: () => ipcRenderer.invoke('fish:list'),
+  fishClear: () => ipcRenderer.invoke('fish:clear'), // убрать тех, кто уже не рыбачит
+  onFish: listen('fish:update'), // { rows: [{ bot, nick, state, stateText, text, caught, last, items, rods, active }], active, caught }
   onLog: listen('bot:log'),
   onChat: listen('bot:chat'),
   onState: listen('bot:state'), // { bot, nick, state }

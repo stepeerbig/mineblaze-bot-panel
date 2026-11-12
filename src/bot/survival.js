@@ -15,7 +15,17 @@ const HOSTILE = new Set([
   'silverfish', 'endermite', 'witch', 'slime', 'magma_cube', 'pillager', 'vindicator', 'evoker', 'ravager', 'vex',
   'phantom', 'blaze', 'wither_skeleton', 'piglin_brute', 'hoglin', 'zoglin', 'guardian', 'breeze', 'creaking',
 ]);
-const RANGED = new Set(['skeleton', 'stray', 'bogged', 'pillager', 'witch', 'blaze', 'breeze', 'guardian']);
+const RANGED = new Set(['skeleton', 'stray', 'bogged', 'pillager', 'witch', 'blaze', 'breeze', 'guardian', 'piglin']);
+// Незер. Нейтральные: зомби-пиглин — только если разозлили (ударил кто-то из них); пиглин — если на боте нет золотой
+// брони, если бот копает золото (пиглины злятся, когда при них ломают золотую руду) или его разозлили.
+// Бить нейтрального без причины нельзя: зомби-пиглины злятся всей толпой.
+const NEUTRAL = new Set(['piglin', 'zombified_piglin']);
+// Огненный шар гаста: летит к боту — отбить ударом (полетит обратно) или закрыться щитом.
+const FIREBALLS = new Set(['fireball']);
+const FIREBALL_DETECT = 8;
+const ANGRY_MS = 40000; // разозлённый нейтральный — столько считается врагом (в игре 20–39 с)
+const ANGER_RADIUS = 16; // разозлил одного — злятся и такие же рядом (в игре — тоже)
+const HURT_BLAME = 5; // ударили, а врагов не видно — виноват нейтральный ближе этого
 const DETECT = 6; // ближе — отбиваться (и не сквозь стену: в соседней пещере — не враг)
 const DETECT_RANGED = 12;
 const CREEPER_SHIELD = 4.5; // крипер ближе — поднять щит
@@ -135,8 +145,17 @@ function bestWeapon(bot) {
   return [...SWORDS, ...AXES].find((n) => hasItem(bot, n)) || null;
 }
 
+const HEAL_AT = 8; // здоровье (из 20) — съесть золотое яблоко, если есть (его едят и сытым)
+/** Мало здоровья и есть золотое яблоко — его имя, иначе null. */
+function healItem(bot) {
+  if (typeof bot.health !== 'number' || bot.health > HEAL_AT) return null;
+  return FOOD_LAST.find((n) => hasItem(bot, n)) || null;
+}
+
 /** Что съесть сейчас (имя) или null: нечего или не голоден. */
 function pickFood(bot) {
+  const heal = healItem(bot);
+  if (heal) return heal;
   const food = typeof bot.food === 'number' ? bot.food : 20;
   const lists = food <= EAT_LOW ? [FOOD_GOOD, FOOD_LOW] : [FOOD_GOOD];
   for (const list of lists) {
@@ -152,6 +171,7 @@ function pickFood(bot) {
 
 /** Пора поесть: сытость низкая (или мало здоровья, а восстановиться нечем) и есть что. */
 function needsFood(bot) {
+  if (healItem(bot)) return true;
   if (typeof bot.food !== 'number' || bot.food >= 20) return false;
   const hurt = typeof bot.health === 'number' && bot.health < 14 && bot.food < 18;
   return (bot.food <= EAT_AT || hurt) && Boolean(pickFood(bot));
@@ -184,15 +204,55 @@ function healthOf(bot, e) {
   return i >= 0 && typeof e.metadata[i] === 'number' ? e.metadata[i] : null;
 }
 
-/** Враги рядом (видно и близко), ближние первыми. ignore — номера сущностей, на которых не отвлекаться. */
-function threats(bot, ignore = new Map()) {
+/** Надета ли хоть одна золотая вещь (пиглины такого не трогают). */
+function wearsGold(bot) {
+  const slots = bot.inventory && bot.inventory.slots ? bot.inventory.slots : [];
+  return [5, 6, 7, 8].some((i) => slots[i] && /^golden_/.test(slots[i].name));
+}
+
+/**
+ * Враг ли сущность сейчас. ctx: { angry: Map номер → до какого времени зол, hostile: Set имён — враги на это время
+ * (пиглины, пока бот копает золото) }.
+ */
+function hostileNow(bot, e, ctx = {}) {
+  if (HOSTILE.has(e.name)) return true;
+  if (!NEUTRAL.has(e.name)) return false;
+  const until = ctx.angry ? ctx.angry.get(e.id) : 0;
+  if (until && until > nowOf(bot)) return true;
+  if (ctx.hostile && ctx.hostile.has(e.name)) return true;
+  return e.name === 'piglin' && !wearsGold(bot);
+}
+
+// Огненные шары: где был в прошлый раз (летит ли к боту) — по смене позиции, а не по числу вызовов.
+const fireballSeen = new WeakMap();
+/** Огненный шар летит к боту и уже близко. */
+function fireballComing(e, d) {
+  const p = e.position;
+  const rec = fireballSeen.get(e);
+  const moved = !rec || rec.x !== p.x || rec.y !== p.y || rec.z !== p.z;
+  const coming = !rec ? true : moved ? d < rec.d - 0.01 : rec.coming;
+  if (moved) fireballSeen.set(e, { x: p.x, y: p.y, z: p.z, d, coming });
+  return d <= FIREBALL_DETECT && coming;
+}
+
+/**
+ * Враги рядом (видно и близко), ближние первыми; огненные шары, летящие к боту, — самыми первыми.
+ * ignore — номера сущностей, на которых не отвлекаться; ctx — кто из нейтральных сейчас враг (hostileNow).
+ */
+function threats(bot, ignore = new Map(), ctx = {}) {
   if (!bot.entity || !bot.entity.position) return [];
   const me = bot.entity.position;
   const eye = me.offset(0, 1.62, 0);
   const now = nowOf(bot);
   const out = [];
   for (const e of Object.values(bot.entities || {})) {
-    if (!e || e === bot.entity || !e.position || !HOSTILE.has(e.name) || hasCustomName(e)) continue;
+    if (!e || e === bot.entity || !e.position) continue;
+    if (FIREBALLS.has(e.name)) {
+      const d = e.position.distanceTo(me);
+      if (fireballComing(e, d) && visible(bot, eye, e)) out.push({ e, d: d - 1000 });
+      continue;
+    }
+    if (!hostileNow(bot, e, ctx) || hasCustomName(e)) continue;
     const hp = healthOf(bot, e);
     if (hp !== null && hp <= 0) continue; // уже умер (ещё падает) — не враг
 
@@ -226,13 +286,14 @@ async function stepBack(bot, creeper) {
  * Отбиться от врагов рядом: оружие в руку; крипер близко — щит (есть во второй руке) или отойти, если шипит;
  * кого достать с места — бить; стрелка или далёкого — подойти. Врагов нет 1,5 с — всё. → { kills, blocked }
  */
-async function defend(bot, { ignore = new Map(), maxMs = 60000 } = {}) {
+async function defend(bot, { ignore = new Map(), maxMs = 60000, ctx = {} } = {}) {
   const started = nowOf(bot);
   const weapon = bestWeapon(bot);
   if (weapon && (!bot.heldItem || bot.heldItem.name !== weapon)) await bot.actions.equip(weapon);
   const hitAt = new Map();
   let kills = 0;
   let blocked = 0;
+  let deflected = 0;
   const killed = [];
   // Отбился — умер тот, кого бот бил недавно (добил ли он сам или, скажем, взрыв крипера рядом).
   const onDead = (e) => {
@@ -247,10 +308,11 @@ async function defend(bot, { ignore = new Map(), maxMs = 60000 } = {}) {
   // Пока бот ждёт, подходит или бьёт другого — крипер подошёл или зашипел: прервать это и закрыться щитом.
   let interruptible = false;
   let tick = 0;
-  const creeperNear = () => threats(bot, ignore).some((e) => e.name === 'creeper' && (e.position.distanceTo(bot.entity.position) < CREEPER_SHIELD || fusing(bot, e)));
+  const creeperNear = () => threats(bot, ignore, ctx).some((e) => FIREBALLS.has(e.name) ||
+    (e.name === 'creeper' && (e.position.distanceTo(bot.entity.position) < CREEPER_SHIELD || fusing(bot, e))));
   const watch = () => {
     if (!interruptible || (tick += 1) % 2) return;
-    if (creeperNear() && bot.actions.busy) bot.actions.interrupt('крипер рядом', 'threat');
+    if (creeperNear() && bot.actions.busy) bot.actions.interrupt('крипер или огненный шар рядом', 'threat');
   };
   bot.on('physicsTick', watch);
   // Действие, которое можно прервать ради крипера: прервали — просто оглядеться заново (щит — следующим шагом).
@@ -269,10 +331,11 @@ async function defend(bot, { ignore = new Map(), maxMs = 60000 } = {}) {
     while (nowOf(bot) - started < maxMs) {
       // Опаснее всего — крипер, который подошёл или шипит: он первым, даже если ближе зомби. Крипер подальше —
       // не цель (к нему не идём: взорвётся рядом), пока бьём остальных.
-      const list = threats(bot, ignore);
+      const list = threats(bot, ignore, ctx);
       const dist = (e) => e.position.distanceTo(bot.entity.position);
+      const fireball = list.find((e) => FIREBALLS.has(e.name));
       const close = list.find((e) => e.name === 'creeper' && (dist(e) < CREEPER_SHIELD || (fusing(bot, e) && dist(e) < 7)));
-      const t = close || list.find((e) => e.name !== 'creeper') || list[0];
+      const t = fireball || close || list.find((e) => e.name !== 'creeper') || list[0];
       if (!t) {
         if (idle >= FIGHT_IDLE_TICKS) break;
         await interruptibly(() => bot.actions.wait(250));
@@ -282,6 +345,23 @@ async function defend(bot, { ignore = new Map(), maxMs = 60000 } = {}) {
       idle = 0;
       const d = dist(t);
       const off = bot.inventory && bot.inventory.slots ? bot.inventory.slots[45] : null;
+      if (FIREBALLS.has(t.name)) {
+        // Шар гаста: достать — ударить (полетит обратно), нет — щит к нему; без щита — ждать, пока долетит до удара.
+        try {
+          if (bot.actions.canHit(t)) {
+            await bot.actions.attack(t, { cooldownTicks: 0 });
+            deflected += 1;
+          } else if (off && off.name === 'shield') {
+            await bot.actions.shield(t, { maxTicks: 30, until: () => bot.actions.canHit(t) });
+            blocked += 1;
+          } else {
+            await bot.actions.wait(50);
+          }
+        } catch (err) {
+          if (isStop(err)) throw err;
+        }
+        continue;
+      }
       if (t.name === 'creeper') {
         if (off && off.name === 'shield' && (d < CREEPER_SHIELD || fusing(bot, t))) {
           try {
@@ -345,7 +425,7 @@ async function defend(bot, { ignore = new Map(), maxMs = 60000 } = {}) {
     bot.removeListener('entityDead', onDead);
     bot.removeListener('physicsTick', watch);
   }
-  return { kills, blocked, killed };
+  return { kills, blocked, killed, deflected };
 }
 
 /** Поесть, если голоден и есть что. → true — поел. */
@@ -378,21 +458,55 @@ async function prepareShield(bot) {
  * Сторож на время работы: враг рядом или пора поесть — прерывает текущее действие (ошибка с кодом «threat»);
  * работа ловит её и зовёт handle() — отбиться и поесть, потом продолжает. → { start, stop, wants, handle, stats }
  */
-function createGuard(bot) {
+function createGuard(bot, { hostile = [] } = {}) {
   let active = false;
   let busy = false;
   let tick = 0;
   const ignore = new Map();
+  const ctx = { angry: new Map(), hostile: new Set(hostile) };
+  /** Разозлить нейтральных: ближайшего к боту в radius и таких же вокруг него (ANGER_RADIUS). → сколько разозлил */
+  const provoke = (radius = HURT_BLAME, names = NEUTRAL) => {
+    if (!bot.entity || !bot.entity.position) return 0;
+    const me = bot.entity.position;
+    let first = null;
+    for (const e of Object.values(bot.entities || {})) {
+      if (!e || !e.position || !names.has(e.name)) continue;
+      const d = e.position.distanceTo(me);
+      if (d <= radius && (!first || d < first.d)) first = { e, d };
+    }
+    if (!first) return 0;
+    const until = nowOf(bot) + ANGRY_MS;
+    let n = 0;
+    for (const e of Object.values(bot.entities || {})) {
+      if (e && e.position && e.name === first.e.name && e.position.distanceTo(first.e.position) <= ANGER_RADIUS) {
+        ctx.angry.set(e.id, until);
+        n += 1;
+      }
+    }
+    return n;
+  };
+  // Здоровье упало не от огня и не от голода, а врагов не видно — ударил нейтральный рядом (зомби-пиглин): он и
+  // такие же вокруг — враги на время.
+  let lastHp = typeof bot.health === 'number' ? bot.health : null;
+  const onHealth = () => {
+    const hp = bot.health;
+    const dropped = typeof lastHp === 'number' && typeof hp === 'number' && hp < lastHp;
+    lastHp = hp;
+    if (!active || !dropped || burning(bot) || bot.food === 0) return;
+    if (threats(bot, ignore, ctx).length) return;
+    if (provoke() && !busy && bot.actions && bot.actions.busy) bot.actions.interrupt('ударил нейтральный моб', 'threat');
+  };
+  bot.on('health', onHealth);
   let eatFailedAt = -Infinity;
   let drinkFailedAt = -Infinity;
-  const stats = { kills: 0, killed: [], ate: 0, fights: 0, blocked: 0, hungry: false, drank: 0, burnedNoPotion: false };
+  const stats = { kills: 0, killed: [], ate: 0, fights: 0, blocked: 0, deflected: 0, hungry: false, drank: 0, burnedNoPotion: false };
   const wants = () => {
     // Горит (или в лаве), огнестойкости нет — первым делом выпить зелье огнестойкости.
     if (burning(bot) && !hasFireRes(bot)) {
       if (fireResPotions(bot).length && nowOf(bot) - drinkFailedAt > 3000) return 'fire';
       stats.burnedNoPotion = !fireResPotions(bot).length || stats.burnedNoPotion;
     }
-    if (threats(bot, ignore).length) return 'threat';
+    if (threats(bot, ignore, ctx).length) return 'threat';
     if (needsFood(bot) && nowOf(bot) - eatFailedAt > 30000) return 'food';
     if (typeof bot.food === 'number' && bot.food <= EAT_LOW && !pickFood(bot)) stats.hungry = true;
     return null;
@@ -409,8 +523,11 @@ function createGuard(bot) {
     stop() {
       active = false;
       bot.removeListener('physicsTick', onTick);
+      bot.removeListener('health', onHealth);
     },
     wants,
+    provoke,
+    ctx,
     stats,
     get busy() {
       return busy;
@@ -428,10 +545,11 @@ function createGuard(bot) {
             else drinkFailedAt = nowOf(bot);
           } else if (w === 'threat') {
             stats.fights += 1;
-            const r = await defend(bot, { ignore });
+            const r = await defend(bot, { ignore, ctx });
             stats.kills += r.kills;
             stats.killed.push(...r.killed);
             stats.blocked += r.blocked;
+            stats.deflected += r.deflected || 0;
           } else if (await eatIfHungry(bot)) {
             stats.ate += 1;
           } else {
@@ -446,6 +564,6 @@ function createGuard(bot) {
 }
 
 module.exports = {
-  HOSTILE, RANGED, FOOD_GOOD, FOOD_LOW, FOOD_BAD, EAT_AT, isFood, foodRank, cooldownFor, bestWeapon, pickFood, needsFood, fusing, threats, defend,
+  HOSTILE, RANGED, NEUTRAL, FIREBALLS, wearsGold, hostileNow, healItem, FOOD_GOOD, FOOD_LOW, FOOD_BAD, EAT_AT, isFood, foodRank, cooldownFor, bestWeapon, pickFood, needsFood, fusing, threats, defend,
   eatIfHungry, prepareShield, createGuard, FIRE_POTIONS, hasFireRes, burning, fireResPotions, drinkFireRes,
 };

@@ -174,3 +174,53 @@ test('огонь: горит без огнестойкости — сторож 
   assert.equal(g2.stats.burnedNoPotion, true);
   g2.stop();
 });
+
+test('Незер: пиглин — враг без золота на боте, с золотом — нет (пока бот не копает золото); зомби-пиглин — только разозлённый', () => {
+  const { createGuard } = require(path.join(__dirname, '..', 'src', 'bot', 'survival.js'));
+  const { bot } = setup();
+  const mob = (id, name, x, z) => ({ id, type: 'hostile', name, position: new Vec3(x, 64, z), width: 0.6, height: 1.95 });
+  bot.entities[11] = mob(11, 'piglin', 0.5, 4.5);
+  bot.entities[12] = mob(12, 'zombified_piglin', -2.5, 2.5);
+  bot.entities[13] = mob(13, 'zombified_piglin', -3.5, -2.5);
+  assert.deepEqual(threats(bot).map((e) => e.id), [11], 'без золота пиглин нападает, зомби-пиглины — нет');
+  bot.inventory.slots[8] = { name: 'golden_boots', count: 1 };
+  assert.deepEqual(threats(bot).map((e) => e.id), [], 'в золотых ботинках пиглин не враг');
+  const g = createGuard(bot, { hostile: ['piglin'] });
+  assert.deepEqual(threats(bot, new Map(), g.ctx).map((e) => e.id), [11], 'копает золото — пиглины злятся');
+  assert.equal(g.provoke(), 2, 'ударил зомби-пиглин — злятся и такие же рядом');
+  assert.deepEqual(threats(bot, new Map(), g.ctx).map((e) => e.id).sort(), [11, 12, 13]);
+  g.stop();
+});
+
+test('Незер: огненный шар гаста летит к боту — первым делом; улетает — не цель', () => {
+  const { bot } = setup();
+  const p = bot.entity.position;
+  bot.entities[21] = { id: 21, type: 'hostile', name: 'zombie', position: p.offset(0, 0, 3), width: 0.6, height: 1.95 };
+  const fb = { id: 22, type: 'projectile', name: 'fireball', position: p.offset(0, 1.5, -7), width: 1, height: 1 };
+  bot.entities[22] = fb;
+  assert.deepEqual(threats(bot).map((e) => e.id), [22, 21]);
+  fb.position = p.offset(0, 1.5, -5); // ближе — летит к боту
+  assert.deepEqual(threats(bot).map((e) => e.id), [22, 21]);
+  fb.position = p.offset(0, 1.5, -6); // отбит — летит прочь
+  assert.deepEqual(threats(bot).map((e) => e.id), [21]);
+});
+
+test('мало здоровья — золотое яблоко и сытым', () => {
+  const registry = require('prismarine-registry')(VERSION);
+  const bot = { registry, inventory: { slots: [] }, food: 20, health: 6 };
+  bot.inventory.slots[36] = { name: 'bread', count: 10 };
+  bot.inventory.slots[37] = { name: 'golden_apple', count: 1 };
+  assert.equal(needsFood(bot), true);
+  assert.equal(pickFood(bot), 'golden_apple');
+  bot.health = 18;
+  assert.equal(needsFood(bot), false);
+});
+
+test('слова: «золото ада», «адское золото», «золото в аду» — золото Незера; «золото» — обычное', () => {
+  const { oreOf } = require(path.join(__dirname, '..', 'src', 'bot', 'commands.js'));
+  assert.equal(oreOf('золото ада'), 'nether_gold');
+  assert.equal(oreOf('адское золото'), 'nether_gold');
+  assert.equal(oreOf('золото в аду'), 'nether_gold');
+  assert.equal(oreOf('незерское золото'), 'nether_gold');
+  assert.equal(oreOf('золото'), 'gold');
+});

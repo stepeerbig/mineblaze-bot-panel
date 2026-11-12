@@ -40,26 +40,32 @@ const IN_GAME = (b) => b.state === 'online' || b.state === 'connected';
 const waitText = (ms) => (ms < 60 * 1000 ? `${Math.max(1, Math.round(ms / 1000))} с` : `${Math.round(ms / 60000)} мин`);
 
 class Fleet extends EventEmitter {
-  constructor({ fork, initPayload, config, timings, clientTimings, captchaService } = {}) {
-    super(); // <--- ОБЯЗАТЕЛЬНО ПЕРВОЙ СТРОКОЙ!
-    
-    this._fork = fork; 
+  /**
+   * @param {object}   opts
+   * @param {Function} opts.fork          (index) => процесс ботов (как у BotClient)
+   * @param {Function} opts.initPayload   () => { authCacheDir, journalDir } — общие настройки fleet добавит сам
+   * @param {object}   opts.config        живой объект настроек панели (botsPerProcess, startInterval, proxyPool, …)
+   * @param {object}   [opts.timings]     { startGapMs, broadcastGap } — подмена задержек (для тестов)
+   * @param {object}   [opts.clientTimings] задержки BotClient (для тестов)
+   */
+  constructor({ fork, initPayload, config, timings, clientTimings } = {}) {
+    super();
+    this._fork = fork;
     this._initPayload = initPayload || (() => ({}));
     this.config = config;
     this.timings = { ...DEFAULT_TIMINGS, ...timings };
     this._clientTimings = clientTimings;
-    
-    this.captchaService = captchaService; // <--- НАШ СЕРВИС КАПЧИ
-    
-    this.bots = new Map(); 
-    this.order = []; 
-    this.workers = []; 
-    this.queue = []; 
-    this._turn = null; 
-    this._captcha = new Map(); 
+    this.bots = new Map(); // номер → { bot, nick, username, password, worker, state, proxy }
+    this.order = []; // номера ботов в порядке списка
+    this.workers = []; // { client, ready, bots: Set, resume: [] }
+    this.queue = []; // кто ждёт входа (номера), по порядку
+    this._turn = null; // идущая очередь «по очереди» (см. runInTurn)
+    this._captcha = new Map(); // номер бота → { since, url }: ждёт проверку «я не робот»
     this._lastAdmitAt = -Infinity;
-    this._ipBlockUntil = 0; 
-    this._batch = null; 
+    this._ipBlockUntil = 0; // до какого времени сервер не пускает с нашего IP (кик «IP адрес заблокирован»)
+    this._batch = null; // последний «Старт»: кого запустили — чтобы, когда все войдут (или нет), сказать итог
+    // Повисшие входы подряд: streak; сервер перестал пускать — holdMs > 0: очередь ждёт до holdUntil, потом пускает
+    // одного (probe) и ждёт, чем кончится его вход.
     this._hung = { streak: 0, holdMs: 0, holdUntil: 0, probe: null };
     this._queueTimer = null;
     this._summaryPending = false;
@@ -68,7 +74,10 @@ class Fleet extends EventEmitter {
 
   // ---------- список ботов ----------
 
-   /** Боты из настроек: [{ username, password }]. Новые — в процессы, где есть место; убранные — остановить. */
+  /**
+   * Боты из настроек: [{ username, password }]. Новые — в процессы, где есть место (и прокси из пула proxyPool —
+   * по botsPerProxy на каждый); убранные — остановить.
+   */
   setAccounts(accounts) {
     const next = new Map();
     for (const a of accounts || []) next.set(String(a.username).toLowerCase(), a);
@@ -85,21 +94,19 @@ class Fleet extends EventEmitter {
       }
     }
 
-    // === ЛОГИКА РОТАЦИИ ПРОКСИ ===
-    const rawProxies = String(this.config.proxyPool || '').split('\n').map(l => l.trim()).filter(Boolean);
-    const proxies = rawProxies.map(url => {
+    // Прокси из пула (socks5://user:pass@host:port по строке, только в config.json на ПК): новым ботам — по очереди,
+    // по botsPerProxy на каждый.
+    const proxies = String(this.config.proxyPool || '').split('\n').map((l) => l.trim()).filter(Boolean).map((url) => {
       try {
         const u = new URL(url);
         return { host: u.hostname, port: parseInt(u.port, 10) || 1080, username: u.username, password: u.password };
-      } catch (e) { 
-        return null; 
+      } catch (_) {
+        return null;
       }
     }).filter(Boolean);
     const maxPerProxy = parseInt(this.config.botsPerProxy, 10) || 15;
-    
     let proxyIndex = 0;
     let proxyCount = 0;
-    // =============================
 
     for (const [id, a] of next) {
       const b = this.bots.get(id);
@@ -112,48 +119,16 @@ class Fleet extends EventEmitter {
       this.workers[worker].bots.add(id);
       touched.add(worker);
 
-      // === ВЫДАЧА ПРОКСИ ===
       let proxy = null;
-      if (proxies.length > 0) {
+      if (proxies.length) {
         if (proxyCount >= maxPerProxy) {
           proxyIndex = (proxyIndex + 1) % proxies.length;
           proxyCount = 0;
         }
         proxy = proxies[proxyIndex];
-        proxyCount++;
+        proxyCount += 1;
       }
-      // =====================
-
-      this.bots.set(id, { 
-        bot: id, 
-        nick: a.username, 
-        username: a.username, 
-        password: a.password || '', 
-        worker, 
-        state: 'offline',
-        proxy: proxy // Сохраняем прокси за ботом
-      });
-    }
-    
-    this.order = [...next.keys()];
-    for (const index of touched) {
-      const w = this.workers[index];
-      if (w && w.client && w.client.child) this._syncWorker(index).catch((err) => this._log('error', `Процесс ботов №${index + 1}: ${errText(err)}`));
-    }
-    this.emit('list', this.list());
-    this._summary();
-  
-    for (const [id, a] of next) {
-      const b = this.bots.get(id);
-      if (b) {
-        if (b.username !== a.username || b.password !== (a.password || '')) touched.add(b.worker);
-        Object.assign(b, { nick: a.username, username: a.username, password: a.password || '' });
-        continue;
-      }
-      const worker = this._pickWorker();
-      this.workers[worker].bots.add(id);
-      touched.add(worker);
-      this.bots.set(id, { bot: id, nick: a.username, username: a.username, password: a.password || '', worker, state: 'offline' });
+      this.bots.set(id, { bot: id, nick: a.username, username: a.username, password: a.password || '', worker, state: 'offline', proxy });
     }
     this.order = [...next.keys()];
     for (const index of touched) {
@@ -579,18 +554,16 @@ class Fleet extends EventEmitter {
   _syncWorker(index) {
     const w = this.workers[index];
     const list = [...w.bots].map((id) => this.bots.get(id)).filter(Boolean)
-      .map((b) => ({ bot: b.bot, username: b.username, password: b.password,  proxy: b.proxy }));
+      .map((b) => ({ bot: b.bot, username: b.username, password: b.password, proxy: b.proxy }));
     return w.client.request('bots', { list });
   }
 
-   _makeClient(index) {
+  _makeClient(index) {
     const client = new BotClient({
-      // ВОТ ЭТИ ТРИ СТРОКИ БЫЛИ УДАЛЕНЫ ИЗ-ЗА КОММЕНТАРИЯ // ...
       fork: () => this._fork(index),
       initPayload: () => ({ ...this._initPayload(), config: this._sharedConfig() }),
       timings: this._clientTimings,
     });
-
     client.on('log', (e) => {
       if (e && e.bot) {
         const b = this.bots.get(e.bot);
@@ -614,6 +587,7 @@ class Fleet extends EventEmitter {
       b.ping = Number.isFinite(p.ping) ? p.ping : null;
       this.emit('ping', { bot: b.bot, nick: b.nick, ping: b.ping });
     });
+    client.on('fishing', (p) => this._emitBot('fishing', p)); // #рыбалка: ход и улов — вкладке «Авто фиш»
     client.on('want-connect', (p) => this._enqueue(p && p.bot));
     client.on('viewer-mode', (mode) => this.emit('viewer-mode', mode));
     client.on('viewer-xray', (settings) => this.emit('viewer-xray', settings));
@@ -621,13 +595,9 @@ class Fleet extends EventEmitter {
     client.on('crash', ({ code, restarting }) => this._onCrash(index, code, restarting));
     client.on('restarted', () => this._onRestarted(index));
 
-    // === ОТКЛЮЧЕНО АВТОПРОХОЖДЕНИЕ (РУЧНОЙ РЕЖИМ) ===
-    client.on('solve-captcha', async (p) => {
-      // Ничего не делаем, капчу обрабатываем вручную
-    });
-
     return client;
   }
+
   /** Бот ждёт проверку «я не робот»: новых в очередь входа не пускаем, пока её не пройдут (не дольше captchaHoldMs). */
   _onCaptcha(c) {
     const b = c && this.bots.get(c.bot);
