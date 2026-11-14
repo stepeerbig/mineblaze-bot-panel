@@ -19,7 +19,7 @@ function makeFleet({ perProcess = 3, gapMs = 30, autoReconnect = false, timings 
     fork: () => mem.fork(),
     initPayload: () => ({ authCacheDir: '/a', journalDir: '/j' }),
     config,
-    timings: { startGapMs: gapMs, broadcastGap: 5, ...timings },
+    timings: { startGapMs: gapMs, broadcastGap: 5, captchaBurst: 0, ...timings },
     clientTimings: { restartDelay: 10, requestTimeout: 2000, shutdownTimeout: 200 },
   });
   const events = [];
@@ -410,6 +410,12 @@ test('флот: события ботов — с ником; убранный и
   managerOf('Farm01').emit('fishing', { state: 'fishing', text: 'поймал: треска', caught: 3, items: [{ name: 'cod', label: 'треска', count: 3 }] });
   assert.ok(await waitFor(() => fished.length === 1));
   assert.deepEqual({ ...fished[0], items: fished[0].items.length }, { bot: 'farm01', nick: 'Farm01', state: 'fishing', text: 'поймал: треска', caught: 3, items: 1 });
+  // Баланс с табло — туда же.
+  const balances = [];
+  fleet.on('balance', (p) => balances.push(p));
+  managerOf('Farm01').emit('balance', { value: 837700, safe: 837650, text: '$837.7k' });
+  assert.ok(await waitFor(() => balances.length === 1));
+  assert.deepEqual(balances[0], { bot: 'farm01', nick: 'Farm01', value: 837700, safe: 837650, text: '$837.7k' });
   managerOf('Farm01').stop();
   assert.ok(await waitFor(() => fleet.get('Farm01').state === 'offline'));
   assert.equal(fleet.get('Farm01').ping, null);
@@ -418,5 +424,107 @@ test('флот: события ботов — с ником; убранный и
   assert.ok(await waitFor(() => gone.calls.includes('shutdown')));
   assert.deepEqual(fleet.list().map((b) => b.nick), ['Farm01']);
   assert.ok(events.some(([n, p]) => n === 'list' && p.length === 1));
+  await fleet.shutdown();
+});
+
+// ---------- прокси из пула: у каждого бота свой (botsPerProxy), лишние — не на чужой ----------
+
+const POOL = ['socks5://u1:p1@10.0.0.1:1081', '# socks5://old:old@10.9.9.9:1080', 'socks5://u2:p2@10.0.0.2:1082', 'socks5://u3:p3@10.0.0.3:1083'].join(String.fromCharCode(10));
+const proxyOf = (fleet, nick) => {
+  const b = fleet.get(nick);
+  return b && b.proxy ? b.proxy.host : null;
+};
+
+test('прокси: по одному на бота — у каждого свой; не хватило — бот не запускается, в консоли кто и что делать', async () => {
+  const { fleet, config, events } = makeFleet({ perProcess: 3, gapMs: 20 });
+  Object.assign(config, { proxyPool: POOL, botsPerProxy: 1 });
+  fleet.setAccounts(accounts(5));
+  assert.deepEqual(accounts(5).map((a) => proxyOf(fleet, a.username)), ['10.0.0.1', '10.0.0.2', '10.0.0.3', null, null]);
+  assert.equal(await fleet.start(), 3, 'запущены только те, кому хватило прокси');
+  assert.ok(events.some(([n, p]) => n === 'log' && /^Не запускаю 2 ботов: прокси на всех не хватает — в пуле 3, по 1 боту на прокси/.test(p.text) && /Farm04, Farm05/.test(p.text)));
+  assert.ok(await waitFor(() => fleet.summary().online === 3));
+  assert.equal(fleet.get('Farm04').state, 'offline');
+  await fleet.shutdown();
+});
+
+test('прокси: список дополнили — новые боты не садятся на занятые прокси; убрали бота — его прокси достаётся ждущему', async () => {
+  const { fleet, config } = makeFleet({ perProcess: 3 });
+  Object.assign(config, { proxyPool: POOL, botsPerProxy: 1 });
+  fleet.setAccounts(accounts(2));
+  assert.deepEqual([proxyOf(fleet, 'Farm01'), proxyOf(fleet, 'Farm02')], ['10.0.0.1', '10.0.0.2']);
+  // Раньше счёт шёл заново с первого прокси: Farm03 сел бы на прокси Farm01.
+  fleet.setAccounts(accounts(4));
+  assert.deepEqual(accounts(4).map((a) => proxyOf(fleet, a.username)), ['10.0.0.1', '10.0.0.2', '10.0.0.3', null]);
+  assert.equal(fleet.get('Farm04').noProxy, true);
+  fleet.setAccounts(accounts(4).filter((a) => a.username !== 'Farm02'));
+  assert.equal(proxyOf(fleet, 'Farm04'), '10.0.0.2', 'освободившийся прокси — тому, кому не хватило');
+  assert.equal(fleet.get('Farm04').noProxy, false);
+  await fleet.shutdown();
+});
+
+test('прокси: по 2 на прокси — сначала всем по одному (наименее занятый), больше двух ни на одном', async () => {
+  const { fleet, config } = makeFleet({ perProcess: 4 });
+  Object.assign(config, { proxyPool: POOL, botsPerProxy: 2 });
+  fleet.setAccounts(accounts(7));
+  const hosts = accounts(7).map((a) => proxyOf(fleet, a.username));
+  assert.deepEqual(hosts, ['10.0.0.1', '10.0.0.2', '10.0.0.3', '10.0.0.1', '10.0.0.2', '10.0.0.3', null]);
+  await fleet.shutdown();
+});
+
+test('флот: лимит проверок «я не робот» — после N проверок подряд очередь входа ждёт (MineBlaze: «превысили лимит»)', async () => {
+  const { fleet, managerOf, events } = makeFleet({
+    perProcess: 3, gapMs: 20, timings: { captchaHoldMs: 5000, captchaBurst: 2, captchaWindowMs: 700 },
+  });
+  fleet.setAccounts(accounts(3));
+  await fleet.start();
+  assert.ok(await waitFor(() => fleet.get('Farm01').state === 'online'));
+  const first = Date.now();
+  managerOf('Farm01').emit('captcha', { time: 1, url: 'https://mineblaze.net/antibot/?id=1' });
+  await flush(20);
+  managerOf('Farm01').emit('captcha-done', { time: 2 });
+  // Одна проверка из двух — следующий входит сразу.
+  assert.ok(await waitFor(() => fleet.get('Farm02').state === 'online', 400), 'вторая проверка ещё в лимите');
+  managerOf('Farm02').emit('captcha', { time: 3, url: 'https://mineblaze.net/antibot/?id=2' });
+  await flush(20);
+  managerOf('Farm02').emit('captcha-done', { time: 4 });
+  assert.ok(await waitFor(() => events.some(([n, p]) => n === 'log' && /^Проверок «я не робот» подряд: 2 — больше MineBlaze сразу не даёт/.test(p.text))));
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(fleet.get('Farm03').state, 'queued', 'две проверки подряд — третий ждёт');
+  assert.ok(await waitFor(() => fleet.get('Farm03').state === 'online', 3000));
+  assert.ok(Date.now() - first >= 650, `третий вошёл через ${Date.now() - first} мс после первой проверки`);
+  await fleet.shutdown();
+});
+
+test('только через прокси: прокси не заданы — боты не запускаются вовсе (с IP компьютера не входят)', async () => {
+  const { fleet, config, events, mem } = makeFleet({ perProcess: 3 });
+  config.proxyOnly = true;
+  fleet.setAccounts(accounts(3));
+  assert.equal(await fleet.start(), 0);
+  assert.ok(events.some(([n, p]) => n === 'log' && /^Не запускаю ботов \(3\): прокси не заданы, а включено «Только через прокси»/.test(p.text)));
+  assert.equal(mem.children.length, 0, 'процессы ботов даже не запускались');
+  // С пулом — входят только те, у кого есть прокси.
+  config.proxyPool = POOL;
+  config.botsPerProxy = 1;
+  fleet.setAccounts([...accounts(3), { username: 'Extra1' }]);
+  // Боты, созданные без пула, получили прокси, как только он появился; четвёртому не хватило.
+  assert.deepEqual(accounts(3).map((a) => proxyOf(fleet, a.username)), ['10.0.0.1', '10.0.0.2', '10.0.0.3']);
+  assert.ok(fleet.get('Extra1').noProxy);
+  await fleet.shutdown();
+});
+
+test('прокси: боту не хватило, потом освободился — в уже запущенном процессе бот входит через выданный прокси, а не с IP компьютера', async () => {
+  const { fleet, config, managerOf } = makeFleet({ perProcess: 4, gapMs: 10 });
+  Object.assign(config, { proxyPool: POOL, botsPerProxy: 1 });
+  fleet.setAccounts(accounts(4));
+  assert.equal(await fleet.start(), 3); // процесс запущен, Farm04 в нём есть, но без прокси
+  assert.ok(await waitFor(() => fleet.summary().online === 3));
+  assert.equal(managerOf('Farm04').proxy, null);
+  assert.equal(fleet.list().find((b) => b.nick === 'Farm04').proxy, 'нет');
+  await fleet.stop([fleet.get('Farm02').bot]);
+  fleet.setAccounts(accounts(4).filter((a) => a.username !== 'Farm02'));
+  assert.ok(await waitFor(() => managerOf('Farm04').proxy && managerOf('Farm04').proxy.host === '10.0.0.2'), 'бот узнал выданный прокси');
+  assert.equal(fleet.list().find((b) => b.nick === 'Farm04').proxy, '10.0.0.2:1082');
+  assert.equal(await fleet.start([fleet.get('Farm04').bot]), 1);
+  assert.ok(await waitFor(() => fleet.get('Farm04').state === 'online'));
   await fleet.shutdown();
 });

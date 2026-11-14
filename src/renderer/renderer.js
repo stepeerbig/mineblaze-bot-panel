@@ -26,6 +26,9 @@ const el = {
   accounts: $('accounts'),
   accountsLabel: $('accountsLabel'),
   startInterval: $('startInterval'),
+  captchaBurst: $('captchaBurst'),
+  captchaWindow: $('captchaWindow'),
+  proxyOnly: $('proxyOnly'),
   viewDistance: $('viewDistance'),
   botsPerProcess: $('botsPerProcess'),
   autologinTag: $('autologinTag'),
@@ -36,6 +39,7 @@ const el = {
   guardOn: $('guardOn'),
   godOn: $('godOn'),
   liveBg: $('liveBg'),
+  captchaExternal: $('captchaExternal'),
   groupInfo: $('groupInfo'),
   groupCount: $('groupCount'),
   groupClear: $('groupClear'),
@@ -116,6 +120,12 @@ const el = {
   fishStatus: $('fishStatus'),
   fishList: $('fishList'),
   fishClear: $('fishClear'),
+  payTo: $('payTo'),
+  payEvery: $('payEvery'),
+  payTag: $('payTag'),
+  payStatus: $('payStatus'),
+  payList: $('payList'),
+  payNow: $('payNow'),
 };
 
 const STATE_TITLES = {
@@ -132,7 +142,7 @@ const MAX_LINES = 1000;
 const MAX_HISTORY = 50;
 // Сервер, версию и способ входа не меняем, пока боты работают: их переподключения ушли бы уже по-новому.
 const CONNECTION_FIELDS = [el.host, el.port, el.version, el.auth];
-const LIST_FIELDS = [el.startInterval, el.viewDistance, el.botsPerProcess];
+const LIST_FIELDS = [el.startInterval, el.captchaBurst, el.captchaWindow, el.viewDistance, el.botsPerProcess];
 
 const bots = new Map(); // номер → { bot, nick, state, chip, dot }
 let selected = null; // чей чат показан и кому уходит сообщение
@@ -191,7 +201,7 @@ function makeLink(url) {
   a.href = url;
   a.target = '_blank'; // главный процесс откроет её в браузере, не в панели
   a.rel = 'noopener noreferrer';
-  a.title = 'Открыть в браузере';
+  a.title = 'Открыть (проверку «я не робот» — через прокси её бота)';
   a.textContent = url;
   return a;
 }
@@ -310,7 +320,9 @@ const stateTitle = (state) => STATE_TITLES[state] || state || '';
 const inGame = (b) => b.state === 'online' || b.state === 'connected';
 // Пинг бота, как его считает сервер (то же число, что у игроков в Tab); не в сети — не показываем.
 const pingOf = (b) => (inGame(b) && Number.isFinite(b.ping) ? b.ping : null);
-const chipTitle = (b) => `${b.nick} — ${stateTitle(b.state)}${pingOf(b) === null ? '' : `, пинг ${pingOf(b)} мс (так его считает сервер)`}`;
+// Прокси бота: «адрес:порт» (у каждого бота свой, см. fleet.setAccounts), «нет» — свободного не хватило, не запустится.
+const proxyText = (b) => (b.proxy === 'нет' ? 'нет свободного прокси — не запустится' : b.proxy ? `прокси ${b.proxy}` : '');
+const chipTitle = (b) => `${b.nick} — ${stateTitle(b.state)}${pingOf(b) === null ? '' : `, пинг ${pingOf(b)} мс (так его считает сервер)`}${proxyText(b) ? `, ${proxyText(b)}` : ''}`;
 
 function showPing(b) {
   const ping = pingOf(b);
@@ -339,7 +351,7 @@ function renderList(list, sel) {
     const pingEl = document.createElement('span');
     pingEl.className = 'ping';
     chip.append(dot, name, pingEl);
-    const b = { bot: item.bot, nick: item.nick, state: item.state, ping: item.ping, chip, dot, pingEl };
+    const b = { bot: item.bot, nick: item.nick, state: item.state, ping: item.ping, proxy: item.proxy || null, chip, dot, pingEl };
     showPing(b);
     bots.set(item.bot, b);
     chips.push(chip);
@@ -453,7 +465,7 @@ function updatePing({ bot, ping }) {
 function updateSelectedUi() {
   const b = bots.get(selected);
   const ping = b ? pingOf(b) : null;
-  el.chatWho.textContent = b ? `${b.nick} · ${stateTitle(b.state)}${ping === null ? '' : ` · пинг ${ping} мс`}` : '— выбери бота в списке';
+  el.chatWho.textContent = b ? `${b.nick} · ${stateTitle(b.state)}${ping === null ? '' : ` · пинг ${ping} мс`}${proxyText(b) ? ` · ${proxyText(b)}` : ''}` : '— выбери бота в списке';
   const members = groupIds().map((id) => bots.get(id));
   if (members.length) {
     el.botStart.disabled = !members.some((m) => m.state === 'offline');
@@ -558,6 +570,9 @@ function fillForm(cfg) {
   // Поля, которые человек сейчас правит, не трогаем (иначе прыгнет курсор).
   if (document.activeElement !== el.accounts) el.accounts.value = cfg.accounts || '';
   el.startInterval.value = cfg.startInterval;
+  el.captchaBurst.value = cfg.captchaBurst;
+  el.captchaWindow.value = cfg.captchaWindow;
+  el.proxyOnly.checked = cfg.proxyOnly !== false;
   el.viewDistance.value = cfg.viewDistance;
   el.botsPerProcess.value = cfg.botsPerProcess;
   el.loginPassword.value = cfg.loginPassword || '';
@@ -565,6 +580,7 @@ function fillForm(cfg) {
   el.guardOn.checked = cfg.guard !== false;
   el.godOn.checked = cfg.godMode !== false;
   el.liveBg.checked = cfg.liveBackground !== false;
+  el.captchaExternal.checked = cfg.captchaExternal === true;
   applyLiveBackground();
   if (document.activeElement !== el.whitelist) el.whitelist.value = cfg.whitelist || '';
   for (const key of ['aiKey', 'aiModel', 'aiBaseUrl', 'ollamaModel', 'ollamaUrl']) {
@@ -576,6 +592,8 @@ function fillForm(cfg) {
     if (document.activeElement !== el[key]) el[key].value = cfg[key] === undefined || cfg[key] === null ? '' : cfg[key];
   }
   if (document.activeElement !== el.fishHome) el.fishHome.value = cfg.questStorage || ''; // «Авто фиш» — тот же дом склада
+  if (document.activeElement !== el.payTo) el.payTo.value = cfg.payTo || '';
+  if (document.activeElement !== el.payEvery) el.payEvery.value = cfg.payEvery === undefined || cfg.payEvery === null ? '' : cfg.payEvery;
   updateQuestSetupTag();
   setAutoReconnectUi(cfg.autoReconnect);
   updateLabels();
@@ -802,6 +820,8 @@ function readForm() {
     auth: el.auth.value,
     accounts: el.accounts.value,
     startInterval: el.startInterval.value,
+    captchaBurst: el.captchaBurst.value,
+    captchaWindow: el.captchaWindow.value,
     viewDistance: el.viewDistance.value,
     botsPerProcess: el.botsPerProcess.value,
   };
@@ -935,6 +955,9 @@ el.godOn.addEventListener('change', () => {
   updateGuardTag();
   bridge.saveConfig({ godMode: el.godOn.checked });
 });
+
+el.captchaExternal.addEventListener('change', () => bridge.saveConfig({ captchaExternal: el.captchaExternal.checked }));
+el.proxyOnly.addEventListener('change', () => bridge.saveConfig({ proxyOnly: el.proxyOnly.checked }));
 
 // Живой фон «Вороны» (background.js): галочка «Живой фон» в «Вид».
 function applyLiveBackground() {
@@ -1141,7 +1164,12 @@ function fishRow(r) {
   }
   const parts = [];
   if (r.items && r.items.length) parts.push(r.items.map((i) => `${i.label} ×${i.count}`).join(', '));
-  if (r.rods !== null && r.active) parts.push(`удочек: ${r.rods}`);
+  if (r.rods !== null && r.active) {
+    const left = r.rodLeft === null ? '' : ` (в руке — ${r.rodLeft}${r.rodMax ? ` из ${r.rodMax}` : ''} прочности)`;
+    parts.push(`целых удочек: ${r.rods}${left}`);
+  }
+  if (r.balance) parts.push(`баланс ${r.balance}`);
+  if (r.job && r.active) parts.push(r.job);
   if (parts.length) {
     const note = document.createElement('div');
     note.className = 'task-note';
@@ -1172,6 +1200,43 @@ function renderFish(s) {
   } else if (!el.fishStatus.dataset.keep) {
     el.fishStatus.textContent = '';
   }
+  renderBalances(s);
+}
+
+/** $837.7k — как на табло MineBlaze. */
+function fmtMoney(v) {
+  if (!Number.isFinite(v)) return '—';
+  if (v >= 1e6) return `$${(v / 1e6).toFixed(1)}M`;
+  if (v >= 1e3) return `$${(v / 1e3).toFixed(1)}k`;
+  return `$${Math.floor(v)}`;
+}
+
+/** Балансы ботов с табло: сумма и по каждому (у кого видно). */
+function renderBalances(s) {
+  const list = Array.isArray(s.balances) ? s.balances : [];
+  el.payList.replaceChildren(...list.slice(0, 80).map((b) => {
+    const span = document.createElement('span');
+    const nick = document.createElement('b');
+    nick.textContent = b.nick;
+    span.append(nick, ` ${b.text}`);
+    return span;
+  }));
+  el.payTag.textContent = list.length ? fmtMoney(s.balanceTotal) : '';
+  el.payTag.hidden = !list.length;
+  if (!el.payStatus.dataset.keep) {
+    el.payStatus.textContent = list.length ? `На балансах ботов: ${fmtMoney(s.balanceTotal)} (видно у ${list.length})` : '';
+    el.payStatus.className = 'ai-status';
+  }
+}
+
+function showPayNote(text, kind) {
+  el.payStatus.textContent = text;
+  el.payStatus.className = `ai-status ${kind || ''}`;
+  el.payStatus.dataset.keep = '1';
+  setTimeout(() => {
+    delete el.payStatus.dataset.keep;
+    renderBalances(fishState);
+  }, 6000);
 }
 
 function showFishNote(text, kind) {
@@ -1201,6 +1266,19 @@ el.fishStop.addEventListener('click', async () => {
   else renderFish(fishState);
 });
 el.fishClear.addEventListener('click', async () => renderFish(await bridge.fishClear()));
+el.payNow.addEventListener('click', async () => {
+  el.payNow.disabled = true;
+  try {
+    const r = await bridge.fishPay(el.fishTarget.value, groupIds(), el.payTo.value.trim());
+    if (r && r.ok) showPayNote(r.targets > 1 ? `Перевод денег на ${el.payTo.value.trim()}: ботов ${r.targets} — итог каждого в консоли` : `Перевод денег на ${el.payTo.value.trim()} — итог в консоли`, 'ok');
+    else showPayNote(`Не переведено: ${(r && r.error) || 'ошибка'}`, 'warn');
+  } finally {
+    el.payNow.disabled = false;
+  }
+});
+for (const field of [el.payTo, el.payEvery]) {
+  field.addEventListener('change', async () => fillForm(await bridge.saveConfig({ payTo: el.payTo.value, payEvery: el.payEvery.value })));
+}
 // Дом склада — тот же, что у автопилота: сохраняется сразу, поле автопилота обновится само.
 el.fishHome.addEventListener('change', async () => fillForm(await bridge.saveConfig({ questStorage: el.fishHome.value })));
 bridge.onFish(renderFish);
@@ -1324,3 +1402,130 @@ bridge.init().then(({ config, bots: list, summary: s, selected: sel, chat, ai, q
   renderTasks(tasks);
   renderFish(fish);
 });
+
+// ---------- проверка «я не робот» внутри панели ----------
+// Сервер прислал ссылку — справа вместо консоли и чата появляется проверка: вкладки ботов, сама страница (её рисует
+// встроенный Chromium отдельным слоем ровно поверх captchaSlot — только когда загрузилась), а пока грузится, если не
+// открылась и когда пройдена — карточки окна панели. Пройдена или закрыта — консоль и чат возвращаются.
+
+const captchaEl = {
+  main: document.querySelector('.main'),
+  box: $('captchaBox'),
+  count: $('captchaCount'),
+  sub: $('captchaSub'),
+  tabs: $('captchaTabs'),
+  slot: $('captchaSlot'),
+  loading: $('captchaLoading'),
+  loadingText: $('captchaLoadingText'),
+  error: $('captchaError'),
+  errorTitle: $('captchaErrorTitle'),
+  errorText: $('captchaErrorText'),
+  retry: $('captchaRetry'),
+  passed: $('captchaPassed'),
+  passedText: $('captchaPassedText'),
+  foot: $('captchaFoot'),
+  reload: $('captchaReload'),
+  close: $('captchaClose'),
+};
+let captchaNow = { active: null, items: [] };
+let captchaTimer = null;
+
+const proxyHost = (p) => (p ? String(p).replace(/:\d+$/, '') : '');
+
+/** Строка из кусков: текст и <b>выделенное</b> (без innerHTML — ники и адреса приходят извне). */
+function richText(target, parts) {
+  target.replaceChildren(...parts.map((p) => {
+    if (typeof p === 'string') return document.createTextNode(p);
+    const b = document.createElement('b');
+    b.textContent = p.b;
+    return b;
+  }));
+}
+
+function sendCaptchaBounds() {
+  if (captchaEl.box.hidden) return bridge.captchaBounds(null);
+  const r = captchaEl.slot.getBoundingClientRect();
+  // 1 px рамки места — оставляем видимой
+  return bridge.captchaBounds({ x: r.left + 1, y: r.top + 1, width: r.width - 2, height: r.height - 2 });
+}
+
+const waitedText = (since) => {
+  const sec = Math.max(0, Math.round((Date.now() - (since || Date.now())) / 1000));
+  return sec < 60 ? `${sec} с` : `${Math.floor(sec / 60)} мин ${sec % 60} с`;
+};
+
+/** Подзаголовок: что сейчас с выбранной проверкой (и сколько бот уже ждёт). */
+function captchaSubline(cur) {
+  if (!cur) return;
+  if (cur.status === 'loading') richText(captchaEl.sub, ['Загружаю страницу для ', { b: cur.nick }, '…']);
+  else if (cur.status === 'ready') richText(captchaEl.sub, ['Пройди проверку на странице — ', { b: cur.nick }, ` войдёт сам · ждёт ${waitedText(cur.since)}`]);
+  else if (cur.status === 'failed') richText(captchaEl.sub, [{ b: cur.nick }, ': страница не открылась']);
+  else if (cur.status === 'passed') richText(captchaEl.sub, [{ b: cur.nick }, ' прошёл проверку — входит в игру']);
+}
+
+function makeCaptchaTab(c, active) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = `captcha-tab${c.bot === active ? ' is-on' : ''}`;
+  b.dataset.status = c.status;
+  b.setAttribute('role', 'tab');
+  b.setAttribute('aria-selected', String(c.bot === active));
+  b.title = { loading: 'Страница грузится', ready: 'Ждёт тебя: пройди проверку', failed: 'Страница не открылась', passed: 'Прошёл' }[c.status] || '';
+  const dot = document.createElement('i');
+  dot.className = 'captcha-dot';
+  const nick = document.createElement('span');
+  nick.textContent = c.nick;
+  b.append(dot, nick);
+  if (c.proxy) {
+    const via = document.createElement('span');
+    via.className = 'via';
+    via.textContent = proxyHost(c.proxy);
+    b.append(via);
+  }
+  b.addEventListener('click', () => bridge.captchaControl('show', c.bot).then(renderCaptcha));
+  return b;
+}
+
+function renderCaptcha(state) {
+  captchaNow = state && Array.isArray(state.items) ? state : { active: null, items: [] };
+  const { items } = captchaNow;
+  const on = items.length > 0;
+  captchaEl.box.hidden = !on;
+  captchaEl.main.classList.toggle('has-captcha', on);
+  clearInterval(captchaTimer);
+  captchaTimer = null;
+  if (!on) {
+    sendCaptchaBounds();
+    return;
+  }
+  const cur = items.find((c) => c.bot === captchaNow.active) || items[items.length - 1];
+  const waiting = items.filter((c) => c.status !== 'passed').length;
+  captchaEl.count.hidden = waiting < 2;
+  captchaEl.count.textContent = `ждут ${waiting}`;
+  captchaEl.tabs.replaceChildren(...items.map((c) => makeCaptchaTab(c, cur.bot)));
+
+  captchaEl.loading.hidden = cur.status !== 'loading';
+  captchaEl.error.hidden = cur.status !== 'failed';
+  captchaEl.passed.hidden = cur.status !== 'passed';
+  richText(captchaEl.loadingText, cur.proxy ? ['через прокси бота ', { b: cur.proxy }] : ['без прокси']);
+  if (cur.error) {
+    captchaEl.errorTitle.textContent = cur.error.title;
+    captchaEl.errorText.textContent = cur.error.text;
+  }
+  richText(captchaEl.passedText, [{ b: cur.nick }, ' входит в игру — страница сейчас закроется']);
+  captchaEl.reload.disabled = cur.status === 'passed';
+  richText(captchaEl.foot, cur.proxy
+    ? ['Сайт видит IP прокси бота ', { b: proxyHost(cur.proxy) }, ', а не твой. Окно приватное: без учётных записей, cookie не сохраняются']
+    : ['Окно приватное: без учётных записей, cookie не сохраняются']);
+  captchaSubline(cur);
+  if (cur.status === 'ready') captchaTimer = setInterval(() => captchaSubline(cur), 1000);
+  sendCaptchaBounds();
+}
+
+new ResizeObserver(() => sendCaptchaBounds()).observe(captchaEl.slot);
+window.addEventListener('resize', sendCaptchaBounds);
+captchaEl.reload.addEventListener('click', () => bridge.captchaControl('reload', captchaNow.active).then(renderCaptcha));
+captchaEl.retry.addEventListener('click', () => bridge.captchaControl('reload', captchaNow.active).then(renderCaptcha));
+captchaEl.close.addEventListener('click', () => bridge.captchaControl('close', captchaNow.active).then(renderCaptcha));
+bridge.onCaptcha(renderCaptcha);
+bridge.captchaState().then(renderCaptcha);

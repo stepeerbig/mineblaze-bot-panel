@@ -61,6 +61,8 @@ class Fleet extends EventEmitter {
     this.queue = []; // кто ждёт входа (номера), по порядку
     this._turn = null; // идущая очередь «по очереди» (см. runInTurn)
     this._captcha = new Map(); // номер бота → { since, url }: ждёт проверку «я не робот»
+    this._checks = []; // когда приходили ссылки проверки «я не робот» (для лимита captchaBurst за captchaWindow)
+    this._burstNoted = 0; // о какой проверке уже сказали «очередь ждёт» (чтобы не повторять)
     this._lastAdmitAt = -Infinity;
     this._ipBlockUntil = 0; // до какого времени сервер не пускает с нашего IP (кик «IP адрес заблокирован»)
     this._batch = null; // последний «Старт»: кого запустили — чтобы, когда все войдут (или нет), сказать итог
@@ -94,8 +96,12 @@ class Fleet extends EventEmitter {
       }
     }
 
-    // Прокси из пула (socks5://user:pass@host:port по строке, только в config.json на ПК): новым ботам — по очереди,
-    // по botsPerProxy на каждый.
+    // Прокси из пула (socks5://user:pass@host:port по строке, только в config.json на ПК; «#» в начале — пропуск).
+    // Новому боту — наименее занятый прокси, и не больше botsPerProxy ботов на один. Занятые считаем по всем ботам
+    // списка: раньше счёт шёл заново с первого прокси при каждом изменении списка (новые садились на занятые), а
+    // боты сверх пула шли по кругу на чужие прокси (13.11: 41 бот на 30 прокси «по одному» — у 11 был чужой).
+    // Прокси на всех не хватило — бот остаётся без прокси и не запускается (см. start): не на чужой прокси и не с IP
+    // компьютера.
     const proxies = String(this.config.proxyPool || '').split('\n').map((l) => l.trim()).filter(Boolean).map((url) => {
       try {
         const u = new URL(url);
@@ -105,30 +111,49 @@ class Fleet extends EventEmitter {
       }
     }).filter(Boolean);
     const maxPerProxy = parseInt(this.config.botsPerProxy, 10) || 15;
-    let proxyIndex = 0;
-    let proxyCount = 0;
+    const proxyKey = (p) => `${p.host}:${p.port}:${p.username}`;
+    const load = new Map(proxies.map((p) => [proxyKey(p), 0]));
+    for (const b of this.bots.values()) {
+      const k = b.proxy ? proxyKey(b.proxy) : null;
+      if (k && load.has(k)) load.set(k, load.get(k) + 1);
+    }
+    this._proxyPool = { count: load.size, perProxy: maxPerProxy };
+    const takeProxy = () => {
+      let best = null;
+      for (const p of proxies) {
+        const n = load.get(proxyKey(p));
+        if (n < maxPerProxy && (best === null || n < load.get(proxyKey(best)))) best = p;
+      }
+      if (best) load.set(proxyKey(best), load.get(proxyKey(best)) + 1);
+      return best;
+    };
 
     for (const [id, a] of next) {
       const b = this.bots.get(id);
       if (b) {
         if (b.username !== a.username || b.password !== (a.password || '')) touched.add(b.worker);
         Object.assign(b, { nick: a.username, username: a.username, password: a.password || '' });
+        // Без прокси (не хватило или пула ещё не было), а теперь есть свободный — отдать; нет — пометить.
+        if (!b.proxy && proxies.length && !RUNNING(b.state)) {
+          const proxy = takeProxy();
+          if (proxy) {
+            Object.assign(b, { proxy, noProxy: false });
+            touched.add(b.worker);
+          } else {
+            b.noProxy = true;
+          }
+        }
         continue;
       }
       const worker = this._pickWorker();
       this.workers[worker].bots.add(id);
       touched.add(worker);
 
-      let proxy = null;
-      if (proxies.length) {
-        if (proxyCount >= maxPerProxy) {
-          proxyIndex = (proxyIndex + 1) % proxies.length;
-          proxyCount = 0;
-        }
-        proxy = proxies[proxyIndex];
-        proxyCount += 1;
-      }
-      this.bots.set(id, { bot: id, nick: a.username, username: a.username, password: a.password || '', worker, state: 'offline', proxy });
+      const proxy = proxies.length ? takeProxy() : null;
+      this.bots.set(id, {
+        bot: id, nick: a.username, username: a.username, password: a.password || '', worker, state: 'offline',
+        proxy, noProxy: proxies.length > 0 && !proxy,
+      });
     }
     this.order = [...next.keys()];
     for (const index of touched) {
@@ -139,11 +164,12 @@ class Fleet extends EventEmitter {
     this._summary();
   }
 
-  /** Боты по порядку: [{ bot, nick, state, worker, ping }]. */
+  /** Боты по порядку: [{ bot, nick, state, worker, ping, proxy }]; proxy — «адрес:порт», «нет» (не хватило) или null. */
   list() {
     return this.order.map((id) => {
       const b = this.bots.get(id);
-      return { bot: id, nick: b.nick, state: b.state, worker: b.worker, ping: b.ping === undefined ? null : b.ping };
+      const proxy = b.proxy ? `${b.proxy.host}:${b.proxy.port}` : b.noProxy ? 'нет' : null; // без логина и пароля
+      return { bot: id, nick: b.nick, state: b.state, worker: b.worker, ping: b.ping === undefined ? null : b.ping, proxy };
     });
   }
 
@@ -166,7 +192,28 @@ class Fleet extends EventEmitter {
 
   /** Запустить ботов (по номерам; без них — всех). Входить они будут по очереди. Возвращает, скольких. */
   async start(ids = null) {
-    const list = this._pick(ids).filter((b) => !RUNNING(b.state));
+    const picked = this._pick(ids).filter((b) => !RUNNING(b.state));
+    // Пул прокси задан, а свободного прокси боту не нашлось (setAccounts) — не запускаем: иначе он пошёл бы с IP
+    // компьютера. Одной строкой — кто и что сделать.
+    const proxyOnly = this.config.proxyOnly === true;
+    const noPool = proxyOnly && !(this._proxyPool && this._proxyPool.count);
+    if (noPool && picked.length) {
+      for (const b of picked) b.lastProblem = 'нет прокси';
+      this._log('error', `Не запускаю ботов (${picked.length}): прокси не заданы, а включено «Только через прокси» — с IP ` +
+        'компьютера боты не входят. Пул прокси — proxyPool в %APPDATA%\\MineBlazeBotPanel\\config.json');
+      return 0;
+    }
+    const noProxy = picked.filter((b) => b.noProxy || (proxyOnly && !b.proxy));
+    const list = picked.filter((b) => !noProxy.includes(b));
+    if (noProxy.length) {
+      const pool = this._proxyPool || { count: 0, perProxy: 1 };
+      for (const b of noProxy) b.lastProblem = 'нет свободного прокси';
+      const names = noProxy.slice(0, 8).map((b) => b.nick).join(', ');
+      const more = noProxy.length > 8 ? ` и ещё ${noProxy.length - 8}` : '';
+      this._log('warn', `Не запускаю ${noProxy.length} ${noProxy.length === 1 ? 'бота' : 'ботов'}: прокси на всех не хватает — ` +
+        `в пуле ${pool.count}, по ${pool.perProxy} ${pool.perProxy === 1 ? 'боту' : 'ботов'} на прокси, и все заняты. ` +
+        `Без прокси: ${names}${more}. Добавь прокси в пул (proxyPool в config.json) или разреши больше ботов на прокси (botsPerProxy)`);
+    }
     const failed = new Set();
     await Promise.all([...new Set(list.map((b) => b.worker))].map((index) => this._ensureWorker(index).catch((err) => {
       failed.add(index);
@@ -577,7 +624,7 @@ class Fleet extends EventEmitter {
     client.on('link', (l) => this._emitBot('link', l));
     client.on('ready', (p) => this._onReady(p && p.bot));
     client.on('captcha', (c) => this._onCaptcha(c));
-    client.on('captcha-done', (c) => this._onCaptchaDone(c && c.bot));
+    client.on('captcha-done', (c) => this._onCaptchaDone(c && c.bot, Boolean(c && c.passed)));
     client.on('ip-block', (p) => this._onIpBlock(p));
     client.on('login-hung', (p) => this._onLoginHung(p));
     client.on('msa', (d) => this._emitBot('msa', d));
@@ -588,6 +635,7 @@ class Fleet extends EventEmitter {
       this.emit('ping', { bot: b.bot, nick: b.nick, ping: b.ping });
     });
     client.on('fishing', (p) => this._emitBot('fishing', p)); // #рыбалка: ход и улов — вкладке «Авто фиш»
+    client.on('balance', (p) => this._emitBot('balance', p)); // баланс бота с табло — туда же
     client.on('want-connect', (p) => this._enqueue(p && p.bot));
     client.on('viewer-mode', (mode) => this.emit('viewer-mode', mode));
     client.on('viewer-xray', (settings) => this.emit('viewer-xray', settings));
@@ -603,6 +651,7 @@ class Fleet extends EventEmitter {
     const b = c && this.bots.get(c.bot);
     if (!b) return;
     this._captcha.set(b.bot, { since: Date.now(), url: c.url });
+    this._checks.push(Date.now());
     this._emitBot('captcha', c);
     if (this.queue.length) {
       this._log('warn', `Очередь входа ждёт: ${b.nick} проходит проверку «я не робот» — открой его ссылку в консоли и нажми «Да» ` +
@@ -610,9 +659,10 @@ class Fleet extends EventEmitter {
     }
   }
 
-  _onCaptchaDone(id) {
+  _onCaptchaDone(id, passed = false) {
     if (!id || !this._captcha.delete(id)) return;
-    this._emitBot('captcha-done', { bot: id });
+    this._emitBot('captcha-done', { bot: id, passed });
+    this._noteBurst();
     clearTimeout(this._queueTimer); // ждали проверку — пустить следующего, как только можно
     this._queueTimer = null;
     this._pump();
@@ -640,7 +690,44 @@ class Fleet extends EventEmitter {
   _holdLeft() {
     const ip = this._ipBlockUntil ? this._ipBlockUntil + this.timings.ipBlockExtraMs - Date.now() : 0;
     const hung = this._hung.holdMs && !this._hung.probe ? this._hung.holdUntil - Date.now() : 0;
-    return Math.max(this._captchaHoldLeft(), ip, hung, 0);
+    return Math.max(this._captchaHoldLeft(), this._burstHoldLeft(), ip, hung, 0);
+  }
+
+  /**
+   * Лимит проверок «я не робот»: не больше captchaBurst за captchaWindow минут (настройки). 13.11, MineBlaze: страница
+   * проверки снимает «отпечаток» браузера (FingerprintJS — один на все окна этого компьютера, прокси на него не
+   * влияет) и после 4 проверок подряд пишет «Вы превысили лимит прохождения проверки, подождите чуть-чуть» — и с
+   * разных прокси, и с паузой в минуту. Значит: 4 проверки — и очередь входа ждёт.
+   */
+  _burstLimit() {
+    const burst = this.timings.captchaBurst !== undefined ? this.timings.captchaBurst : parseInt(this.config.captchaBurst, 10);
+    const windowMs = this.timings.captchaWindowMs !== undefined
+      ? this.timings.captchaWindowMs
+      : (Number(this.config.captchaWindow) > 0 ? Number(this.config.captchaWindow) : 10) * 60 * 1000;
+    return { burst: Number.isFinite(burst) && burst > 0 ? burst : 0, windowMs };
+  }
+
+  /** Сколько ещё ждать, пока в окне captchaWindow станет меньше captchaBurst проверок (0 — можно). */
+  _burstHoldLeft() {
+    const { burst, windowMs } = this._burstLimit();
+    if (!burst) return 0;
+    const now = Date.now();
+    this._checks = this._checks.filter((t) => now - t < windowMs);
+    if (this._checks.length < burst) return 0;
+    return this._checks[this._checks.length - burst] + windowMs - now;
+  }
+
+  /** Проверок уже столько, сколько MineBlaze даёт подряд, — сказать один раз, до какого времени очередь ждёт. */
+  _noteBurst() {
+    const left = this._burstHoldLeft();
+    const last = this._checks[this._checks.length - 1] || 0;
+    if (left <= 0 || !this.queue.length || this._burstNoted === last) return;
+    this._burstNoted = last;
+    const { burst } = this._burstLimit();
+    const at = new Date(Date.now() + left);
+    const hhmm = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`;
+    this._log('warn', `Проверок «я не робот» подряд: ${burst} — больше MineBlaze сразу не даёт («превысили лимит прохождения ` +
+      `проверки»). Очередь входа ждёт до ${hhmm} (${waitText(left)}); боты в сети остаются в игре`);
   }
 
   /** Вход повис (BotManager, 'login-hung'). Несколько подряд — сервер перестал пускать: очередь ждёт и пробует одного. */

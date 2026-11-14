@@ -75,11 +75,17 @@ async function moveStacks(bot, window, from, to, test, want = Infinity) {
       continue; // этому предмету места нет — другому, может, есть
     }
     const name = item.name;
-    const before = countIn(window, to, (x) => x.name === name);
+    // Сколько перенеслось — по своему инвентарю: его меняет только сам бот. В общем сундуке в тот же миг другой бот
+    // может взять или положить такое же (стенд 12.11: бот положил удочку, сосед взял — счёт сундука не изменился,
+    // и перенос засчитался как «не вышло»).
+    const mineFrom = from[0] === window.inventoryStart && to[0] !== window.inventoryStart;
+    const side = mineFrom ? from : to;
+    const count = () => countIn(window, side, (x) => x.name === name);
+    const before = count();
     // Пустую ячейку не щёлкаем: стопку, пока бот тянулся, забрал другой (это видно по ячейкам от сервера).
     const gone = () => !window.slots[slot] || window.slots[slot].name !== name;
     const r = await bot.actions.clickSlot(slot, { mode: 1, unless: gone });
-    const n = countIn(window, to, (x) => x.name === name) - before;
+    const n = mineFrom ? before - count() : count() - before;
     if (n <= 0) {
       if ((r && r.skipped) || gone()) {
         lost += 1;

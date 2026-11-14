@@ -10,6 +10,7 @@ const { createActionsPlugin } = require('./bot/actions');
 const { windowClicksPlugin } = require('./bot/window-clicks');
 const { Guard, GodKeeper, worldNameOf } = require('./bot/guard');
 const { runCommand } = require('./bot/commands');
+const { attachSidebar } = require('./bot/sidebar');
 
 // Что бот делает как обычный клиент, а не как mineflayer (см. src/bot/). Выключать нужно только для сравнения
 // на тестовом стенде: physics — своя физика (ровные тики, движение по правилам клиента), tickEnd — пакет
@@ -54,6 +55,53 @@ function registerCommand(template, word) {
 }
 
 const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
+
+const decodeCred = (s) => {
+  try {
+    return decodeURIComponent(s || '');
+  } catch (_) {
+    return s || '';
+  }
+};
+
+/**
+ * Подключение к серверу игры через SOCKS5-прокси бота { host, port, username, password } (логин и пароль — как в
+ * ссылке пула, %-кодированные). Как обычное подключение minecraft-protocol: адрес на стандартном порту без IP —
+ * сначала запись SRV (_minecraft._tcp.адрес), куда она укажет; нет её — сам адрес. → функция для options.connect.
+ */
+function proxyConnect(proxy, host, port) {
+  return (client) => {
+    const go = (toHost, toPort) => {
+      const { SocksClient } = require('socks');
+      SocksClient.createConnection({
+        proxy: {
+          host: proxy.host,
+          port: Number(proxy.port) || 1080,
+          type: 5,
+          ...(proxy.username ? { userId: decodeCred(proxy.username), password: decodeCred(proxy.password) } : {}),
+        },
+        command: 'connect',
+        destination: { host: toHost, port: toPort },
+        timeout: 20000,
+      }).then(({ socket }) => {
+        client.setSocket(socket);
+        client.emit('connect');
+      }).catch((err) => {
+        err.message = `прокси ${proxy.host}:${proxy.port}: ${err.message}`;
+        client.emit('error', err);
+      });
+    };
+    const p = Number(port) || 25565;
+    if (p !== 25565 || require('net').isIP(String(host))) {
+      go(host, p);
+      return;
+    }
+    require('dns').resolveSrv(`_minecraft._tcp.${host}`, (err, records) => {
+      if (!err && records && records.length) go(records[0].name, records[0].port);
+      else go(host, p);
+    });
+  };
+}
 
 /** Сколько байтов пришло по сокету клиента (null — не узнать). */
 function socketBytes(client) {
@@ -193,7 +241,7 @@ function ipBlockMinutes(text) {
  *   'link'  { time, url, source }   сервер прислал ссылку для человека (например, проверка «я не робот»)
  *   'ready' { time }                 готов к делам: вошёл, автовход и команды после входа прошли (раз за сессию)
  *   'captcha' { time, url }          сервер ждёт проверку «я не робот» (её проходит человек по ссылке)
- *   'captcha-done' { time }          проверку прошли (или бот её больше не ждёт: отключился)
+ *   'captcha-done' { time, passed }  проверку прошли (passed) или бот её больше не ждёт (отключился)
  *   'ping'  мс | null   пинг бота, как его считает сервер (он же — в Tab у игроков); null — бот не в сети
  *   'ip-block' { time, until, minutes }  кик «IP адрес заблокирован»: до until входить бессмысленно (IP общий)
  *   'login-hung' { time, stage, bytes }  вход повис (сервер принял подключение и не пускает дальше)
@@ -256,6 +304,7 @@ class BotManager extends EventEmitter {
       this.log('warn', 'Бот уже запущен');
       return false;
     }
+    if (this._proxyMissing()) return false;
     this.wantRun = true;
     this.attempt = 0;
     this.loginRetries = 0;
@@ -469,7 +518,22 @@ class BotManager extends EventEmitter {
     if (s.silenceTimer && typeof s.silenceTimer.unref === 'function') s.silenceTimer.unref();
   }
 
+  /**
+   * «Только через прокси» (proxyOnly): прокси у бота нет — не подключаться вовсе, ни с IP компьютера, ни повтором.
+   * Проверяется перед каждым подключением (старт, очередь, переподключение). true — прокси нет, входить нельзя.
+   */
+  _proxyMissing() {
+    if (this.config.proxyOnly !== true || (this.proxy && this.proxy.host)) return false;
+    this.log('error', 'Нет прокси — с IP компьютера не вхожу (включено «Только через прокси»). Прокси ботам — пул proxyPool в config.json');
+    return true;
+  }
+
   _connect() {
+    if (this._proxyMissing()) {
+      this.wantRun = false;
+      this._setState('offline');
+      return;
+    }
     const cfg = { ...this.config };
     this._setState('connecting');
     this.log('info', `Подключение к ${cfg.host}:${cfg.port} как ${cfg.username} (версия ${cfg.version || 'авто'})…`);
@@ -534,10 +598,13 @@ class BotManager extends EventEmitter {
         ...this._compatOptions(),
       };
       if (this.proxy && this.proxy.host) {
+        // Само подключение к игре — через прокси (options.connect: minecraft-protocol отдаёт сокет нам). options.agent
+        // minecraft-protocol берёт только для HTTP-запросов входа (Microsoft), а не для игры: до 13.11 боты с ним
+        // писали «Использую прокси», а заходили напрямую, с IP компьютера.
         const { SocksProxyAgent } = require('socks-proxy-agent');
         const auth = this.proxy.username ? `${this.proxy.username}:${this.proxy.password}@` : '';
-        const proxyUrl = `socks5://${auth}${this.proxy.host}:${this.proxy.port}`;
-        options.agent = new SocksProxyAgent(proxyUrl);
+        options.agent = new SocksProxyAgent(`socks5://${auth}${this.proxy.host}:${this.proxy.port}`);
+        options.connect = proxyConnect(this.proxy, cfg.host, cfg.port);
         this.log('info', `Использую прокси: ${this.proxy.host}:${this.proxy.port}`);
       }
       if (cfg.auth === 'microsoft') {
@@ -593,6 +660,11 @@ class BotManager extends EventEmitter {
     // Рыбалка (#рыбалка) сообщает, что делает и сколько поймала, — для вкладки «Авто фиш» в панели.
     bot.on('fishing', (p) => {
       if (alive()) this.emit('fishing', p);
+    });
+    // Табло справа (src/bot/sidebar.js): баланс бота — во вкладку «Авто фиш» (переводы /pay берут сумму отсюда).
+    attachSidebar(bot);
+    bot.on('balance', (b) => {
+      if (alive()) this.emit('balance', b);
     });
     // Команды серверу из команд боту (#квесты принести пишет /home и /warp ah): та же очередь, что у чата панели,
     // и охрана с режимом бога видят их так же.
@@ -771,7 +843,7 @@ class BotManager extends EventEmitter {
           s.captchaDone.add(s.captcha);
           s.captcha = null;
           this.log('ok', 'Проверка «я не робот» пройдена');
-          this.emit('captcha-done', { time: Date.now() });
+          this.emit('captcha-done', { time: Date.now(), passed: true });
         }
         this._onAuthMessage(s, shown);
         const forced = forcedMoveReason(shown);
@@ -1252,7 +1324,7 @@ class BotManager extends EventEmitter {
     this._setPing(null);
     if (s.captcha) {
       s.captcha = null; // проверку «я не робот» бот уже не ждёт — очередь входа не держим
-      this.emit('captcha-done', { time: Date.now() });
+      this.emit('captcha-done', { time: Date.now(), passed: false });
     }
 
     const manual = !this.wantRun;

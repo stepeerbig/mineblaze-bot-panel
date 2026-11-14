@@ -41,3 +41,24 @@ test('«Авто фиш»: отправили команду — сразу «к
   assert.equal(board.list().rows.length, 0, 'убранных из списка ботов — нет и здесь');
   assert.ok(updates >= 8);
 });
+
+test('«Авто фиш»: балансы ботов с табло — у рыбаков в строке, всех — в сводке с суммой; тот же баланс — без обновления окна', () => {
+  const board = new FishBoard();
+  let updates = 0;
+  board.on('update', () => {
+    updates += 1;
+  });
+  board.started('a', 'Alpha');
+  board.setBalance({ bot: 'a', nick: 'Alpha', value: 837700, safe: 837650, text: '$837.7k' });
+  board.setBalance({ bot: 'b', nick: 'Beta', value: 1500, safe: 1450, text: '$1.5k' }); // не рыбачит — только в сводке
+  const before = updates;
+  board.setBalance({ bot: 'b', nick: 'Beta', value: 1500, safe: 1450, text: '$1.5k' });
+  assert.equal(updates, before, 'тот же баланс — окно не дёргаем');
+  board.setBalance({ bot: 'c', value: NaN, text: '?' }); // не число — не баланс
+  const l = board.list();
+  assert.equal(l.rows[0].balance, '$837.7k');
+  assert.deepEqual(l.balances.map((b) => [b.nick, b.text]), [['Alpha', '$837.7k'], ['Beta', '$1.5k']]);
+  assert.equal(l.balanceTotal, 839200);
+  board.retain(['a']);
+  assert.deepEqual(board.list().balances.map((b) => b.nick), ['Alpha'], 'убранный из списка бот — и из балансов');
+});

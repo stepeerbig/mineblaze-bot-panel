@@ -1,7 +1,7 @@
 {
   "name": "mineblaze-bot-panel",
   "productName": "MineBlaze Bot Panel",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Панель управления Minecraft-ботом на mineflayer",
   "main": "src/main.js",
   "author": "MineBlaze",
@@ -14,10 +14,14 @@
     "stand:check": "node test-server/check.js"
   },
   "dependencies": {
+    "cloakbrowser": "^0.7.2",
     "express": "^4.22.3",
     "mineflayer": "^4.37.1",
+    "mmdb-lib": "^3.0.5",
+    "playwright-core": "^1.64.1",
     "prismarine-viewer": "1.33.0",
     "socket.io": "^4.8.4",
+    "socks": "^2.8.10",
     "socks-proxy-agent": "^10.1.0"
   },
   "devDependencies": {

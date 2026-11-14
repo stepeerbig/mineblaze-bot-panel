@@ -212,6 +212,7 @@
             <option value="microsoft">Microsoft (лицензия)</option>
           </select>
         </label>
+        <label class="check" title="Обычно проверка открывается прямо в панели, во встроенном браузере. С галочкой — в браузере, который выбран в Windows по умолчанию: отдельным приватным окном, со своим профилем на каждого бота и через тот же прокси"><input id="captchaExternal" type="checkbox"><span>Проверку «я не робот» — в отдельном браузере, а не в панели</span></label>
       </div>
 
       <details id="botsGroup" class="group fold" open>
@@ -231,6 +232,15 @@
         <label class="field" title="Больше — меньше памяти, но тики ботов могут опаздывать (античит это не любит)">Ботов в одном процессе
           <input id="botsPerProcess" type="number" min="1" max="20" step="1">
         </label>
+        <div class="row">
+          <label class="field" title="MineBlaze считает проверки «я не робот» с этого компьютера (по отпечатку браузера — прокси на него не влияют) и после 4 подряд пишет «Вы превысили лимит прохождения проверки». Столько проверок — и очередь входа ждёт. 0 — не ограничивать">Проверок подряд
+            <input id="captchaBurst" type="number" min="0" max="20" step="1">
+          </label>
+          <label class="field" title="Сколько минут очередь входа ждёт после стольких проверок подряд (считая от первой из них). Увидел «превысили лимит» — поставь больше">Потом ждать, мин
+            <input id="captchaWindow" type="number" min="1" max="120" step="1">
+          </label>
+        </div>
+        <label class="check" title="Бот без прокси не входит вовсе — ни при старте, ни переподключением; ссылку проверки панель открывает только через прокси бота. Без галочки бот без прокси пошёл бы напрямую, с IP компьютера"><input id="proxyOnly" type="checkbox" checked><span>Только через прокси — с IP компьютера боты не входят</span></label>
       </details>
 
       <details id="autologin" class="group fold">
@@ -284,8 +294,24 @@
           <p id="fishStatus" class="ai-status" role="status"></p>
           <div id="fishList" class="fish-list"></div>
           <button id="fishClear" class="link fish-clear" type="button" hidden>Убрать остановленных</button>
-          <p class="hint">Бот пишет <b>/home</b> на дом склада, берёт из сундуков у дома (до 12 блоков от точки дома) <b>3 удочки</b> и ищет ближайшую воду (до 24 блоков). Встаёт на берег и закидывает так, чтобы поплавок упал в воду. Клюнуло — подсекает и закидывает снова, пока не нажмёшь <b>Стоп</b> или не напишешь боту <b>#стоп</b>.</p>
-          <p class="hint">Удочка сломалась — берёт следующую, кончились — новые со склада. Инвентарь забился — складывает улов в сундуки склада. Каждый бот встаёт на своё место у воды — на бота нужно 2 блока берега. Сам ест и отбивается от мобов.</p>
+          <p class="hint">Бот пишет <b>/home</b> на дом склада и устраивается на работу <b>Рыбак</b> в <b>/jobs</b> (за улов — деньги). Удочка своя; нет целой — берёт из сундуков у дома (до 12 блоков от точки дома) самую целую. Ищет ближайшую воду (до 24 блоков), встаёт на берег и закидывает так, чтобы поплавок упал в воду. Клюнуло — подсекает и закидывает снова, пока не нажмёшь <b>Стоп</b> или не напишешь боту <b>#стоп</b>.</p>
+          <p class="hint">Удочка износилась (осталось <b>3</b> прочности и меньше, у обычной — из 64) — кладёт её в сундук и берёт целую; целых нет нигде — ждёт и раз в 5 минут смотрит сундуки. Поплавок лёг на берег — бот убирает его, не вытаскивая (вытаскивать — износ). Инвентарь забился — складывает улов в сундуки склада. Каждый бот встаёт на своё место у воды — на бота нужно 2 блока берега. Сам ест и отбивается от мобов.</p>
+        </div>
+
+        <div class="group">
+          <div class="group-title">Деньги ботов <span id="payTag" class="tag" hidden></span></div>
+          <div class="row">
+            <label class="field" title="Ник игрока, которому боты переводят деньги: /pay ник сумма">Ник для денег
+              <input id="payTo" type="text" autocomplete="off" spellcheck="false" placeholder="BARABYLKAyt">
+            </label>
+            <label class="field" title="Пока рыбачат, боты сами переводят весь баланс на этот ник раз в столько минут (если на балансе от 100$). 0 — только кнопкой">Переводить сами раз в, мин
+              <input id="payEvery" type="number" min="0" max="240" step="1">
+            </label>
+          </div>
+          <p id="payStatus" class="ai-status" role="status"></p>
+          <div id="payList" class="pay-list"></div>
+          <button id="payNow" class="btn ai-get" type="button" title="Каждому боту (кому — как у рыбалки выше): /pay ник весь баланс с табло">Перевести всё сейчас</button>
+          <p class="hint">Баланс бот берёт с табло справа («Баланс • $837.7k»). Там сумма округлена, поэтому бот переводит чуть меньше показанного: при балансе в тысячах у него остаётся до 100$. Кому переводят — тот же выбор «Кому», что у рыбалки.</p>
         </div>
       </div>
     </aside>
@@ -305,6 +331,53 @@
           </div>
         </header>
         <div id="botList" class="bot-list" role="listbox" aria-multiselectable="true" aria-label="Боты" title="Клик — выбрать бота; Ctrl+клик — добавить в группу или убрать; Shift+клик — выбрать подряд; Ctrl+A — всех; Esc — снять группу" data-empty="Впиши ботов слева, в поле «Боты»: ник или ник:пароль, по одному в строке."></div>
+      </section>
+
+      <section id="captchaBox" class="pane captcha-box" hidden aria-labelledby="captchaTitle">
+        <header class="captcha-head">
+          <div class="captcha-title">
+            <svg class="captcha-shield" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.2 4.5 5v5.6c0 4.8 3.1 9.2 7.5 10.9 4.4-1.7 7.5-6.1 7.5-10.9V5L12 2.2zm-1.1 13.3-3.4-3.4 1.4-1.4 2 2 4.6-4.6 1.4 1.4-6 6z"/></svg>
+            <div class="captcha-titles">
+              <h2 id="captchaTitle">Проверка «я не робот» <span id="captchaCount" class="captcha-count" hidden></span></h2>
+              <p id="captchaSub" class="captcha-sub" role="status"></p>
+            </div>
+          </div>
+          <div class="captcha-actions">
+            <button id="captchaReload" class="ghost-btn" type="button" title="Открыть страницу проверки заново (F5)">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.6 6.2A6 6 0 1 0 14 8h-1.6a4.4 4.4 0 1 1-1.3-3.1L9.2 6.8H14V2l-1.7 1.7a5.9 5.9 0 0 1 1.3 2.5z"/></svg>
+              Обновить
+            </button>
+            <button id="captchaClose" class="ghost-btn" type="button" title="Убрать страницу этого бота — снова покажутся консоль и чат">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 2.4 8 6.9l4.5-4.5 1.1 1.1L9.1 8l4.5 4.5-1.1 1.1L8 9.1l-4.5 4.5-1.1-1.1L6.9 8 2.4 3.5z"/></svg>
+              Закрыть
+            </button>
+          </div>
+        </header>
+        <div id="captchaTabs" class="captcha-tabs" role="tablist" aria-label="Чья проверка"></div>
+        <div class="captcha-stage">
+          <!-- Сюда панель кладёт саму страницу (встроенный Chromium, отдельный слой ровно поверх этого места) -->
+          <div id="captchaSlot" class="captcha-slot"></div>
+          <div id="captchaLoading" class="captcha-card" hidden>
+            <div class="captcha-spinner" aria-hidden="true"></div>
+            <div class="captcha-card-title">Открываю страницу проверки…</div>
+            <div id="captchaLoadingText" class="captcha-card-text"></div>
+          </div>
+          <div id="captchaError" class="captcha-card is-error" hidden>
+            <div class="captcha-badge" aria-hidden="true">!</div>
+            <div id="captchaErrorTitle" class="captcha-card-title"></div>
+            <div id="captchaErrorText" class="captcha-card-text"></div>
+            <button id="captchaRetry" class="btn captcha-retry" type="button">Обновить</button>
+          </div>
+          <div id="captchaPassed" class="captcha-card is-ok" hidden>
+            <svg class="captcha-check" viewBox="0 0 52 52" aria-hidden="true"><circle cx="26" cy="26" r="24"/><path d="M15 27l7 7 15-16"/></svg>
+            <div class="captcha-card-title">Проверка пройдена</div>
+            <div id="captchaPassedText" class="captcha-card-text"></div>
+          </div>
+        </div>
+        <p class="captcha-foot">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5a3.5 3.5 0 0 0-3.5 3.5v2H4a1 1 0 0 0-1 1v5.5a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V8a1 1 0 0 0-1-1h-.5V5A3.5 3.5 0 0 0 8 1.5zm-2 3.5a2 2 0 1 1 4 0v2H6V5z"/></svg>
+          <span id="captchaFoot"></span>
+        </p>
       </section>
 
       <section class="pane">

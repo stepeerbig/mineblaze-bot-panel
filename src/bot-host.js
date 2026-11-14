@@ -73,7 +73,7 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
   }
 
   function addBot(id, account) {
-    const entry = { account: { username: account.username, password: account.password || '' }, config: {}, manager: null };
+    const entry = { account: { username: account.username, password: account.password || '', proxy: account.proxy || null }, config: {}, manager: null };
     refresh(entry);
     const manager = makeManager({
       config: entry.config,
@@ -96,6 +96,7 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
     manager.on('msa', (d) => emit('msa', { bot: id, ...d }));
     manager.on('ping', (ping) => emit('ping', { bot: id, ping }));
     manager.on('fishing', (p) => emit('fishing', { bot: id, ...p })); // вкладка «Авто фиш»: что делает, сколько поймал
+    manager.on('balance', (b) => emit('balance', { bot: id, ...b })); // баланс с табло — туда же
     // Экран показывает своего бота: тот появился в мире или пропал — экран узнаёт сразу.
     manager.on('bot', (bot) => {
       if (viewer && viewerBot === id) viewer.setBot(bot);
@@ -181,7 +182,9 @@ function createBotHost({ port, createManager, createViewer, exit = () => {} }) {
         if (!entry) {
           addBot(id, account);
         } else {
-          entry.account = { username: account.username, password: account.password || '', proxy: account.proxy };
+          entry.account = { username: account.username, password: account.password || '', proxy: account.proxy || null };
+          // Прокси боту могли выдать позже (fleet: освободился прокси) — иначе бот вошёл бы с IP компьютера.
+          if (entry.manager) entry.manager.proxy = account.proxy || null;
           refresh(entry);
         }
       }

@@ -1590,18 +1590,47 @@ function inject(bot, { random, now }) {
     if (!ok) throw new ActionError('не вытащить: правая кнопка что-нибудь откроет');
   }
 
+  /** Ячейка быстрой панели без удочки — ближайшая к текущей (или -1: удочки везде, или удочка во второй руке). */
+  function noRodSlot() {
+    const slots = bot.inventory && bot.inventory.slots ? bot.inventory.slots : [];
+    const isRod = (it) => Boolean(it && it.name === 'fishing_rod');
+    if (isRod(slots[45])) return -1; // с удочкой во второй руке сервер поплавок не уберёт
+    const cur = Number.isInteger(bot.quickBarSlot) ? bot.quickBarSlot : 0;
+    for (let d = 1; d <= 8; d += 1) {
+      for (const i of [cur + d, cur - d]) if (i >= 0 && i <= 8 && !isRod(slots[36 + i])) return i;
+    }
+    return -1;
+  }
+
+  /**
+   * Убрать свой поплавок, не вытаскивая: взять в руку не удочку (как игрок, который переключил ячейку) — сервер сам
+   * убирает поплавок, когда в руках нет удочки (FishingHook.shouldStopFishing), и прочность цела. Вытащить с берега
+   * стоит удочке 2 прочности, зацепленного игрока или моба — 5: рабочую ещё удочку на 4–5 прочности это бы сломало. Ячейки без
+   * удочки нет — вытащить как обычно.
+   */
+  async function dropBobber(signal) {
+    const to = noRodSlot();
+    if (to < 0) return reelIn(signal);
+    await inTick(() => bot.setQuickBarSlot(to), signal); // как нажатие цифры на клавиатуре
+    for (let i = 0; i < 20 && ownBobber !== null; i += 1) await inTick(() => {}, signal);
+    return undefined;
+  }
+
   /**
    * Порыбачить один заход: удочка в руку, взгляд yaw/pitch (куда упадёт поплавок, считает src/bot/fishing.js),
    * заброс — правая кнопка, как у клиента (use_item и взмах руки); ждать свой поплавок. Клюнуло (у поплавка
    * «biting» или всплеск рыбы у него) — через 3–7 тиков, как человек, правая кнопка ещё раз: подсечь; улов
-   * подлетает к боту сам — подождать, пока подберёт. Поплавок лёг на берег, зацепил кого-то или рыба не клюёт
-   * дольше maxWaitTicks — вытащить. Прервали (#стоп) — поплавок вытащить, как человек, который закончил.
+   * подлетает к боту сам — подождать, пока подберёт. Рыба не клюёт дольше maxWaitTicks — вытащить (в воде это
+   * прочности не стоит). Поплавок лёг на берег или зацепил кого-то — убрать сменой ячейки (dropBobber): вытаскивать
+   * такой — износ удочки. Прервали (#стоп) — поплавок из воды вытащить, как человек, который закончил.
    * → { outcome: 'caught' | 'ground' | 'hooked' | 'lost' | 'timeout' | 'no_bobber', collected, waitTicks, landed }
    */
-  function fish({ yaw, pitch, maxWaitTicks = 1800 } = {}) {
+  function fish({ yaw, pitch, maxWaitTicks = 1800, rod = null } = {}) {
     return run('рыбачить', async (signal) => {
       if (!bobberInfo) throw new ActionError('в этой версии игры нет удочки с поплавком');
-      await equipItem('fishing_rod', signal);
+      if (rod) await holdItem(rod, signal); // именно эта удочка (самая целая), а не первая попавшаяся
+      else await equipItem('fishing_rod', signal);
+      if (!bot.heldItem || bot.heldItem.name !== 'fishing_rod') throw new ActionError('удочка не взялась в руку');
       await standStill(signal);
       // Остался поплавок с прошлого раза — сначала вытащить (иначе правая кнопка его и вытащит, а не забросит).
       if (ownBobber !== null && bot.entities && bot.entities[ownBobber]) {
@@ -1664,7 +1693,7 @@ function inject(bot, { random, now }) {
           }
           const wait = ticks() - castTick;
           if (hooked) {
-            await reelIn(signal);
+            await dropBobber(signal); // вытащить зацепленного — 3–5 прочности
             out = false;
             return { outcome: 'hooked', collected, waitTicks: wait, landed };
           }
@@ -1683,7 +1712,7 @@ function inject(bot, { random, now }) {
           else still = 0;
           last = p.clone();
           if (still >= 20 && wait > 20) {
-            await reelIn(signal);
+            await dropBobber(signal); // вытащить с берега — 2 прочности
             out = false;
             return { outcome: 'ground', collected, waitTicks: wait, landed };
           }
@@ -1698,7 +1727,13 @@ function inject(bot, { random, now }) {
         // отбиться) уберёт удочку из руки — тогда поплавок пропадёт и сам.
         if (out && err && err.code === 'stopped') {
           inTick(() => {
-            if (ownBobber !== null && bot.heldItem && bot.heldItem.name === 'fishing_rod' && entries.size === 0) rodClick();
+            if (ownBobber === null || !bot.heldItem || bot.heldItem.name !== 'fishing_rod' || entries.size !== 0) return;
+            // Не в воде (на берегу, ещё летит) — сменой ячейки: вытаскивать с берега — 2 прочности.
+            const e = bot.entities ? bot.entities[ownBobber] : null;
+            const wet = Boolean(e && e.position && (isWaterCell(e.position) || isWaterCell(e.position.offset(0, -0.2, 0))));
+            const to = wet ? -1 : noRodSlot();
+            if (to >= 0) bot.setQuickBarSlot(to);
+            else rodClick();
           }).catch(() => {});
         }
         throw err;
@@ -1737,6 +1772,32 @@ function inject(bot, { random, now }) {
       await bot.equip(it, dest);
       await waitTicks(2 + Math.floor(random() * 3), signal);
       return { already: false };
+    });
+  }
+
+  /**
+   * Снять надетое (броню — head / torso / legs / feet) или убрать из второй руки ('off-hand') в инвентарь: переносом
+   * (shift-клик), стоя на месте, с паузами, как человек. Там пусто — ничего; в инвентаре нет свободной ячейки — ошибка
+   * 'full'; сервер не дал снять (проклятие несъёмности) — 'rejected'. → { already, item }
+   */
+  function takeOff(dest) {
+    return run('снять', async (signal) => {
+      const at = WEAR_SLOTS[dest];
+      if (at === undefined) throw new ActionError(`нечего снимать: ${dest}`);
+      const slots = bot.inventory ? bot.inventory.slots : [];
+      const it = slots[at];
+      if (!it) return { already: true, item: null };
+      let free = false;
+      for (let i = 9; i < 45 && !free; i += 1) free = !slots[i];
+      if (!free) throw new ActionError('в инвентаре нет свободной ячейки', 'full');
+      await standStill(signal);
+      await waitTicks(3 + Math.floor(random() * 4), signal);
+      await bot.unequip(dest);
+      // Ответ сервера: не дал снять — вернёт предмет на место (тогда он там и останется).
+      await waitTicks(3 + Math.floor(random() * 3), signal);
+      const now = bot.inventory.slots[at];
+      if (now && now.name === it.name) throw new ActionError(`${it.name} не снимается`, 'rejected');
+      return { already: false, item: it.name };
     });
   }
 
@@ -1892,6 +1953,26 @@ function inject(bot, { random, now }) {
     }, { keepWindow: true });
   }
 
+  /**
+   * Взять в руку именно этот предмет (из нескольких одинаковых — например, самую целую удочку): из быстрой панели —
+   * сменой ячейки, из инвентаря и второй руки — переносом, стоя на месте, с паузами, как человек.
+   */
+  async function holdItem(item, signal) {
+    const slots = bot.inventory ? bot.inventory.slots : [];
+    const at = slots.indexOf(item);
+    if (at < 0) throw new ActionError(`нет такого предмета: ${item && item.name}`);
+    if (bot.heldItem === item) return;
+    if (at >= 36 && at <= 44) {
+      await inTick(() => bot.setQuickBarSlot(at - 36), signal); // как нажатие цифры на клавиатуре
+      await waitTicks(2, signal);
+      return;
+    }
+    await standStill(signal);
+    await waitTicks(3 + Math.floor(random() * 4), signal);
+    await bot.equip(item, 'hand');
+    await waitTicks(2 + Math.floor(random() * 3), signal);
+  }
+
   /** Взять предмет в руку: из быстрой панели — сменой ячейки, из инвентаря — переносом, стоя на месте. */
   async function equipItem(name, signal) {
     const wanted = String(name).replace(/^minecraft:/, '');
@@ -1969,6 +2050,7 @@ function inject(bot, { random, now }) {
     },
     equipOffhand,
     equipTo,
+    takeOff,
     shield,
     interrupt: interruptActions,
     interact,

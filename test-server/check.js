@@ -13,6 +13,9 @@
 //                                                  процесс + процесс бота); --electron=<путь к exe> — через сборку
 //         npm run stand:check -- --electron --bots=24 — 24 бота сразу (StandBot1…24, входят по одному в секунду):
 //                                                  все ли вошли и простояли, память и процессор на бота
+//         npm run stand:check -- --electron --captcha 10 — проверка «я не робот»: бот заходит через прокси с паролем,
+//                                                  сервер шлёт ссылку — окно панели открывает её само через тот же прокси;
+//                                                  «Да» на странице → «прошли проверку» → окно закрывается
 //         npm run stand:check -- --clicks        — клики в меню: бот берёт из сундука предметы с названиями,
 //                                                  описаниями, зачарованиями… и кладёт обратно; сервер не должен
 //                                                  ничего поправлять (значит, «отпечатки» предметов как у игры);
@@ -51,7 +54,7 @@ const BOT_NAME = 'StandBot';
 const HELPER_NAME = 'Helper'; // второй игрок в сценарии — для команд по нику
 
 const ARGS = process.argv.slice(2);
-const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--no-clicks', '--scenario', '--clicks', '--fight', '--mine', '--survive', '--gear', '--nether', '--fish', '--electron']);
+const KNOWN_FLAGS = new Set(['--legacy', '--no-physics', '--no-tick-end', '--no-profile', '--no-clicks', '--scenario', '--clicks', '--fight', '--mine', '--survive', '--gear', '--nether', '--fish', '--electron', '--captcha']);
 const SCENARIO = ARGS.includes('--scenario');
 const CLICKS = ARGS.includes('--clicks');
 const FIGHT = ARGS.includes('--fight');
@@ -62,6 +65,7 @@ const NETHER = ARGS.includes('--nether');
 const FISH = ARGS.includes('--fish');
 const ANY_CHECK = SCENARIO || CLICKS || FIGHT || MINE || SURVIVE || GEAR || NETHER || FISH;
 const ELECTRON_ARG = ARGS.find((a) => a === '--electron' || a.startsWith('--electron='));
+const CAPTCHA = ARGS.includes('--captcha'); // с --electron: ссылка «я не робот» → окно панели через прокси бота
 const ELECTRON = Boolean(ELECTRON_ARG);
 const ELECTRON_EXE = ELECTRON_ARG && ELECTRON_ARG.includes('=') ? ELECTRON_ARG.slice(ELECTRON_ARG.indexOf('=') + 1).replace(/^"|"$/g, '') : '';
 const BOTS_ARG = ARGS.find((a) => a.startsWith('--bots='));
@@ -479,6 +483,12 @@ async function runNetherCheck(manager, cmd) {
   const bot = manager.getBot();
   if (!bot || !bot.actions) throw new Error('у бота нет безопасных действий (они работают только со своей физикой)');
   const N = (c) => `execute in minecraft:the_nether run ${c}`;
+  // Бот после прошлой проверки мог остаться в Незере — сначала в обычный мир (на поверхность у 0 0), как будто он дома.
+  if (/nether/.test(String(bot.game && bot.game.dimension))) {
+    cmd(`execute in minecraft:overworld run spreadplayers 0 0 0 2 false ${BOT_NAME}`);
+    for (let i = 0; i < 50 && /nether/.test(String(bot.game && bot.game.dimension)); i += 1) await wait(200);
+    await wait(2000);
+  }
   for (const c of [
     `op ${BOT_NAME}`,
     `clear ${BOT_NAME}`,
@@ -543,6 +553,8 @@ async function runGearCheck(manager, cmd) {
   const bot = manager.getBot();
   if (!bot || !bot.actions) throw new Error('у бота нет безопасных действий (они работают только со своей физикой)');
   const o = bot.entity.position.floored();
+  // Сундуки — в том мире, где бот (после проверки Незера он там и остаётся).
+  const dim = (bot.game && bot.game.dimension) || 'minecraft:overworld';
   const at = (dx, dy, dz) => `${o.x + dx} ${o.y + dy} ${o.z + dz}`;
   const item = (slot, id, count = 1, extra = '') => `{Slot:${slot}b,id:"minecraft:${id}",count:${count}${extra}}`;
   const ench = (list) => `,components:{"minecraft:enchantments":{${list}}}`;
@@ -561,8 +573,10 @@ async function runGearCheck(manager, cmd) {
       item(4, 'shield'),
       item(5, 'cooked_beef', 40),
     ].join(',')}]}`,
-  ]) cmd(c);
+  ]) cmd(`execute in ${dim} run ${c}`);
   await wait(2500);
+  const seen = [[2, 0, -2], [-2, 0, 3], [7, 0, 4]].map(([dx, dy, dz]) => (bot.blockAt(o.offset(dx, dy, dz)) || {}).name || '?');
+  console.log(`  [снаряжение] бот у ${o.x} ${o.y} ${o.z}, видит на местах сундуков: ${seen.join(', ')}`);
   const started = Date.now();
   const r = await runCommand(bot, '#снаряжение');
   const text = [].concat(r.message).join(' | ');
@@ -743,11 +757,13 @@ async function runFishCheck(host, port, version, cmd) {
   const nicks = Array.from({ length: BOTS }, (_, i) => `${BOT_NAME}${i + 1}`);
   const board = new FishBoard();
   const spots = new Map(); // ник → последнее место (из событий)
+  const states = new Map(); // ник → какие состояния были (за удочками ходил? ждал?)
+  const balances = new Map(); // ник → баланс с табло (событие «balance»)
   const kicks = [];
   const result = { online: false, onlineMs: 0, kick: null, problem: null, stats: null };
   const managers = nicks.map((nick) => new BotManager({
     config: {
-      ...DEFAULT_CONFIG, host, port, username: nick, version, auth: 'offline', autoReconnect: false,
+      ...DEFAULT_CONFIG, host, port, username: nick, version, auth: 'offline', autoReconnect: false, proxyOnly: false,
       loginPassword: '', joinCommands: '', godMode: false, guard: false, fleetNicks: nicks.join('\n'),
     },
     authCacheDir: path.join(os.tmpdir(), 'mineblaze-stand-auth'),
@@ -764,7 +780,10 @@ async function runFishCheck(host, port, version, cmd) {
     m.on('fishing', (p) => {
       board.update({ bot: nick.toLowerCase(), nick, ...p });
       if (p.spot) spots.set(nick, p.spot);
+      if (!states.has(nick)) states.set(nick, []);
+      states.get(nick).push(p.state);
     });
+    m.on('balance', (b) => balances.set(nick, b));
   });
   const onlineAt = Date.now();
   let journalFrom = 0;
@@ -783,7 +802,9 @@ async function runFishCheck(host, port, version, cmd) {
     // «Дом»: площадка 61×61 на y 149, пруд 13×13 глубиной 3 (вода — x 314…326, z 314…326), точка дома — к западу от
     // пруда, сундуки с удочками — рядом с ней. Небо открыто (рыба клюёт как обычно), мобов нет.
     const HOME = '308.5 150 320.5';
-    const rods = (n) => Array.from({ length: n }, (_, i) => `{Slot:${i}b,id:"minecraft:fishing_rod",count:1}`).join(',');
+    // Удочки в сундуках: новые и потёртые; изношенные (прочность 3 и меньше) бот брать не должен.
+    const rod = (slot, damage = 0) => `{Slot:${slot}b,id:"minecraft:fishing_rod",count:1${damage ? `,components:{"minecraft:damage":${damage}}` : ''}}`;
+    const rods = (n, from = 0, damage = 0) => Array.from({ length: n }, (_, i) => rod(from + i, damage)).join(',');
     for (const c of [
       'forceload add 288 288 352 352',
       'difficulty peaceful',
@@ -794,11 +815,23 @@ async function runFishCheck(host, port, version, cmd) {
       'fill 290 150 290 350 156 350 minecraft:air',
       'fill 313 145 313 327 149 327 minecraft:stone',
       'fill 314 147 314 326 149 326 minecraft:water',
-      `setblock 306 150 318 minecraft:chest{Items:[${rods(15)}]}`,
-      `setblock 306 150 322 minecraft:chest{Items:[${rods(15)}]}`,
+      `setblock 306 150 318 minecraft:chest{Items:[${[rods(4, 0, 63), rods(4, 4, 20), rods(8, 8)].join(',')}]}`,
+      `setblock 306 150 322 minecraft:chest{Items:[${rods(12)}]}`,
       'kill @e[type=minecraft:item]',
       'kill @e[type=minecraft:fishing_bobber]',
       ...nicks.flatMap((n) => [`clear ${n}`, `effect clear ${n}`, `gamemode survival ${n}`, `tp ${n} ${HOME}`]),
+      // StandBot1 — со своей новой удочкой (к сундукам не ходит), StandBot2 — с изношенной (1: в сундук, взять
+      // целую), StandBot3 — с удочкой на 5 (за два улова износится — заменит). Остальные — без удочки.
+      `give ${nicks[0]} minecraft:fishing_rod`,
+      ...(nicks[1] ? [`give ${nicks[1]} minecraft:fishing_rod[damage=63]`] : []),
+      ...(nicks[2] ? [`give ${nicks[2]} minecraft:fishing_rod[damage=59]`] : []),
+      // Табло справа, как на MineBlaze: строка «• Баланс • $837.7k» — подписью очка (1.20.3+). Слово — латиницей
+      // («Balance»): русские буквы через консоль сервера могут прийти не в той кодировке; бот понимает оба.
+      'scoreboard objectives remove mb',
+      'scoreboard objectives add mb dummy "MineBlaze"',
+      'scoreboard objectives setdisplay sidebar mb',
+      'scoreboard players set bal mb 4',
+      'scoreboard players display name bal mb "Balance: $837.7k"',
     ]) cmd(c);
     // Сервер строит площадку и грузит чанки (бывает, замирает на секунды): ждём, пока каждый бот окажется на доме
     // и увидит оба сундука и воду, — как после /home, когда чанки догрузились.
@@ -851,6 +884,25 @@ async function runFishCheck(host, port, version, cmd) {
       if (r.code !== 'stopped') problems.push(`${nick}: закончил не по #стоп (${r.code || 'ok'})`);
       if (!(r.data && r.data.caught > 0)) problems.push(`${nick}: ничего не поймал`);
     }
+    // Удочки: со своей целой — к сундукам не ходил; изношенные — в сундуке; у ботов изношенных не осталось.
+    const byNick = new Map(finished.map((x) => [x.nick, x.r]));
+    // Со своей целой — сразу рыбачить: к сундукам до первого заброса не ходить (потом — можно: выловил изношенную
+    // удочку «мусором» — её положено отнести в сундук).
+    const seen = states.get(nicks[0]) || [];
+    const firstFish = seen.indexOf('fishing');
+    if (firstFish < 0 || seen.slice(0, firstFish).includes('rods')) problems.push(`${nicks[0]}: со своей целой удочкой ходил к сундукам до первого заброса`);
+    if (nicks[1] && !((byNick.get(nicks[1]).data || {}).saved >= 1)) problems.push(`${nicks[1]}: изношенную удочку в сундук не положил`);
+    if (nicks[2] && !((byNick.get(nicks[2]).data || {}).saved >= 1)) problems.push(`${nicks[2]}: износившуюся за рыбалкой удочку не заменил`);
+    const { wornRods } = require('../src/bot/fishing');
+    for (const [i, m] of managers.entries()) {
+      const b = m.getBot();
+      const worn = b ? wornRods(b) : [];
+      if (worn.length) problems.push(`${nicks[i]}: у бота изношенная удочка (${worn.map((w) => w.left).join(', ')})`);
+    }
+    // Баланс с табло увидел каждый.
+    const noBalance = nicks.filter((n) => !balances.has(n) || balances.get(n).value !== 837700);
+    console.log(`  [рыбалка] баланс с табло: ${balances.size} из ${BOTS} (${[...new Set([...balances.values()].map((b) => `${b.text} → можно ${b.safe}`))].join('; ')})`);
+    if (noBalance.length) problems.push(`баланс «$837.7k» с табло не увидели: ${noBalance.join(', ')}`);
     // Места: каждый на своём, не ближе 2 блоков к другому.
     const list = [...spots].map(([nick, p]) => ({ nick, p }));
     for (let a = 0; a < list.length; a += 1) {
@@ -864,6 +916,62 @@ async function runFishCheck(host, port, version, cmd) {
     const viewer = managers[0].getBot();
     const bobbers = viewer ? Object.values(viewer.entities || {}).filter((e) => e && e.name === 'fishing_bobber').length : 0;
     if (bobbers) problems.push(`после #стоп в воде осталось поплавков: ${bobbers}`);
+
+    // Поплавок мимо воды — на камень площадки: бот не вытаскивает его (это −2 прочности удочке), а убирает сменой
+    // ячейки в руке — сервер сам убирает поплавок, прочность та же.
+    const { botRods, usableRods } = require('../src/bot/fishing');
+    const caster = managers[0].getBot();
+    if (caster && usableRods(caster).length) {
+      const total = () => botRods(caster).reduce((s, x) => s + (Number.isFinite(x.left) ? x.left : 0), 0);
+      const before = total();
+      const pos = caster.entity.position;
+      const away = Math.hypot(pos.x - 320.5, pos.z - 320.5) || 1; // от середины пруда — наружу, на площадку
+      const target = new Vec3(pos.x + ((pos.x - 320.5) / away) * 5, 150, pos.z + ((pos.z - 320.5) / away) * 5);
+      const eye = pos.offset(0, 1.62, 0);
+      const yaw = Math.atan2(-(target.x - eye.x), -(target.z - eye.z));
+      const pitch = Math.atan2(target.y - eye.y, Math.hypot(target.x - eye.x, target.z - eye.z));
+      const cast = await caster.actions.fish({ yaw, pitch, rod: usableRods(caster)[0].item, maxWaitTicks: 300 })
+        .catch((err) => ({ outcome: `ошибка: ${err.message}` }));
+      await wait(1500);
+      const after = total();
+      console.log(`  [рыбалка] поплавок на земле: ${cast.outcome}, прочность удочек ${before} → ${after}`);
+      if (cast.outcome !== 'ground' && cast.outcome !== 'hooked') problems.push(`поплавок на земле: вышло «${cast.outcome}», а не «ground»`);
+      if (after !== before) problems.push(`поплавок на земле: удочки потеряли прочность (${before} → ${after})`);
+    } else {
+      problems.push(`${nicks[0]}: нет целой удочки — «поплавок на земле» не проверен`);
+    }
+
+    // «#скинь»: весь инвентарь, броня и щит во второй руке — в ближайший сундук, где есть место (ближний — забит).
+    const dumper = managers[1] ? managers[1].getBot() : null;
+    if (dumper) {
+      const nick = nicks[1];
+      const stone = Array.from({ length: 27 }, (_, i) => `{Slot:${i}b,id:"minecraft:stone",count:64}`).join(',');
+      for (const c of [
+        `tp ${nick} 296.5 150 296.5`,
+        `setblock 298 150 296 minecraft:chest{Items:[${stone}]}`, // ближний — забит камнем
+        'setblock 293 150 299 minecraft:chest', // подальше — пустой
+        `item replace entity ${nick} armor.head with minecraft:iron_helmet`,
+        `item replace entity ${nick} armor.chest with minecraft:iron_chestplate`,
+        `item replace entity ${nick} armor.legs with minecraft:iron_leggings`,
+        `item replace entity ${nick} armor.feet with minecraft:iron_boots`,
+        `item replace entity ${nick} weapon.offhand with minecraft:shield`,
+        `give ${nick} minecraft:bread 10`,
+      ]) cmd(c);
+      const placed = () => dumper.entity.position.distanceTo(new Vec3(296.5, 150, 296.5)) < 1 &&
+        [5, 6, 7, 8, 45].every((s) => dumper.inventory.slots[s]) && (dumper.blockAt(new Vec3(293, 150, 299)) || {}).name === 'chest';
+      for (let i = 0; i < 60 && !placed(); i += 1) await wait(250);
+      if (!placed()) problems.push(`#скинь: ${nick} не на месте или без брони — проверка не готова`);
+      await wait(1500); // постоять после телепорта, как человек
+      const r = await runCommand(dumper, '#скинь').catch((err) => ({ ok: false, message: String(err && err.message ? err.message : err) }));
+      await wait(1000);
+      console.log(`  [скинь] ${nick}: ${[].concat(r.message).join(' | ')}`);
+      const left = dumper.inventory.slots.map((it, i) => (it && i >= 5 ? `${i}:${it.name}` : null)).filter(Boolean);
+      const used = ((r.data && r.data.chests) || []).map((c) => `${c.position.x} ${c.position.y} ${c.position.z}`);
+      if (!r.ok) problems.push(`#скинь: ${[].concat(r.message).join(' | ')}`);
+      if (left.length) problems.push(`#скинь: у бота осталось ${left.join(', ')}`);
+      if (used.join(';') !== '293 150 299') problems.push(`#скинь: скинул не туда (${used.join('; ') || 'никуда'})`);
+    }
+
     const l = board.list();
     console.log(`  [рыбалка] всего поймано ${l.caught}, рыбачат после «Стоп»: ${l.active}`);
     if (l.active) problems.push(`после «Стоп» рыбачат ещё ${l.active}`);
@@ -887,12 +995,108 @@ async function runFishCheck(host, port, version, cmd) {
   return result;
 }
 
+/**
+ * Прокси с логином и паролем, как у продавцов прокси (SOCKS5, RFC 1929), — для --captcha: через него заходит бот и
+ * должна грузиться страница проверки. seen — куда через него ходили.
+ */
+function standProxy(user, pass) {
+  const net = require('net');
+  const seen = [];
+  const server = net.createServer((c) => {
+    c.on('error', () => {});
+    let buf = Buffer.alloc(0);
+    let stage = 0;
+    c.on('data', function onData(chunk) {
+      buf = Buffer.concat([buf, chunk]);
+      if (stage === 0 && buf.length >= 2 && buf.length >= 2 + buf[1]) {
+        buf = buf.subarray(2 + buf[1]);
+        c.write(Buffer.from([5, 2]));
+        stage = 1;
+      }
+      if (stage === 1 && buf.length >= 2) {
+        const ul = buf[1];
+        if (buf.length < 3 + ul || buf.length < 3 + ul + buf[2 + ul]) return;
+        const pl = buf[2 + ul];
+        const ok = buf.subarray(2, 2 + ul).toString() === user && buf.subarray(3 + ul, 3 + ul + pl).toString() === pass;
+        buf = buf.subarray(3 + ul + pl);
+        if (!ok) {
+          c.end(Buffer.from([1, 1]));
+          return;
+        }
+        c.write(Buffer.from([1, 0]));
+        stage = 2;
+      }
+      if (stage === 2 && buf.length >= 7) {
+        let host;
+        let end;
+        if (buf[3] === 3) {
+          end = 5 + buf[4];
+          host = buf.subarray(5, end).toString();
+        } else {
+          end = 8;
+          host = [...buf.subarray(4, 8)].join('.');
+        }
+        if (buf.length < end + 2) return;
+        const port = buf.readUInt16BE(end);
+        seen.push(`${host}:${port}`);
+        c.off('data', onData);
+        stage = 3;
+        const out = net.connect(port, host === 'localhost' ? '127.0.0.1' : host, () => {
+          c.write(Buffer.from([5, 0, 0, 1, 127, 0, 0, 1, 0, 0]));
+          out.pipe(c);
+          c.pipe(out);
+        });
+        out.on('error', () => c.destroy());
+        c.on('close', () => out.destroy());
+      }
+    });
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ port: server.address().port, seen, close: () => server.close() })));
+}
+
+/** Страница проверки «я не робот» с кнопкой «Да»: нажали — yes() (сервер напишет «прошли проверку»). */
+function captchaPage() {
+  const http = require('http');
+  const state = { hits: 0, yes: false };
+  const server = http.createServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/yes') {
+      state.yes = true;
+      res.end('ok');
+      return;
+    }
+    state.hits += 1;
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+    res.end('<!doctype html><title>check</title><p>Вы не робот?</p><button id="yes" onclick="fetch(\'/yes\',{method:\'POST\'})">Да</button>');
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ port: server.address().port, state, close: () => server.close() })));
+}
+
 /** Бот заходит через настоящий Electron: самопроверка панели с сервером (см. MBP_SELFTEST_* в src/main.js). */
-function runElectron(host, port, version) {
-  return new Promise((resolve) => {
+async function runElectron(host, port, version, cmd) {
+  // --captcha: бот — через прокси с паролем; сервер шлёт ссылку проверки, окно панели должно открыть её само через
+  // тот же прокси; «человек» (самопроверка) жмёт «Да» — сервер пишет «прошли», окно закрывается.
+  let proxy = null;
+  let page = null;
+  let nag = null;
+  if (CAPTCHA) {
+    if (!cmd) return { problem: '--captcha — только со своим сервером стенда (нужна его консоль)' };
+    proxy = await standProxy('standuser', 'p@ss:word');
+    page = await captchaPage();
+    let doneSent = false;
+    nag = setInterval(() => {
+      if (!page.state.yes) {
+        cmd(`tellraw ${BOT_NAME} {"text":"Please confirm you are not a robot (captcha), click the link and press Yes: http://127.0.0.1:${page.port}/check"}`);
+      } else if (!doneSent) {
+        doneSent = true;
+        cmd(`tellraw ${BOT_NAME} {"text":"Verification passed, welcome!"}`);
+      }
+    }, 2000);
+  }
+  const r = await new Promise((resolve) => {
     const out = path.join(os.tmpdir(), `mbp-electron-check-${process.pid}.json`);
     fs.rmSync(out, { force: true });
     const env = {
+      ...(CAPTCHA ? { MBP_SELFTEST_PROXY: `socks5://standuser:p%40ss%3Aword@127.0.0.1:${proxy.port}`, MBP_SELFTEST_CAPTCHA: '1' } : {}),
       ...process.env,
       MBP_SELFTEST_OUT: out,
       MBP_SELFTEST_SERVER: `${host}:${port}`,
@@ -928,15 +1132,43 @@ function runElectron(host, port, version) {
         for (const p of m.processes || []) console.log(`  [процесс] ${p.name}: память ${p.memoryMB} МБ (своя ${p.privateMB} МБ), процессор ${p.cpu}%`);
         console.log(`  [память] процессы ботов ${m.botsMB} МБ — на бота ≈ ${m.perBotMB} МБ; вся программа ${m.appMB} МБ`);
       }
-      resolve({ online: Boolean(s && s.states.includes('online')), onlineMs: s ? s.stayMs : 0, kick: kick ? kick.slice(6) : null, problem, stats: s ? s.stats : null });
+      resolve({ online: Boolean(s && s.states.includes('online')), onlineMs: s ? s.stayMs : 0, kick: kick ? kick.slice(6) : null, problem, stats: s ? s.stats : null, captcha: s ? s.captcha : null });
     });
   });
+  if (CAPTCHA) {
+    clearInterval(nag);
+    const c = r.captcha || {};
+    const viaProxy = proxy.seen.filter((x) => x === `127.0.0.1:${page.port}`).length;
+    const botViaProxy = proxy.seen.filter((x) => x.endsWith(`:${port}`)).length;
+    console.log(`  [капча] через прокси ходили: ${proxy.seen.join(", ")}`);
+    if (!c.browser) console.log(`  [капча] страницу видно только загруженную: ${c.shownAfterLoad ? 'да' : 'НЕТ'}; после «прошли» — «✓ Проверка пройдена»: ${c.passedShown ? 'да' : 'НЕТ'}`);
+    console.log(`  [капча] в панели: ${c.inPanel ? 'да' : 'НЕТ'}, место ${c.rect ? `${c.rect.width}×${c.rect.height} с (${c.rect.x}, ${c.rect.y})` : 'НЕ ОТВЕДЕНО'}, вкладка: «${c.panelSays || ''}»`);
+    console.log(`  [капча] окно открылось: ${c.opened ? 'да' : 'НЕТ'}${c.opened ? ` через ${c.openMs} мс после ссылки, страница загружена за ${c.loadMs} мс` : ''}; ` +
+      `заголовок: «${c.title || ''}»; страница через прокси бота: ${viaProxy} раз (всего на странице ${page.state.hits}); бот вошёл через прокси: ${botViaProxy ? 'да' : 'НЕТ'}; ` +
+      `«Да» нажато: ${page.state.yes ? 'да' : 'нет'}; окно закрылось само: ${c.closed ? 'да' : 'НЕТ'}`);
+    const bad = [];
+    if (!c.opened) bad.push('окно проверки не открылось');
+    if (c.opened && !c.inPanel && !c.browser) bad.push('проверка не внутри окна панели');
+    if (c.opened && !c.rect && !c.browser) bad.push('панель не отвела место под проверку');
+    if (c.opened && !c.browser && !c.shownAfterLoad) bad.push('загруженную страницу проверки не видно');
+    if (c.opened && !c.browser && !c.passedShown) bad.push('после «прошли» не показалось «✓ Проверка пройдена»');
+    if (!viaProxy || page.state.hits !== viaProxy) bad.push('страница проверки грузилась не через прокси бота');
+    if (!botViaProxy) bad.push('бот зашёл не через прокси');
+    // В браузере по умолчанию (MBP_SELFTEST_BROWSER) «Да» жмёт человек — стенд проверяет только, что страница шла через прокси бота.
+    if (!c.browser && !page.state.yes) bad.push('«Да» на странице не нажалось');
+    if (!c.browser && !c.closed) bad.push('окно не закрылось после «прошли проверку»');
+    if (bad.length && !r.problem) r.problem = `капча: ${bad.join('; ')}`;
+    proxy.close();
+    page.close();
+  }
+  return r;
 }
 
 function runBot(host, port, version, cmd) {
   return new Promise((resolve) => {
     const config = {
       ...DEFAULT_CONFIG,
+      proxyOnly: false, // стенд: свой сервер, без прокси
       host,
       port,
       username: BOT_NAME,
@@ -1075,7 +1307,7 @@ async function main() {
 
     const offset = logSize();
     const cmd = server ? (text) => server.child.stdin.write(`${text}\n`) : null; // консоль — только у своего сервера
-    const result = ELECTRON ? await runElectron(host, port, version) : FISH ? await runFishCheck(host, port, version, cmd) : await runBot(host, port, version, cmd);
+    const result = ELECTRON ? await runElectron(host, port, version, cmd) : FISH ? await runFishCheck(host, port, version, cmd) : await runBot(host, port, version, cmd);
     await sleep(2000); // сервер успеет дописать лог
     const { checks, other } = summarize(readLogFrom(offset));
 

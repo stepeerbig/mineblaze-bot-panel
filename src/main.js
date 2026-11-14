@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, Menu, clipboard, ipcMain, net, safeStorage, session, shell, utilityProcess } = require('electron');
+const { app, BrowserWindow, Menu, WebContentsView, clipboard, ipcMain, net, safeStorage, session, shell, utilityProcess } = require('electron');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -11,38 +11,43 @@ const { TaskBoard } = require('./tasks');
 const { FishBoard } = require('./fish-board');
 const { DEFAULT_CONFIG, sanitize, validate, accountsOf } = require('./config');
 const { maskSecrets } = require('./chat-utils');
+const { startRelay } = require('./proxy-relay');
+const { browserKind, browserName, launchArgs, firefoxPrefs } = require('./captcha-browser');
+const { launch } = require('cloakbrowser'); // <--- НОВЫЙ ИМПОРТ
 
 // Фиксированная папка для настроек и логов: %APPDATA%\MineBlazeBotPanel
 app.setPath('userData', path.join(app.getPath('appData'), 'MineBlazeBotPanel'));
 
-// Самопроверка сборки: MBP_SELFTEST_OUT=<файл> — без окон запустить процесс ботов, загрузить его модули
-// (в собранном exe — из app.asar), поднять и закрыть экран бота, записать итог в файл и выйти.
-// С MBP_SELFTEST_SERVER=<адрес:порт> бот ещё и заходит на сервер (тестовый стенд) и стоит там
-// MBP_SELFTEST_STAY секунд — так проверяется весь путь бота в настоящем Electron (npm run stand:check -- --electron).
 const SELFTEST_OUT = process.env.MBP_SELFTEST_OUT || '';
+const TRIAL_BOTS = Math.max(0, Math.min(200, parseInt(process.env.MBP_TRIAL_BOTS, 10) || 0));
+const TRIAL_SEC = Math.max(20, Math.min(3600, parseInt(process.env.MBP_TRIAL_SEC, 10) || 120));
 if (SELFTEST_OUT) app.setPath('userData', fs.mkdtempSync(path.join(os.tmpdir(), 'mbp-selftest-')));
+if (SELFTEST_OUT && process.env.MBP_SELFTEST_SHOT) app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
 
-const config = { ...DEFAULT_CONFIG }; // настройки панели; копию держат процессы ботов
-const SECRET_FIELDS = ['loginPassword', 'joinCommands', 'accounts', 'aiKey']; // хранятся зашифрованными (Windows DPAPI)
+const config = { ...DEFAULT_CONFIG };
+const SECRET_FIELDS = ['loginPassword', 'joinCommands', 'accounts', 'aiKey'];
 const ICON = path.join(__dirname, 'assets', 'icon.png');
-const VIEWER_PARTITION = 'mineblaze-viewer'; // без «persist:» — сессия окна экрана живёт только в памяти
-const CHAT_HISTORY = 300; // строк чата каждого бота: выбрал бота в списке — видишь его чат
+const VIEWER_PARTITION = 'mineblaze-viewer';
+const CHAT_HISTORY = 300;
 let configFile = '';
 let logsDir = '';
 let win = null;
-let fleet = null; // все боты (src/fleet.js)
-let ai = null; // ИИ-помощник (src/ai.js)
-let autopilot = null; // автопилот заданий NPC (src/quest-autopilot.js)
-let tasks = null; // задачи ботам (src/tasks.js)
-let selectedBot = null; // чей чат в панели и кого показывает экран бота
-let appliedAccounts = null; // список ботов, который уже отдан флоту
-let viewerWin = null; // окно «Экран бота»
-let viewerOpening = null; // общий промис, пока окно открывается (защита от двойного клика)
-let viewerTarget = null; // { bot, client, url } — кого показывает экран и в каком процессе
+let fleet = null;
+let ai = null;
+let autopilot = null;
+let tasks = null;
+let selectedBot = null;
+let appliedAccounts = null;
+let viewerWin = null;
+let viewerOpening = null;
+let viewerTarget = null;
 let quitting = false;
 let shutdownDone = false;
-const chatHistory = new Map(); // номер бота → последние строки его чата
-// Вкладка «Авто фиш»: кто рыбачит и сколько поймал (src/fish-board.js); в окно — не чаще раза в 0,3 с.
+const chatHistory = new Map();
+
+// Хранилище для запущенных экземпляров CloakBrowser
+const cloakRuns = new Map(); // номер бота → { browser, page, startedAt }
+
 const fishBoard = new FishBoard();
 let fishPending = null;
 fishBoard.on('update', () => {
@@ -56,14 +61,11 @@ fishBoard.on('update', () => {
 const errText = (err) => (err && err.message ? err.message : String(err));
 
 // ---------- настройки ----------
-
 function encodeSecret(value) {
   if (!value) return '';
   try {
     if (safeStorage.isEncryptionAvailable()) return `enc:${safeStorage.encryptString(value).toString('base64')}`;
-  } catch (_) {
-    /* шифрование недоступно — сохраним как есть */
-  }
+  } catch (_) {}
   return `txt:${value}`;
 }
 
@@ -73,7 +75,7 @@ function decodeSecret(value) {
     try {
       return safeStorage.decryptString(Buffer.from(value.slice(4), 'base64'));
     } catch (_) {
-      return ''; // зашифровано под другим пользователем Windows — придётся ввести заново
+      return '';
     }
   }
   return value.startsWith('txt:') ? value.slice(4) : value;
@@ -85,14 +87,10 @@ function loadConfig() {
     raw = JSON.parse(fs.readFileSync(configFile, 'utf8'));
     for (const key of SECRET_FIELDS) raw[key] = decodeSecret(raw[key]);
     Object.assign(config, sanitize(raw));
-  } catch (_) {
-    /* первый запуск или файл повреждён — остаются значения по умолчанию */
-  }
-  // Раньше бот был один («Ник бота») — он становится первым в списке «Боты».
+  } catch (_) {}
   if (!String(config.accounts || '').trim() && config.username) config.accounts = config.username;
 }
 
-/** Записать файл через временный: если программа упадёт посреди записи, старый файл не пострадает. */
 function writeFileSafe(file, text) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp`;
@@ -116,7 +114,6 @@ function saveConfig() {
   syncFleet();
 }
 
-/** Процессам ботов — те же настройки; поменялся список ботов — флоту новый список. */
 function syncFleet() {
   if (!fleet) return;
   const key = `${config.auth}\n${config.accounts}`;
@@ -127,12 +124,11 @@ function syncFleet() {
   fleet.pushConfig();
 }
 
-// ---------- логи в файлы: %APPDATA%\MineBlazeBotPanel\logs ----------
-
+// ---------- логи ----------
 const pad = (n) => String(n).padStart(2, '0');
 const dayOf = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const clockOf = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-const logStreams = new Map(); // вид лога -> { day, stream }
+const logStreams = new Map();
 let logWriteFailed = false;
 
 function appendLog(kind, time, line) {
@@ -142,15 +138,11 @@ function appendLog(kind, time, line) {
   let entry = logStreams.get(kind);
   if (!entry || entry.day !== day) {
     if (entry) entry.stream.end();
-    try {
-      fs.mkdirSync(logsDir, { recursive: true });
-    } catch (_) {
-      /* ошибку покажет поток ниже */
-    }
+    try { fs.mkdirSync(logsDir, { recursive: true }); } catch (_) {}
     const stream = fs.createWriteStream(path.join(logsDir, `${kind}-${day}.log`), { flags: 'a', encoding: 'utf8' });
     stream.on('error', (err) => {
       if (logWriteFailed) return;
-      logWriteFailed = true; // одного сообщения достаточно
+      logWriteFailed = true;
       uiLog('error', `Не удалось записать лог в файл: ${err.message}`);
     });
     entry = { day, stream };
@@ -165,11 +157,8 @@ function closeLogs() {
 }
 
 const tagOf = (nick) => (nick ? `[${nick}] ` : '');
-
-// Одно и то же сообщение сервера (общий чат, объявления) видят все боты — в лог оно пишется один раз:
-// другой бот прислал тот же текст в ближайшие секунды — пропускаем.
 const CHAT_DEDUPE_MS = 3000;
-const recentChat = new Map(); // текст → { time, bot }
+const recentChat = new Map();
 
 function logChat(msg) {
   const time = msg.time || Date.now();
@@ -182,25 +171,21 @@ function logChat(msg) {
       for (const [k, v] of recentChat) if (time - v.time >= CHAT_DEDUPE_MS) recentChat.delete(k);
     }
   }
-  // Спрятанные за кликабельным текстом адреса тоже сохраняем в лог.
   const hidden = (Array.isArray(msg.links) ? msg.links : []).filter((url) => !text.includes(url));
   appendLog('chat', time, `${tagOf(msg.nick)}${hidden.length ? `${text} [${hidden.join(' ')}]` : text}`);
 }
 
-// ---------- окно и связь с интерфейсом ----------
-
+// ---------- окно и связь ----------
 function send(channel, payload) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
 }
 
-/** Строка в консоль панели и в лог — от самого главного процесса (не от бота). */
 function uiLog(level, text) {
   const entry = { bot: null, nick: null, time: Date.now(), level, text };
   send('bot:log', entry);
   appendLog('events', entry.time, `${level.toUpperCase().padEnd(5)} ${text}`);
 }
 
-/** Пароли ботов и ключ ИИ — точками: ни в лог, ни в консоль, ни сервису ИИ они попасть не должны. */
 function hideSecrets(text) {
   let s = String(text === undefined || text === null ? '' : text);
   const secrets = [config.loginPassword, config.aiKey, ...accountsOf(config).accounts.map((a) => a.password)];
@@ -208,14 +193,12 @@ function hideSecrets(text) {
   return maskSecrets(s);
 }
 
-/** Строка ИИ-помощника: в консоль (с меткой «ИИ») и в лог. */
 function aiLog(level, text) {
   const entry = { bot: null, nick: null, source: 'ai', time: Date.now(), level, text: hideSecrets(text) };
   send('bot:log', entry);
   appendLog('events', entry.time, `[ИИ] ${level.toUpperCase().padEnd(5)} ${entry.text}`);
 }
 
-/** Строка автопилота заданий: в консоль (с меткой «Авто», у бота — как его строки) и в лог. */
 function questLog({ level, text, bot, nick }) {
   const entry = { bot: bot || null, nick: nick || null, source: 'quests', time: Date.now(), level, text: hideSecrets(text) };
   send('bot:log', entry);
@@ -251,7 +234,6 @@ function registerIpc() {
     return { ...config };
   });
 
-  // Старт: ids — каких ботов (нет — всех); settings — поля формы, сохранить перед запуском.
   ipcMain.handle('bots:start', async (_e, { ids = null, settings = null } = {}) => {
     if (settings) Object.assign(config, sanitize(settings));
     saveConfig();
@@ -263,7 +245,7 @@ function registerIpc() {
     const started = await fleet.start(Array.isArray(ids) ? ids : null);
     if (!ids) {
       uiLog('info', started > 1
-        ? `Запускаю ботов: ${started} — входят по одному каждые ${config.startInterval} с (последний войдёт примерно через ${Math.ceil(((started - 1) * config.startInterval) / 60)} мин)`
+        ? `Запускаю ботов: ${started} — входят по одному каждые ${config.startInterval} с`
         : started ? 'Запускаю бота' : 'Все боты уже запущены');
     }
     return { ok: true, started, config: { ...config } };
@@ -282,10 +264,6 @@ function registerIpc() {
     return value;
   });
 
-  // Сообщение или команда: mode 'one' — выбранному боту; 'all' — всем ботам в сети сразу (только команды);
-  // 'turn' — всем по очереди: команда боту «#…» — следующий начинает, когда закончил предыдущий; сообщение и
-  // «/…» — друг за другом через паузу.
-  // 'group' / 'group-turn' — то же, что «всем сразу» / «всем по очереди», только ботам группы (ids — выбраны в списке).
   ipcMain.handle('bot:say', async (_e, { text, mode = 'one', ids = null } = {}) => {
     if (typeof text !== 'string' || !text.trim()) return false;
     if (['all', 'turn', 'group', 'group-turn'].includes(mode)) {
@@ -296,7 +274,7 @@ function registerIpc() {
         return false;
       }
       const turn = mode === 'turn' || mode === 'group-turn';
-      if (turn && autopilot) autopilot.interrupt('идёт «по очереди»'); // ботам — одно дело за раз
+      if (turn && autopilot) autopilot.interrupt('идёт «по очереди»');
       const r = turn ? fleet.runInTurn(text, { ids: only }) : fleet.broadcast(text, { ids: only, who: group ? 'группе' : 'всем' });
       if (r.refused) {
         uiLog('warn', `Не отправлено: ${r.refused}`);
@@ -310,9 +288,8 @@ function registerIpc() {
       uiLog('warn', 'Не отправлено: выбери бота в списке');
       return false;
     }
-    try {
-      return await fleet.say(selectedBot, text);
-    } catch (err) {
+    try { return await fleet.say(selectedBot, text); }
+    catch (err) {
       uiLog('error', `Процесс бота: ${errText(err)}`);
       return false;
     }
@@ -331,36 +308,44 @@ function registerIpc() {
 
   ipcMain.handle('viewer:open', () => openViewer());
 
-  // ИИ-помощник (src/ai.js): задание словами — ИИ сам отдаёт ботам команды. settings — поля ИИ из формы.
+  ipcMain.on('captcha:bounds', (_e, r) => {
+    const ok = r && [r.x, r.y, r.width, r.height].every(Number.isFinite) && r.width > 20 && r.height > 20;
+    captchaRect = ok ? { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) } : null;
+    layoutCaptcha();
+  });
+  ipcMain.handle('captcha:state', () => captchaState());
+  ipcMain.handle('captcha:control', (_e, { action, bot } = {}) => {
+    const id = String(bot || captchaActive || '');
+    if (!captchaViews.has(id)) return captchaState();
+    if (action === 'show') {
+      captchaActive = id;
+      syncCaptcha();
+    } else if (action === 'reload') reloadCaptcha(id);
+    else if (action === 'close') removeCaptcha(id);
+    return captchaState();
+  });
+
   ipcMain.handle('ai:run', (_e, { task, settings = null } = {}) => {
     if (settings) {
       Object.assign(config, sanitize(settings));
       saveConfig();
     }
     const text = hideSecrets(String(task || '').trim()).slice(0, 2000);
-    try {
-      ai.run(text).catch((err) => aiLog('error', errText(err)));
-    } catch (err) {
-      return { ok: false, error: errText(err) };
-    }
-    if (autopilot) autopilot.interrupt('ИИ выполняет задание'); // ботам — одно дело за раз
+    try { ai.run(text).catch((err) => aiLog('error', errText(err))); }
+    catch (err) { return { ok: false, error: errText(err) }; }
+    if (autopilot) autopilot.interrupt('ИИ выполняет задание');
     const where = config.aiProvider === 'openai' ? `модель ${config.aiModel}` : `модель ${config.ollamaModel} на этом ПК`;
     aiLog('info', `Задание: ${text} (${where})`);
     return { ok: true };
   });
 
-  // Готов ли ИИ (для подсказки на панели): Ollama запущена? модель скачана? у интернет-сервиса — есть ли ключ.
   ipcMain.handle('ai:status', async () => {
-    try {
-      return { ok: true, ...(await ai.status()) };
-    } catch (err) {
-      return { ok: false, error: hideSecrets(errText(err)) };
-    }
+    try { return { ok: true, ...(await ai.status()) }; }
+    catch (err) { return { ok: false, error: hideSecrets(errText(err)) }; }
   });
 
   ipcMain.handle('ai:get-ollama', () => shell.openExternal('https://ollama.com/download').then(() => true, () => false));
 
-  // Автопилот заданий: включить/выключить (settings — его поля из формы), состояние, «проверить всех сейчас».
   ipcMain.handle('quests:toggle', async (_e, { on, settings = null } = {}) => {
     if (settings) Object.assign(config, sanitize(settings));
     config.questAuto = Boolean(on);
@@ -370,12 +355,8 @@ function registerIpc() {
     return autopilot.status();
   });
   ipcMain.handle('quests:status', () => autopilot.status());
-  ipcMain.handle('quests:check-now', () => {
-    autopilot.checkNow();
-    return autopilot.status();
-  });
+  ipcMain.handle('quests:check-now', () => { autopilot.checkNow(); return autopilot.status(); });
 
-  // Задачи ботам (src/tasks.js). target: 'selected' — выбранному, 'online' — всем в сети, 'all' — всем ботам из списка.
   ipcMain.handle('tasks:add', (_e, { text, target = 'selected', repeat = false, ids: groupIds = null } = {}) => {
     if (!tasks) return { ok: false, error: 'задачи недоступны' };
     let ids;
@@ -384,18 +365,16 @@ function registerIpc() {
     else if (target === 'online') ids = fleet.list().filter((b) => b.state === 'online' || b.state === 'connected').map((b) => b.bot);
     else ids = selectedBot ? [selectedBot] : [];
     if (!ids.length) {
-      const why = target === 'online' ? 'в сети нет ни одного бота' : target === 'group' ? 'группа пуста — выбери ботов в списке (Ctrl+клик, Shift+клик)' : 'выбери бота в списке';
+      const why = target === 'online' ? 'в сети нет ни одного бота' : target === 'group' ? 'группа пуста' : 'выбери бота в списке';
       return { ok: false, error: why };
     }
     try {
       const r = tasks.add(ids, String(text || ''), { repeat: Boolean(repeat) });
       if (r.added > 1) taskLog({ level: 'info', text: `Задача добавлена ботам: ${r.added}` });
       return { ok: true, added: r.added };
-    } catch (err) {
-      return { ok: false, error: errText(err) };
-    }
+    } catch (err) { return { ok: false, error: errText(err) }; }
   });
-  // action: 'pause' | 'resume' | 'cancel' (id — одна задача, без id — все) | 'clear-done' (убрать готовые)
+
   ipcMain.handle('tasks:control', (_e, { action, id = null } = {}) => {
     if (!tasks) return 0;
     if (action === 'pause') return tasks.pause(id);
@@ -406,8 +385,6 @@ function registerIpc() {
   });
   ipcMain.handle('tasks:list', () => (tasks ? tasks.list() : []));
 
-  // Вкладка «Авто фиш». target: 'selected' — выбранному, 'group' — группе (ids), 'online' — всем в сети; home — дом
-  // склада (сундуки с удочками, вода рядом). Боту уходит «#рыбалка дом X»: рыбачит, пока не «#стоп».
   ipcMain.handle('fish:start', (_e, { target = 'selected', ids: groupIds = null, home = '' } = {}) => {
     let ids;
     if (target === 'group') ids = Array.isArray(groupIds) ? groupIds.map(String) : [];
@@ -418,116 +395,101 @@ function registerIpc() {
       return Boolean(b && (b.state === 'online' || b.state === 'connected'));
     };
     ids = ids.filter(inGame);
-    if (!ids.length) {
-      const why = target === 'group' ? 'в группе нет ботов в сети (выбери ботов: Ctrl+клик, Shift+клик)' : target === 'online' ? 'в сети нет ни одного бота' : 'выбранный бот не в сети';
-      return { ok: false, error: why };
-    }
+    if (!ids.length) return { ok: false, error: 'нет ботов в сети для рыбалки' };
     const h = String(home || '').trim().replace(/^\/?home\s+/i, '');
-    if (h && !/^[\p{L}\p{N}_-]{1,32}$/u.test(h)) return { ok: false, error: `странное имя дома «${h}»: буквы, цифры, _ и -` };
-    if (!h && !String(config.questStorage || '').trim()) return { ok: false, error: 'впиши «Дом склада» — дом, где сундуки с удочками и вода рядом' };
+    if (h && !/^[\p{L}\p{N}_-]{1,32}$/u.test(h)) return { ok: false, error: `странное имя дома «${h}»` };
+    if (!h && !String(config.questStorage || '').trim()) return { ok: false, error: 'впиши «Дом склада»' };
     const line = `#рыбалка${h ? ` дом ${h}` : ''}`;
     const r = fleet.broadcast(line, { ids, who: ids.length > 1 ? 'рыбакам' : 'боту' });
     if (r.refused) return { ok: false, error: r.refused };
     for (const id of ids) fishBoard.started(id, fleet.get(id).nick);
-    uiLog('info', `Авто фиш: ${ids.length > 1 ? `ботов ${ids.length}` : fleet.get(ids[0]).nick} — ${line} (рыбачат, пока не «Стоп»)`);
+    uiLog('info', `Авто фиш: ${ids.length} ботов — ${line}`);
     return { ok: true, targets: ids.length };
   });
-  // Остановить рыбалку: ids — кого (нет — всех, кто рыбачит). Каждому — «#стоп».
+
   ipcMain.handle('fish:stop', async (_e, { ids = null } = {}) => {
     const list = (Array.isArray(ids) && ids.length ? ids.map(String) : fishBoard.activeIds()).filter((id) => fleet.get(id));
     if (!list.length) return { ok: false, error: 'никто не рыбачит' };
     let sent = 0;
     for (const id of list) {
       const b = fleet.get(id);
-      if (!b || (b.state !== 'online' && b.state !== 'connected')) {
-        fishBoard.offline(id); // не в сети — его рыбалка и так кончилась
-        continue;
-      }
-      try {
-        if (await fleet.say(id, '#стоп')) sent += 1; // в сети — ответит сам («остановлен»)
-      } catch (_) {
-        fishBoard.offline(id);
-      }
+      if (!b || (b.state !== 'online' && b.state !== 'connected')) { fishBoard.offline(id); continue; }
+      try { if (await fleet.say(id, '#стоп')) sent += 1; } catch (_) { fishBoard.offline(id); }
     }
     uiLog('info', `Авто фиш: стоп — ботов ${sent}`);
     return { ok: true, targets: sent };
   });
-  ipcMain.handle('fish:list', () => fishBoard.list());
-  ipcMain.handle('fish:clear', () => {
-    fishBoard.clearDone();
-    return fishBoard.list();
+
+  ipcMain.handle('fish:pay', (_e, { target = 'online', ids: groupIds = null, to = '' } = {}) => {
+    const nick = String(to || config.payTo || '').trim();
+    if (!/^[A-Za-z0-9_]{3,16}$/.test(nick)) return { ok: false, error: 'впиши ник, куда переводить' };
+    if (nick !== config.payTo) { Object.assign(config, sanitize({ payTo: nick })); saveConfig(); }
+    let ids;
+    if (target === 'group') ids = Array.isArray(groupIds) ? groupIds.map(String) : [];
+    else if (target === 'online') ids = fleet.list().map((b) => b.bot);
+    else ids = selectedBot ? [selectedBot] : [];
+    ids = ids.filter((id) => {
+      const b = fleet.get(id);
+      return Boolean(b && (b.state === 'online' || b.state === 'connected') && b.username.toLowerCase() !== nick.toLowerCase());
+    });
+    if (!ids.length) return { ok: false, error: 'нет ботов для перевода' };
+    const r = fleet.broadcast(`#перевод ${nick}`, { ids, who: 'ботам' });
+    if (r.refused) return { ok: false, error: r.refused };
+    uiLog('info', `Авто фиш: перевод на ${nick} — ботов ${ids.length}`);
+    return { ok: true, targets: ids.length };
   });
+  ipcMain.handle('fish:list', () => fishBoard.list());
+  ipcMain.handle('fish:clear', () => { fishBoard.clearDone(); return fishBoard.list(); });
 
   ipcMain.handle('ai:stop', () => {
     const stopped = ai.stop();
-    if (stopped) aiLog('warn', 'Останавливаю: новые команды ботам не уйдут, начатое бот бросит');
+    if (stopped) aiLog('warn', 'Останавливаю ИИ: новые команды не уйдут');
     return stopped;
   });
 
-  // Бесплатные модели сервиса, которые умеют вызывать инструменты (для подсказки в поле «Модель»).
   ipcMain.handle('ai:models', async (_e, settings) => {
-    if (settings) {
-      Object.assign(config, sanitize(settings));
-      saveConfig();
-    }
-    try {
-      return { ok: true, models: await ai.listModels() };
-    } catch (err) {
-      return { ok: false, error: hideSecrets(errText(err)) };
-    }
+    if (settings) { Object.assign(config, sanitize(settings)); saveConfig(); }
+    try { return { ok: true, models: await ai.listModels() }; }
+    catch (err) { return { ok: false, error: hideSecrets(errText(err)) }; }
   });
 }
 
 function createWindow({ show = true } = {}) {
   win = new BrowserWindow({
-    width: 1280,
-    height: 800,
-    minWidth: 960,
-    minHeight: 600,
-    show, // самопроверка открывает окно скрытым
-    backgroundColor: '#1c1e22',
-    title: 'MineBlaze Bot Panel',
-    icon: ICON,
+    width: 1280, height: 800, minWidth: 960, minHeight: 600, show,
+    backgroundColor: '#1c1e22', title: 'MineBlaze Bot Panel', icon: ICON,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
+      contextIsolation: true, nodeIntegration: false, sandbox: true,
     },
   });
 
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
-  // Ссылки и новые окна не открываем внутри приложения.
   win.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:\/\//i.test(url)) shell.openExternal(url); // в т.ч. ссылки проверки от сервера
+    if (/^https?:\/\//i.test(url)) openLink(url);
     return { action: 'deny' };
   });
   win.webContents.on('will-navigate', (event) => event.preventDefault());
 
-  // F12 — инструменты разработчика (пригодится, если что-то пойдёт не так).
   win.webContents.on('before-input-event', (_event, input) => {
     if (input.type === 'keyDown' && input.key === 'F12') win.webContents.toggleDevTools();
   });
 
-  win.on('focus', () => win.flashFrame(false)); // мигание «пришла ссылка» гасим, когда окно открыли
+  win.on('focus', () => win.flashFrame(false));
 
   win.on('closed', () => {
     win = null;
-    // Без главного окна экран бота не нужен, а открытым он не дал бы программе закрыться.
     if (viewerWin && !viewerWin.isDestroyed()) viewerWin.close();
   });
 }
 
-// ---------- «Экран бота»: отдельное окно с 3D-видом мира вокруг выбранного бота ----------
-// Сервер картинки живёт в процессе этого бота (рядом с ним), окно — здесь.
-
+// ---------- «Экран бота» ----------
 const viewerTitle = (id) => {
   const b = fleet && fleet.get(id);
   return b ? `Экран бота — ${b.nick}` : 'Экран бота';
 };
 
-/** Открывает окно экрана (или показывает уже открытое). true — окно есть. */
 function openViewer() {
   if (viewerWin && !viewerWin.isDestroyed()) {
     if (viewerWin.isMinimized()) viewerWin.restore();
@@ -536,30 +498,20 @@ function openViewer() {
     retargetViewer().catch((err) => uiLog('error', `Экран бота: ${errText(err)}`));
     return Promise.resolve(true);
   }
-  // Пока окно открывается, повторные нажатия ждут тот же результат, а не открывают второе.
   if (!viewerOpening) {
-    viewerOpening = createViewer().finally(() => {
-      viewerOpening = null;
-    });
+    viewerOpening = createViewer().finally(() => { viewerOpening = null; });
   }
   return viewerOpening;
 }
 
 async function createViewer() {
   const id = selectedBot;
-  if (!id) {
-    uiLog('warn', 'Экран бота: сначала выбери бота в списке');
-    return false;
-  }
+  if (!id) { uiLog('warn', 'Экран бота: сначала выбери бота в списке'); return false; }
   let client = null;
   try {
     client = await fleet.ensureClientOf(id);
-    // Первый запуск экрана готовит его скрипты — это может занять несколько секунд.
     const url = await client.request('viewer:open', { mode: config.viewerMode, bot: id }, { timeoutMs: 60 * 1000 });
-    if (quitting || !win) {
-      client.request('viewer:close').catch(() => {});
-      return false;
-    }
+    if (quitting || !win) { client.request('viewer:close').catch(() => {}); return false; }
     viewerTarget = { bot: id, client, url };
     createViewerWindow(id);
     return true;
@@ -570,7 +522,6 @@ async function createViewer() {
   }
 }
 
-/** Выбрали другого бота, а экран открыт — показать его (в том же процессе — сразу, в другом — новым адресом). */
 async function retargetViewer() {
   if (!viewerWin || viewerWin.isDestroyed() || !viewerTarget || !selectedBot || viewerTarget.bot === selectedBot) return;
   const id = selectedBot;
@@ -583,10 +534,7 @@ async function retargetViewer() {
     viewerTarget = null;
     old.request('viewer:close').catch(() => {});
     const url = await client.request('viewer:open', { mode: config.viewerMode, bot: id }, { timeoutMs: 60 * 1000 });
-    if (!viewerWin || viewerWin.isDestroyed()) {
-      client.request('viewer:close').catch(() => {});
-      return;
-    }
+    if (!viewerWin || viewerWin.isDestroyed()) { client.request('viewer:close').catch(() => {}); return; }
     viewerTarget = { bot: id, client, url };
     viewerWin.webContents.loadURL(url).catch(() => {});
   }
@@ -595,40 +543,24 @@ async function retargetViewer() {
 
 function createViewerWindow(id) {
   const w = new BrowserWindow({
-    width: 1000,
-    height: 640,
-    minWidth: 480,
-    minHeight: 320,
-    title: viewerTitle(id),
-    backgroundColor: '#1c1e22',
-    icon: ICON,
-    autoHideMenuBar: true,
-    show: true,
-    webPreferences: {
-      partition: VIEWER_PARTITION,
-      contextIsolation: true,
-      sandbox: true,
-      nodeIntegration: false,
-    },
+    width: 1000, height: 640, minWidth: 480, minHeight: 320,
+    title: viewerTitle(id), backgroundColor: '#1c1e22', icon: ICON, autoHideMenuBar: true, show: true,
+    webPreferences: { partition: VIEWER_PARTITION, contextIsolation: true, sandbox: true, nodeIntegration: false },
   });
   viewerWin = w;
   const wc = w.webContents;
 
-  // Новые окна не открываем; со страницы экрана никуда не уходим, перезагружать её можно.
   wc.setWindowOpenHandler(() => ({ action: 'deny' }));
   wc.on('will-navigate', (event, legacyUrl) => {
     const target = String((event && event.url) || legacyUrl || '');
     if (!viewerTarget || !target.startsWith(viewerTarget.url)) event.preventDefault();
   });
-  // Заголовок окна — с ником бота; страница экрана своё название не навязывает.
   w.on('page-title-updated', (event) => event.preventDefault());
 
-  // F12 — инструменты разработчика, F5 или Ctrl+R — перезагрузить картинку (code — при любой раскладке).
   wc.on('before-input-event', (event, input) => {
     if (input.type !== 'keyDown') return;
-    if (input.key === 'F12') {
-      wc.toggleDevTools();
-    } else if (input.key === 'F5' || (input.control && (input.code === 'KeyR' || input.key.toLowerCase() === 'r'))) {
+    if (input.key === 'F12') { wc.toggleDevTools(); }
+    else if (input.key === 'F5' || (input.control && (input.code === 'KeyR' || input.key.toLowerCase() === 'r'))) {
       event.preventDefault();
       if (!input.isAutoRepeat) wc.reload();
     }
@@ -642,28 +574,326 @@ function createViewerWindow(id) {
 
   w.on('closed', () => {
     if (viewerWin === w) viewerWin = null;
-    // Окно закрыли — сервер картинки тоже больше не нужен.
     const target = viewerTarget;
     viewerTarget = null;
     if (target && !quitting) target.client.request('viewer:close').catch(() => {});
   });
 
   wc.loadURL(viewerTarget.url).catch((err) => {
-    // ERR_ABORTED — загрузку прервали перезагрузка страницы или закрытие окна, это не ошибка.
     if (w.isDestroyed() || (err && err.code === 'ERR_ABORTED')) return;
     uiLog('error', `Не удалось открыть экран бота: ${errText(err)}`);
   });
 }
 
-// ---------- боты ----------
+// ---------- проверка «я не робот» ----------
+// Оставляем старые переменные и функции, чтобы не сломать UI и интерфейсы IPC,
+// но теперь для капчи используется CloakBrowser (отдельное окно).
+const captchaViews = new Map();
+let captchaActive = null;
+let captchaRect = null;
+const relays = new Map();
+const proxyKey = (p) => `${p.host}:${p.port}:${p.username || ''}`;
+const CAPTCHA_PASSED_MS = 1800;
 
+function relayFor(proxy) {
+  const key = proxyKey(proxy);
+  if (!relays.has(key)) {
+    const started = startRelay(proxy);
+    started.catch(() => relays.delete(key));
+    relays.set(key, started);
+  }
+  return relays.get(key);
+}
+
+function captchaState() {
+  return {
+    active: captchaActive,
+    items: [...captchaViews.entries()].map(([bot, c]) => ({
+      bot, nick: c.nick, proxy: c.proxy, status: c.status, error: c.error, since: c.since,
+    })),
+  };
+}
+
+function layoutCaptcha() {
+  for (const [bot, c] of captchaViews) {
+    const on = bot === captchaActive && captchaRect !== null && c.status === 'ready';
+    if (on) c.view.setBounds(captchaRect);
+    c.view.setVisible(on);
+  }
+}
+
+function syncCaptcha() {
+  if (captchaActive !== null && !captchaViews.has(captchaActive)) captchaActive = null;
+  if (captchaActive === null && captchaViews.size) captchaActive = [...captchaViews.keys()].pop();
+  layoutCaptcha();
+  send('captcha:state', captchaState());
+}
+
+function setCaptchaStatus(bot, status, error = null) {
+  const c = captchaViews.get(bot);
+  if (!c) return;
+  c.status = status;
+  c.error = error;
+  syncCaptcha();
+}
+
+const browserRuns = new Map();
+const CAPTCHA_PROFILES = 'captcha-private';
+
+function removeOldCaptchaProfiles() {
+  const old = path.join(app.getPath('userData'), 'captcha-browser');
+  if (!fs.existsSync(old)) return;
+  fs.promises.rm(old, { recursive: true, force: true })
+    .then(() => uiLog('info', 'Убрал старые профили браузера окна проверки'))
+    .catch(() => {});
+}
+
+function defaultBrowser() {
+  if (process.platform !== 'win32') return null;
+  const { execFileSync } = require('child_process');
+  const reg = (key, value) => {
+    try {
+      const out = execFileSync('reg', ['query', key, ...(value ? ['/v', value] : ['/ve'])], { encoding: 'utf8', windowsHide: true });
+      const m = out.match(/REG_(?:EXPAND_)?SZ\s+(.*)/);
+      return m ? m[1].trim() : null;
+    } catch (_) { return null; }
+  };
+  const progId = reg('HKCU\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\https\\UserChoice', 'ProgId');
+  const cmd = progId && reg(`HKCR\\${progId}\\shell\\open\\command`);
+  const m = cmd && cmd.match(/^"([^"]+)"|^(\S+)/);
+  const exe = m ? (m[1] || m[2]).replace(/%([^%]+)%/g, (all, v) => process.env[v] || all) : null;
+  if (!exe || !fs.existsSync(exe)) return null;
+  return { exe, kind: browserKind(exe), name: browserName(exe) };
+}
+
+async function openInBrowser({ bot, nick, url, proxy, via, browser }) {
+  const profile = path.join(app.getPath('userData'), CAPTCHA_PROFILES, `${browser.kind}-${String(bot).replace(/[^\w.-]/g, '_')}`);
+  fs.mkdirSync(profile, { recursive: true });
+  const relay = proxy ? await relayFor(proxy) : null;
+  if (browser.kind === 'firefox') fs.writeFileSync(path.join(profile, 'user.js'), firefoxPrefs(relay && relay.port), 'utf8');
+  const args = launchArgs({ kind: browser.kind, exe: browser.exe, profile, proxyPort: relay && relay.port, url });
+  const child = require('child_process').spawn(browser.exe, args, { detached: true, stdio: 'ignore' });
+  child.on('error', (err) => uiLog('error', `${nick}: ${browser.name} не запустился: ${errText(err)}`));
+  child.on('exit', () => { if (browserRuns.get(bot) === child) browserRuns.delete(bot); });
+  child.unref();
+  if (!browserRuns.has(bot)) browserRuns.set(bot, child);
+  uiLog('info', `${nick}: открыл проверку в браузере ${browser.name} — приватное окно, ${via}`);
+}
+
+function closeBrowser(bot) {
+  const child = browserRuns.get(bot);
+  if (!child) return;
+  browserRuns.delete(bot);
+  setTimeout(() => {
+    if (child.exitCode === null) require('child_process').execFile('taskkill', ['/PID', String(child.pid), '/T'], { windowsHide: true }, () => {});
+  }, 1500);
+}
+
+function getSeedFromString(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
+
+async function openCaptcha({ bot, nick, url }) {
+  if (quitting || !win || win.isDestroyed() || typeof url !== 'string' || !/^https?:\/\//i.test(url)) return;
+  const b = fleet && fleet.get(bot);
+  const proxy = b && b.proxy && b.proxy.host ? b.proxy : null;
+  const via = proxy ? `через прокси ${proxy.host}:${proxy.port}` : 'без прокси';
+  const name = nick || bot;
+
+  if (!proxy && config.proxyOnly === true) {
+    uiLog('error', `${name}: у бота нет прокси — страницу проверки с IP компьютера не открываю`);
+    return;
+  }
+
+  const browser = config.captchaExternal === true ? defaultBrowser() : null;
+  if (browser && !browser.kind) {
+    uiLog('warn', `${name}: браузеру по умолчанию панель не умеет задать прокси — открываю в CloakBrowser`);
+  } else if (browser) {
+    if (!win.isFocused()) win.flashFrame(true);
+    try {
+      await openInBrowser({ bot, nick: name, url, proxy, via, browser });
+    } catch (err) {
+      uiLog('error', `${name}: ошибка браузера ${browser.name}: ${errText(err)} — открываю в CloakBrowser`);
+    }
+    if (browserRuns.has(bot)) return;
+  }
+
+  // --- ИСПОЛЬЗОВАНИЕ CLOAKBROWSER ---
+  if (cloakRuns.has(bot)) {
+    uiLog('info', `${name}: проверка уже открыта в CloakBrowser`);
+    return;
+  }
+
+  if (quitting || !win || win.isDestroyed()) return;
+
+  uiLog('info', `${name}: запускаю CloakBrowser для прохождения проверки «я не робот»...`);
+  
+  // --- ИЗМЕНЕННЫЙ БЛОК: Используем локальный релей для прокси ---
+  let proxyUrl = null;
+  if (proxy) {
+    try {
+      const relay = await relayFor(proxy);
+      proxyUrl = `socks5://127.0.0.1:${relay.port}`;
+      uiLog('info', `${name}: запущен локальный релей для CloakBrowser на порту ${relay.port}`);
+    } catch (err) {
+      uiLog('error', `${name}: не удалось запустить релей для прокси: ${errText(err)}`);
+      return; 
+    }
+  }
+
+  try {
+    const cloakBrowser = await launch({
+      proxy: proxyUrl,
+      headless: false,
+      humanize: true,
+      geoip: true,
+    });
+
+    const page = await cloakBrowser.newPage();
+    cloakRuns.set(bot, { browser: cloakBrowser, page, startedAt: Date.now() });
+    
+    if (!win.isFocused()) win.flashFrame(true);
+    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    
+    uiLog('ok', `${name}: CloakBrowser открыт (${via}). Пройди проверку в открывшемся окне!`);
+
+    cloakBrowser.on('disconnected', () => {
+      cloakRuns.delete(bot);
+      uiLog('warn', `${name}: окно CloakBrowser закрыто пользователем`);
+    });
+  } catch (err) {
+    uiLog('error', `${name}: не удалось запустить CloakBrowser: ${errText(err)}`);
+  }
+}
+
+function captchaFailed(bot, code) {
+  const c = captchaViews.get(bot);
+  if (!c || c.status === 'passed') return;
+  const refused = c.proxy && /CONNECTION_(?:CLOSED|RESET|REFUSED)|(?:SOCKS|TUNNEL|PROXY)_CONNECTION_FAILED/.test(code);
+  const error = refused
+    ? { title: 'Соединение через прокси оборвалось', text: `Прокси ${c.proxy} не довёл до сайта проверки (${code}). Нажми «Обновить»; не поможет — проверь этот прокси.` }
+    : { title: 'Страница проверки не открылась', text: `${code}. Нажми «Обновить», чтобы попробовать ещё раз.` };
+  uiLog('error', `${c.nick}: ${refused ? `соединение с сайтом проверки через прокси ${c.proxy} оборвалось` : 'страница проверки не открылась'} (${code})`);
+  setCaptchaStatus(bot, 'failed', error);
+}
+
+function reloadCaptcha(bot) {
+  const c = captchaViews.get(bot);
+  if (!c || c.view.webContents.isDestroyed() || c.status === 'passed') return;
+  setCaptchaStatus(bot, 'loading');
+  c.view.webContents.loadURL(c.url).catch(() => {});
+}
+
+function removeCaptcha(bot) {
+  const c = captchaViews.get(bot);
+  if (!c) return;
+  captchaViews.delete(bot);
+  if (win && !win.isDestroyed()) win.contentView.removeChildView(c.view);
+  if (!c.view.webContents.isDestroyed()) c.view.webContents.close();
+  syncCaptcha();
+}
+
+function closeCaptcha(bot, passed = false) {
+  closeBrowser(bot);
+  const c = captchaViews.get(bot);
+  if (!c) return;
+  if (!passed) { removeCaptcha(bot); return; }
+  setCaptchaStatus(bot, 'passed');
+  setTimeout(() => { if (captchaViews.get(bot) === c) removeCaptcha(bot); }, CAPTCHA_PASSED_MS);
+}
+
+const captchaLinks = new Map();
+const ANTIBOT_RE = /^https?:\/\/(?:[\w-]+\.)*mineblaze\.(?:net|ru)\/antibot\b/i;
+
+function openLink(url) {
+  const known = captchaLinks.get(url);
+  if (known) {
+    openCaptcha(known).catch((err) => uiLog('error', `Окно проверки: ${errText(err)}`));
+    return;
+  }
+  if (ANTIBOT_RE.test(url)) {
+    uiLog('warn', 'Эта ссылка проверки уже не ждёт — с IP компьютера её не открываю');
+    return;
+  }
+  shell.openExternal(url);
+}
+
+async function selftestShot(name) {
+  const dir = process.env.MBP_SELFTEST_SHOT;
+  if (!dir || !win || win.isDestroyed()) return;
+  try { await selftestShotNow(dir, name); } catch (err) { console.error(`снимок ${name}: ${errText(err)}`); }
+}
+
+async function selftestShotNow(dir, name) {
+  fs.mkdirSync(dir, { recursive: true });
+  const c = captchaViews.get(captchaActive);
+  let overlay = false;
+  if (c && c.status === 'ready' && captchaRect && c.view.getVisible()) {
+    const page = await c.view.webContents.capturePage();
+    fs.writeFileSync(path.join(dir, `${name}-page.png`), page.toPNG());
+    const r = captchaRect;
+    await win.webContents.executeJavaScript(`new Promise((done) => { const i = new Image(); i.id = '__shot'; i.onload = done; i.onerror = done;
+      Object.assign(i.style, { position: 'fixed', left: '${r.x}px', top: '${r.y}px', width: '${r.width}px', height: '${r.height}px', borderRadius: '8px', zIndex: 99 });
+      i.src = ${JSON.stringify(page.toDataURL())}; document.body.appendChild(i); })
+      .then(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))))`);
+    await new Promise((r) => setTimeout(r, 150));
+    overlay = true;
+  }
+  const shot = await win.webContents.capturePage();
+  fs.writeFileSync(path.join(dir, `${name}.png`), shot.toPNG());
+  if (overlay) await win.webContents.executeJavaScript("document.getElementById('__shot').remove()").catch(() => {});
+}
+
+async function selftestFakeShots(first, c) {
+  if (!process.env.MBP_SELFTEST_SHOT) return;
+  const now = Date.now();
+  const others = (activeStatus, error = null) => ({
+    active: 'shot-a',
+    items: [
+      { bot: 'shot-a', nick: 'kakajamba7', proxy: '193.32.152.95:9756', status: activeStatus, error, since: now - 4000 },
+      { bot: first, nick: c.nick, proxy: c.proxy, status: 'ready', error: null, since: now - 14000 },
+      { bot: 'shot-b', nick: 'kakajamba9', proxy: '45.89.73.75:9175', status: 'passed', error: null, since: now - 30000 },
+    ],
+  });
+  const prevActive = captchaActive;
+  captchaActive = 'shot-a';
+  layoutCaptcha();
+  send('captcha:state', others('loading'));
+  await new Promise((r) => setTimeout(r, 400));
+  await selftestShot('captcha-loading');
+  send('captcha:state', others('failed', { title: 'Соединение через прокси оборвалось', text: 'Прокси 193.32.152.95:9756 не довёл до сайта проверки (ERR_CONNECTION_CLOSED).' }));
+  await new Promise((r) => setTimeout(r, 400));
+  await selftestShot('captcha-failed');
+  captchaActive = prevActive;
+  syncCaptcha();
+  await new Promise((r) => setTimeout(r, 300));
+}
+
+function closeRelays() {
+  for (const started of relays.values()) started.then((r) => r.close()).catch(() => {});
+  relays.clear();
+}
+
+function closeCloakBrowsers() {
+  for (const run of cloakRuns.values()) {
+    if (run.browser && run.browser.isConnected()) run.browser.close().catch(() => {});
+  }
+  cloakRuns.clear();
+}
+
+// ---------- боты ----------
 function createFleet() {
   const f = new Fleet({
     config,
     fork: (index) => utilityProcess.fork(path.join(__dirname, 'bot-process.js'), [], { serviceName: `MineBlaze Bots ${index + 1}`, stdio: 'pipe' }),
     initPayload: () => ({
       authCacheDir: path.join(app.getPath('userData'), 'auth-cache'),
-      journalDir: path.join(logsDir, 'packets'), // журнал пакетов при кике и возврате в лобби
+      journalDir: path.join(logsDir, 'packets'),
     }),
   });
   f.on('log', (entry) => {
@@ -675,55 +905,63 @@ function createFleet() {
     if (!list) chatHistory.set(msg.bot, (list = []));
     list.push(msg);
     if (list.length > CHAT_HISTORY) list.splice(0, list.length - CHAT_HISTORY);
-    if (msg.bot === selectedBot) send('bot:chat', msg); // в панели — чат выбранного бота
+    if (msg.bot === selectedBot) send('bot:chat', msg);
     logChat(msg);
   });
   f.on('state', (s) => {
     send('bot:state', s);
-    if (s && s.state !== 'online' && s.state !== 'connected') fishBoard.offline(s.bot); // вышел — рыбалка кончилась
+    if (s && s.state !== 'online' && s.state !== 'connected') fishBoard.offline(s.bot);
   });
-  f.on('fishing', (p) => fishBoard.update(p)); // #рыбалка: что делает, сколько поймал — вкладке «Авто фиш»
-  f.on('ping', (p) => send('bot:ping', p)); // пинг бота, как его считает сервер (Tab)
+  f.on('fishing', (p) => fishBoard.update(p));
+  f.on('balance', (p) => fishBoard.setBalance(p));
+  f.on('ping', (p) => send('bot:ping', p));
   f.on('summary', (s) => send('fleet:summary', s));
   f.on('list', (bots) => {
     for (const id of [...chatHistory.keys()]) if (!f.get(id)) chatHistory.delete(id);
-    fishBoard.retain(bots.map((b) => b.bot)); // убранных из списка — и из «Авто фиш»
+    fishBoard.retain(bots.map((b) => b.bot));
     selectBot(selectedBot);
     send('fleet:list', { bots, selected: selectedBot });
   });
-  // Сервер прислал ссылку (например, проверку «я не робот»): мигаем окном на панели задач,
-  // чтобы успеть перейти по ней, пока сервер ждёт.
   f.on('link', () => {
     if (win && !win.isDestroyed() && !win.isFocused()) win.flashFrame(true);
   });
+  f.on('captcha', (c) => {
+    if (c && c.url) captchaLinks.set(c.url, { bot: c.bot, nick: c.nick, url: c.url });
+    openCaptcha(c || {}).catch((err) => uiLog('error', `Окно проверки: ${errText(err)}`));
+  });
+  f.on('captcha-done', (c) => {
+    for (const [url, link] of captchaLinks) if (c && link.bot === c.bot) captchaLinks.delete(url);
+    
+    // Закрываем CloakBrowser, если он был запущен
+    if (c && c.bot && cloakRuns.has(c.bot)) {
+      const run = cloakRuns.get(c.bot);
+      cloakRuns.delete(c.bot);
+      if (run.browser && run.browser.isConnected()) run.browser.close().catch(() => {});
+    }
+
+    closeCaptcha(c && c.bot, Boolean(c && c.passed));
+  });
   f.on('msa', (data) => {
     if (!data) return;
-    // Код сразу в буфер обмена, страница входа Microsoft открывается сама.
     if (typeof data.user_code === 'string') {
       try {
         clipboard.writeText(data.user_code);
-        uiLog('info', `${data.nick ? `${data.nick}: ` : ''}код скопирован в буфер обмена — вставь его на открывшейся странице (Ctrl+V)`);
-      } catch (_) {
-        /* не страшно: код и так виден в консоли */
-      }
+        uiLog('info', `${data.nick ? `${data.nick}: ` : ''}код скопирован в буфер обмена`);
+      } catch (_) {}
     }
     if (typeof data.verification_uri === 'string' && data.verification_uri.startsWith('https://')) {
       shell.openExternal(data.verification_uri);
     }
   });
-  // Режим переключают в самом окне экрана — запоминаем его до следующего раза.
   f.on('viewer-mode', (mode) => {
     Object.assign(config, sanitize({ viewerMode: mode }));
     saveConfig();
   });
-  // Рентген (список блоков, цвета, радиус) меняют в меню окна экрана — запоминаем и раздаём всем процессам.
   f.on('viewer-xray', (settings) => {
     Object.assign(config, sanitize({ xray: settings }));
     saveConfig();
   });
-  // То, что процессы ботов печатают сами (предупреждения mineflayer и т.п.), — в отдельный лог.
   f.on('output', ({ worker, stream, line }) => appendLog('process', Date.now(), `#${worker + 1} ${stream === 'stderr' ? 'ERR ' : ''}${line}`));
-  // Упал процесс, где был бот экрана, — окно экрана закрываем (после перезапуска можно открыть снова).
   f.on('crash', () => {
     if (viewerTarget && !viewerTarget.client.child && viewerWin && !viewerWin.isDestroyed()) viewerWin.close();
   });
@@ -731,11 +969,6 @@ function createFleet() {
 }
 
 // ---------- ИИ-помощник ----------
-
-/**
- * Чем запустить Ollama (значок у часов): её программа или ярлыки, которые ставит установщик.
- * Пусто — Ollama не установлена.
- */
 function ollamaLaunchers() {
   if (process.platform !== 'win32') return [];
   const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
@@ -747,15 +980,10 @@ function ollamaLaunchers() {
     path.join(programs, 'Ollama', 'Ollama.lnk'),
     path.join(programs, 'Startup', 'Ollama.lnk'),
   ].filter((p) => {
-    try {
-      return fs.existsSync(p);
-    } catch (_) {
-      return false;
-    }
+    try { return fs.existsSync(p); } catch (_) { return false; }
   });
 }
 
-/** Ollama не запущена — запустить её, как из меню «Пуск». true — нашли и запустили. */
 async function startOllama() {
   for (const target of ollamaLaunchers()) {
     if ((await shell.openPath(target)) === '') return true;
@@ -766,33 +994,22 @@ async function startOllama() {
 function createAi() {
   const agent = new AiAgent({
     getConfig: () => config,
-    // Сеть Chromium, а не fetch из Node: прокси и сертификаты Windows (антивирус с проверкой HTTPS иначе мешает).
     fetch: (url, opts) => net.fetch(url, opts),
     env: {
-      // Боты, у которых есть задачи (src/tasks.js), автопилот не трогает: ботам — одно дело за раз.
       listBots: () => fleet.list().filter((b) => !tasks || !tasks.hasWork(b.bot)),
-      // Ответы ботов уходят сервису ИИ — пароли из них (если вдруг попали) прячем.
-      runCommand: async (ids, line, signal) => (await fleet.commandEach(ids, line, { signal }))
-        .map((r) => ({ ...r, message: r.message.map(hideSecrets) })),
+      runCommand: async (ids, line, signal) => (await fleet.commandEach(ids, line, { signal })).map((r) => ({ ...r, message: r.message.map(hideSecrets) })),
       startBots: async (ids) => {
         const problem = validate(config);
         if (problem) throw new Error(problem);
         return fleet.start(ids);
       },
-      catalog: () => require('./bot/commands').catalog(), // список команд ботов — тот же, что #помощь
+      catalog: () => require('./bot/commands').catalog(),
       startOllama,
       ollamaInstalled: () => ollamaLaunchers().length > 0,
-      // Ollama падает на видеокарте — дальше только процессор (галочка «Видеокарта» в настройках ИИ вернёт).
-      disableGpu: () => {
-        config.ollamaGpu = false;
-        saveConfig();
-      },
+      disableGpu: () => { config.ollamaGpu = false; saveConfig(); },
     },
   });
-  agent.on('action', ({ text }) => {
-    aiLog('info', text);
-    send('ai:progress', { text: hideSecrets(text) });
-  });
+  agent.on('action', ({ text }) => { aiLog('info', text); send('ai:progress', { text: hideSecrets(text) }); });
   agent.on('progress', ({ text }) => send('ai:progress', { text: hideSecrets(text) }));
   agent.on('thought', ({ text }) => aiLog('info', `«${text}»`));
   agent.on('done', ({ text, partial, requests, provider, ms }) => {
@@ -809,17 +1026,14 @@ function createAi() {
   return agent;
 }
 
-// ---------- автопилот заданий NPC ----------
-
+// ---------- автопилот заданий ----------
 function createAutopilot() {
-  const file = path.join(app.getPath('userData'), 'quests-state.json'); // кто у какого NPC на каком уровне
+  const file = path.join(app.getPath('userData'), 'quests-state.json');
   const ap = new QuestAutopilot({
     getConfig: () => config,
     env: {
-      // Боты, которые рыбачат («Авто фиш»), автопилот не трогает: ботам — одно дело за раз.
       listBots: () => fleet.list().filter((b) => !fishBoard.isActive(b.bot)),
       runCommand: (bot, line, { signal, quiet } = {}) => fleet.commandOne(bot, line, { signal, quiet }),
-      // Ботам — одно дело за раз: пока работает ИИ или идёт «по очереди», автопилот их не трогает.
       busy: () => (ai && ai.busy ? 'ИИ выполняет задание' : fleet && fleet.turnRunning ? 'идёт «по очереди»' : ''),
       autoReconnect: () => Boolean(config.autoReconnect),
     },
@@ -829,23 +1043,18 @@ function createAutopilot() {
     },
   });
   ap.on('log', questLog);
-  let pending = null; // в панель — не чаще раза в 0,3 с
+  let pending = null;
   ap.on('status', () => {
     if (pending) return;
-    pending = setTimeout(() => {
-      pending = null;
-      send('quests:status', ap.status());
-    }, 300);
+    pending = setTimeout(() => { pending = null; send('quests:status', ap.status()); }, 300);
   });
-  // Бот вошёл или вышел — автопилот посмотрит, кому пора, и обновит сводку.
   fleet.on('summary', () => ap.refresh());
   return ap;
 }
 
-// ---------- задачи ботам ----------
-
+// ---------- задачи ----------
 function createTasks() {
-  const file = path.join(app.getPath('userData'), 'tasks.json'); // очередь задач каждого бота: где остановились
+  const file = path.join(app.getPath('userData'), 'tasks.json');
   const board = new TaskBoard({
     fleet,
     store: {
@@ -854,18 +1063,14 @@ function createTasks() {
     },
   });
   board.on('log', taskLog);
-  let pending = null; // в панель — не чаще раза в 0,3 с
+  let pending = null;
   board.on('update', () => {
     if (pending) return;
-    pending = setTimeout(() => {
-      pending = null;
-      send('tasks:update', board.list());
-    }, 300);
+    pending = setTimeout(() => { pending = null; send('tasks:update', board.list()); }, 300);
   });
   return board;
 }
 
-/** Строка задач: в консоль (с меткой «Задача», у бота — как его строки) и в лог. */
 function taskLog({ level, text, bot, nick }) {
   const entry = { bot: bot || null, nick: nick || null, source: 'tasks', time: Date.now(), level, text: hideSecrets(text) };
   send('bot:log', entry);
@@ -880,8 +1085,6 @@ function startApp() {
   process.on('uncaughtException', reportFatal);
   process.on('unhandledRejection', reportFatal);
 
-  // Второй запуск программы просто показывает уже открытое окно:
-  // два бота с одним ником выкидывали бы друг друга с сервера.
   app.on('second-instance', () => {
     if (!win) return;
     if (win.isMinimized()) win.restore();
@@ -898,12 +1101,19 @@ function startApp() {
     ai = createAi();
     autopilot = createAutopilot();
     tasks = createTasks();
-    syncFleet(); // процессы ботов запускаются, когда нужны (по «Старт» или для экрана бота)
-    tasks.start(); // задачи из файла продолжатся, когда их боты войдут
+    syncFleet();
     selectBot(null);
-    if (config.questAuto) autopilot.start(); // был включён — продолжает (ждёт ботов в сети)
+    removeOldCaptchaProfiles();
+    if (TRIAL_BOTS) {
+      const ids = fleet.list().slice(0, TRIAL_BOTS).map((b) => b.bot);
+      uiLog('info', `Пробный запуск: входят ${ids.length} ботов, через ${TRIAL_SEC} с панель закроется`);
+      fleet.start(ids).catch((err) => uiLog('error', `Пробный запуск: ${errText(err)}`));
+      setTimeout(() => app.quit(), TRIAL_SEC * 1000);
+    } else {
+      tasks.start();
+      if (config.questAuto) autopilot.start();
+    }
 
-    // Странице экрана бота не нужны камера, уведомления и прочие разрешения.
     session.fromPartition(VIEWER_PARTITION).setPermissionRequestHandler((_wc, permission, callback) => {
       callback(permission === 'fullscreen' || permission === 'pointerLock');
     });
@@ -913,7 +1123,6 @@ function startApp() {
     createWindow();
   });
 
-  // Перед выходом даём ботам выйти с сервера (не дольше нескольких секунд).
   app.on('before-quit', (event) => {
     if (shutdownDone) return;
     event.preventDefault();
@@ -921,10 +1130,12 @@ function startApp() {
     quitting = true;
     if (ai) ai.stop();
     if (autopilot) autopilot.stop().catch(() => {});
-    if (tasks) tasks.stop(); // список задач — в файл; продолжатся при следующем запуске
+    if (tasks) tasks.stop();
     Promise.resolve(fleet && fleet.shutdown())
       .catch(() => {})
       .finally(() => {
+        closeCloakBrowsers();
+        closeRelays();
         closeLogs();
         shutdownDone = true;
         app.quit();
@@ -936,14 +1147,9 @@ function startApp() {
 
 function runSelftest() {
   const finish = (result, code) => {
-    try {
-      fs.writeFileSync(SELFTEST_OUT, JSON.stringify(result, null, 2), 'utf8');
-    } catch (_) {
-      /* некуда записать — останется код выхода */
-    }
+    try { fs.writeFileSync(SELFTEST_OUT, JSON.stringify(result, null, 2), 'utf8'); } catch (_) {}
     app.exit(code);
   };
-  // MBP_SELFTEST_BOTS=N — на сервер заходят N ботов (StandBot1…N) через флот, как «Старт всех» в панели.
   const count = Math.max(1, Math.min(200, parseInt(process.env.MBP_SELFTEST_BOTS, 10) || 1));
   const interval = Math.max(1, Math.min(120, parseInt(process.env.MBP_SELFTEST_INTERVAL, 10) || 1));
   const stay = Math.max(5, Number(process.env.MBP_SELFTEST_STAY) || 30);
@@ -954,10 +1160,13 @@ function runSelftest() {
     const nick = process.env.MBP_SELFTEST_NICK || 'StandBot';
     const nicks = count === 1 ? [nick] : Array.from({ length: count }, (_, i) => `${nick}${i + 1}`);
     Object.assign(config, { accounts: nicks.join('\n'), username: nicks[0], startInterval: interval });
+    if (process.env.MBP_SELFTEST_PROXY) Object.assign(config, { proxyPool: process.env.MBP_SELFTEST_PROXY, botsPerProxy: 100 });
+    config.proxyOnly = Boolean(process.env.MBP_SELFTEST_PROXY);
+    config.captchaExternal = Boolean(process.env.MBP_SELFTEST_BROWSER);
     fleet = createFleet();
     ai = createAi();
-    autopilot = createAutopilot(); // не включается: самопроверке хватит панели и сводки
-    tasks = createTasks(); // папка настроек самопроверки — временная: задач в ней нет
+    autopilot = createAutopilot();
+    tasks = createTasks();
     tasks.start();
     syncFleet();
     selectBot(null);
@@ -965,11 +1174,14 @@ function runSelftest() {
       const client = await fleet.ensureClientOf(nicks[0]);
       const pong = await client.request('ping');
       const details = await client.request('selftest', {}, { timeoutMs: 60 * 1000 });
-      // ИИ-помощник: список команд ботов грузится в главном процессе (в exe — из app.asar), подсказка модели собирается.
       const aiPrompt = require('./ai').systemPrompt(require('./bot/commands').catalog());
       const aiCheck = { promptChars: aiPrompt.length, ok: aiPrompt.length > 1000 && aiPrompt.includes('#квесты') };
       registerIpc();
       createWindow({ show: false });
+      if (process.env.MBP_SELFTEST_SHOT) {
+        win.setPosition(-32000, -32000);
+        win.showInactive();
+      }
       const ui = await checkUi(nicks.length);
       const server = process.env.MBP_SELFTEST_SERVER ? await selftestOnServer(process.env.MBP_SELFTEST_SERVER, nicks, stay * 1000) : null;
       await fleet.shutdown();
@@ -980,10 +1192,6 @@ function runSelftest() {
   });
 }
 
-/**
- * Окно панели (скрытое) грузится без ошибок: видит всех ботов, выбор бота, фильтр консоли и «всем» работают.
- * Ошибки страницы — из её консоли (так видны и необработанные исключения).
- */
 async function checkUi(expected) {
   const errors = [];
   const wc = win.webContents;
@@ -999,36 +1207,36 @@ async function checkUi(expected) {
     for (let i = 0; i < 50 && document.querySelectorAll('.bot').length < ${Number(expected)}; i += 1) await sleep(100);
     const chips = [...document.querySelectorAll('.bot')];
     const out = { bots: chips.length, status: document.getElementById('statusText').textContent };
-    if (chips.length > 1) {
-      chips[1].click();
-      for (let i = 0; i < 20 && !chips[1].classList.contains('is-selected'); i += 1) await sleep(50);
-    }
+    if (chips.length > 1) { chips[1].click(); for (let i = 0; i < 20 && !chips[1].classList.contains('is-selected'); i += 1) await sleep(50); }
     out.selected = (document.querySelector('.bot.is-selected') || {}).textContent || null;
     out.chatWho = document.getElementById('chatWho').textContent;
     const only = document.getElementById('onlySelected');
-    only.checked = true;
-    only.dispatchEvent(new Event('change'));
+    only.checked = true; only.dispatchEvent(new Event('change'));
     const mode = document.getElementById('sendMode');
-    mode.value = 'turn';
-    mode.dispatchEvent(new Event('change'));
+    mode.value = 'turn'; mode.dispatchEvent(new Event('change'));
     out.placeholder = document.getElementById('chatInput').placeholder;
     out.ai = Boolean(document.getElementById('aiRun') && document.getElementById('aiProvider').value === 'ollama' && document.getElementById('ollamaModel').value);
     for (let i = 0; i < 20 && !document.getElementById('questStatus').textContent; i += 1) await sleep(50);
     out.quests = document.getElementById('questStatus').textContent;
-    // Вкладка «Авто фиш»: открывается, там дом склада и кнопки; «Управление» на это время скрыто; назад — как было.
     document.getElementById('tabFish').click();
-    out.fishTab = !document.getElementById('pageFish').hidden && document.getElementById('pageMain').hidden &&
-      Boolean(document.getElementById('fishStart')) && document.getElementById('fishStop').disabled;
+    out.fishTab = !document.getElementById('pageFish').hidden && document.getElementById('pageMain').hidden && Boolean(document.getElementById('fishStart')) && document.getElementById('fishStop').disabled;
+    const payNow = document.getElementById('payNow');
+    out.pay = Boolean(payNow) && document.getElementById('payEvery').value === '10' && !document.getElementById('payTo').value;
+    if (payNow) {
+      payNow.click();
+      for (let i = 0; i < 40 && !/ник/.test(document.getElementById('payStatus').textContent); i += 1) await sleep(50);
+      out.payNote = document.getElementById('payStatus').textContent;
+      out.pay = out.pay && /^Не переведено: .*ник/.test(out.payNote);
+    }
     document.getElementById('tabMain').click();
     out.fishTab = out.fishTab && document.getElementById('pageFish').hidden && !document.getElementById('pageMain').hidden;
     return out;
   })()`, true);
   const wantSelected = fleet.order.length > 1 ? fleet.get(fleet.order[1]).nick : fleet.order.length ? fleet.get(fleet.order[0]).nick : null;
-  const ok = errors.length === 0 && result.bots === expected && result.selected === wantSelected && result.ai && /^Выключен/.test(result.quests) && result.fishTab;
+  const ok = errors.length === 0 && result.bots === expected && result.selected === wantSelected && result.ai && /^Выключен/.test(result.quests) && result.fishTab && result.pay;
   return { ok, ...result, errors };
 }
 
-/** Память и процессор процессов ботов (Electron считает их сам): сколько уходит на бота. */
 function processMetrics() {
   const mb = (kb) => Math.round((kb || 0) / 1024);
   const all = app.getAppMetrics();
@@ -1040,36 +1248,72 @@ function processMetrics() {
   };
 }
 
-/** Боты заходят на сервер (по очереди, как в панели) и стоят там: консоль, состояния, что отправлял первый, память. */
 async function selftestOnServer(address, nicks, stayMs) {
   const [host, port] = String(address).split(':');
   const ids = nicks.map((n) => n.toLowerCase());
   const first = ids[0];
   const states = [];
   const logs = [];
-  fleet.on('state', (s) => {
-    if (s.bot === first) states.push(s.state);
-  });
+  fleet.on('state', (s) => { if (s.bot === first) states.push(s.state); });
   fleet.on('log', (e) => logs.push(`${e.level}: ${e.nick && ids.length > 1 ? `[${e.nick}] ` : ''}${e.text}`));
   Object.assign(config, {
-    host,
-    port: Number(port) || 25565,
-    accounts: nicks.join('\n'),
-    username: nicks[0],
-    version: process.env.MBP_SELFTEST_VERSION || DEFAULT_CONFIG.version,
-    auth: 'offline',
-    autoReconnect: false,
+    host, port: Number(port) || 25565, accounts: nicks.join('\n'), username: nicks[0],
+    version: process.env.MBP_SELFTEST_VERSION || DEFAULT_CONFIG.version, auth: 'offline', autoReconnect: false,
   });
   syncFleet();
   const stateOf = (id) => (fleet.get(id) ? fleet.get(id).state : 'offline');
   const onlineCount = () => ids.filter((id) => stateOf(id) === 'online').length;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let linkAt = null;
+  fleet.on('captcha', () => { if (linkAt === null) linkAt = Date.now(); });
   await fleet.start(ids);
-  // Ждём, пока войдут все (или каждый либо вошёл, либо окончательно не смог).
   const deadline = Date.now() + (ids.length * (config.startInterval || 1) + 60) * 1000;
   while (Date.now() < deadline && !ids.every((id) => ['online', 'offline'].includes(stateOf(id)))) await sleep(250);
   const joined = onlineCount();
-  processMetrics(); // отсчёт процессора — с этого момента
+  processMetrics();
+  let captcha = null;
+  if (joined && process.env.MBP_SELFTEST_CAPTCHA) {
+    captcha = { opened: false, closed: false };
+    const until = Date.now() + 30000;
+    let c = null;
+    if (config.captchaExternal) {
+      while (Date.now() < until && !browserRuns.has(first)) await sleep(50);
+      if (browserRuns.has(first)) {
+        Object.assign(captcha, { opened: true, browser: true, openMs: linkAt === null ? null : Date.now() - linkAt, title: (defaultBrowser() || {}).name });
+        await sleep(15000);
+      }
+    }
+    while (!config.captchaExternal && Date.now() < until && !(c = captchaViews.get(first))) await sleep(50);
+    if (c) {
+      const wc = c.view.webContents;
+      captcha.opened = true;
+      captcha.openMs = linkAt === null ? null : Date.now() - linkAt;
+      captcha.title = `${c.nick} (${c.via})`;
+      if (wc.isLoading()) await new Promise((resolve) => wc.once('did-stop-loading', resolve));
+      captcha.loadMs = linkAt === null ? null : Date.now() - linkAt;
+      captcha.inPanel = win.contentView.children.includes(c.view);
+      captcha.rect = captchaRect;
+      captcha.panelSays = await win.webContents.executeJavaScript("(() => { const b = document.getElementById('captchaBox'); return b && !b.hidden ? b.querySelector('.captcha-tabs').textContent.trim() : null; })()").catch(() => null);
+      for (let t = 0; t < 5000 && c.status === 'loading'; t += 50) await sleep(50);
+      captcha.shownAfterLoad = c.status === 'ready' && c.view.getVisible();
+      await sleep(500);
+      await selftestShot('captcha-ready');
+      await selftestFakeShots(first, c);
+      if (!wc.isDestroyed()) await wc.executeJavaScript("document.getElementById('yes') && document.getElementById('yes').click()").catch(() => {});
+      const end = Date.now() + 20000;
+      while (Date.now() < end && captchaViews.get(first) === c && c.status !== 'passed') await sleep(50);
+      captcha.passedShown = c.status === 'passed';
+      if (captcha.passedShown) { await sleep(600); await selftestShot('captcha-passed'); }
+      while (Date.now() < end && captchaViews.get(first) === c) await sleep(100);
+      captcha.closed = captchaViews.get(first) !== c;
+    } else if (cloakRuns.has(first)) {
+      captcha.opened = true;
+      captcha.browser = 'CloakBrowser';
+      captcha.openMs = linkAt === null ? null : Date.now() - linkAt;
+      await sleep(15000);
+      captcha.closed = !cloakRuns.has(first); // Проверяем, закрылось ли окно
+    }
+  }
   if (joined) await sleep(stayMs);
   const stayed = onlineCount();
   const metrics = processMetrics();
@@ -1078,14 +1322,7 @@ async function selftestOnServer(address, nicks, stayMs) {
   await fleet.stop(ids);
   await sleep(1500);
   return {
-    online: joined === ids.length && stayed === ids.length,
-    bots: ids.length,
-    joined,
-    stayed,
-    stayMs,
-    states,
-    logs,
-    stats,
+    online: joined === ids.length && stayed === ids.length, bots: ids.length, joined, stayed, stayMs, states, logs, stats, captcha,
     memory: { ...metrics, perBotMB: stayed ? Math.round(metrics.botsMB / stayed) : null },
   };
 }

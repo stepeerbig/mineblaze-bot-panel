@@ -51,6 +51,70 @@ const LOOT_NAMES = {
 };
 const lootName = (name) => LOOT_NAMES[name] || name;
 
+// ---------- удочки: сколько прочности осталось ----------
+
+// Удочка, у которой прочности осталось 3 и меньше (у любой: и у обычной на 64, и у особой с сервера), — «изношенная»:
+// ею не ловят, а кладут в сундук склада (сохранить: починить и зачаровать её потом можно, а сломанную — нет). Улов
+// стоит удочке 1 прочности. Ловят целыми, самыми целыми — первыми. (Сначала порог был 30 из 64 — удочки уходили в
+// сундук почти на половине прочности; 12.11 попросили 3 единицы.)
+const ROD_SAVE_LEFT = 3;
+const ROD_MAX = 64;
+
+/** Данные компонента предмета 1.21 (damage, max_damage, unbreakable): prismarine-item или простой объект тестов. */
+function componentData(item, type) {
+  if (item.componentMap && typeof item.componentMap.get === 'function' && item.componentMap.has(type)) {
+    return item.componentMap.get(type).data;
+  }
+  if (Array.isArray(item.components)) {
+    const c = item.components.find((x) => x && x.type === type);
+    if (c) return c.data === undefined ? true : c.data;
+  }
+  return undefined;
+}
+
+/** Полная прочность удочки (у обычной — 64; у особой с сервера — своя, компонентом max_damage). */
+function rodMax(item) {
+  return (item && (Number(componentData(item, 'max_damage')) || item.maxDurability)) || ROD_MAX;
+}
+
+/** Сколько прочности осталось у удочки (неразрушимая — бесконечно). */
+function rodLeft(item) {
+  if (!item) return 0;
+  if (componentData(item, 'unbreakable') !== undefined) return Infinity;
+  const max = rodMax(item);
+  let used = componentData(item, 'damage');
+  if (used === undefined) {
+    try {
+      used = item.durabilityUsed;
+    } catch (_) {
+      used = undefined;
+    }
+  }
+  if (used === undefined || used === null) used = item.damage || 0;
+  return Math.max(0, max - (Number(used) || 0));
+}
+
+/** Удочки бота (инвентарь, быстрая панель и вторая рука): [{ item, slot, left }], самые целые — первыми. */
+function botRods(bot) {
+  const slots = bot.inventory && bot.inventory.slots ? bot.inventory.slots : [];
+  const out = [];
+  for (let i = 9; i <= 45; i += 1) {
+    const it = slots[i];
+    if (it && it.name === 'fishing_rod') out.push({ item: it, slot: i, left: rodLeft(it) });
+  }
+  return out.sort((a, b) => b.left - a.left);
+}
+
+/** Удочка износилась: прочности осталось 3 и меньше (неразрушимая не изнашивается). */
+function rodWorn(item) {
+  if (!item) return false;
+  const left = rodLeft(item);
+  return Number.isFinite(left) && left <= ROD_SAVE_LEFT;
+}
+
+const usableRods = (bot) => botRods(bot).filter((r) => !rodWorn(r.item));
+const wornRods = (bot) => botRods(bot).filter((r) => rodWorn(r.item));
+
 const blockProps = (block) => {
   try {
     return typeof block.getProperties === 'function' ? block.getProperties() || {} : {};
@@ -258,30 +322,44 @@ function openness(cell, p) {
 const DEG = Math.PI / 180;
 // Наклоны заброса (градусы, вверх — плюс): сначала обычные — чуть вверх, как закидывает человек.
 const PITCHES = [12, 5, 20, -5, 28, -14, 36, -24, -34, 45];
-// Улов летит от поплавка прямо к рыбаку; игрок ближе стольких блоков к этому пути подберёт его сам (подбирают в
-// 1,3 блока от середины игрока). На стенде 10 ботов у одного пруда: кто забрасывал наискосок вдоль берега —
-// отдавал улов соседу.
-const STEAL_RANGE = 1.7;
+// Улов летит от поплавка прямо к рыбаку (недолетел — скользит по воде туда же); игрок ближе стольких блоков к этому
+// пути подберёт его сам (подбирают в 1,3 блока от середины игрока, а поплавок за время клёва сносит). Последний
+// блок пути у самого бота не в счёт: там улов уже его. Стенд 12.11: 10 ботов у одного пруда; кто забрасывал
+// наискосок вдоль берега (путь улова — в 1,8 блока от соседа), отдавал улов соседу; поперёк берега — нет.
+const STEAL_RANGE = 2.2;
+const STEAL_KEEP_END = 1;
+const YAW_STEP = 5; // направления заброса — через столько градусов (есть и ровно поперёк берега: 0°, 45°, 90°…)
+
+/** Как близко к игроку o пройдёт улов на пути от места падения поплавка at к глазам eye (без последнего блока). */
+function returnClearance(o, at, eye) {
+  const dx = eye.x - at.x;
+  const dz = eye.z - at.z;
+  const len = Math.hypot(dx, dz);
+  if (len <= STEAL_KEEP_END) return Infinity;
+  const k = (len - STEAL_KEEP_END) / len;
+  return segmentDistance(o, at, { x: at.x + dx * k, z: at.z + dz * k });
+}
 
 /**
  * Лучший заброс с места: глаза eye, вода — в waters (клетки воды у поверхности). Направления — на воду
- * в 2…12 блоках, наклоны — PITCHES; поплавок должен упасть в воду не ближе 2 блоков, и вокруг — вода.
+ * в 2…12 блоках, наклоны — PITCHES; поплавок должен упасть в воду не ближе 2 блоков, и вокруг — вода; улов полетит
+ * обратно не мимо другого игрока (чем дальше от них, тем лучше).
  * → { yaw, pitch, landing: Vec3, dist, open, score } или null.
  */
 function planCast(cell, eye, waters, { others = [], minDist = 2 } = {}) {
-  const buckets = new Map(); // направление (по 8°) → сколько воды в нём
+  const buckets = new Map(); // направление (по YAW_STEP°) → сколько воды в нём
   for (const w of waters) {
     const dx = w.x + 0.5 - eye.x;
     const dz = w.z + 0.5 - eye.z;
     const d = Math.hypot(dx, dz);
     if (d < minDist || d > 12) continue;
     const yaw = Math.atan2(-dx, -dz); // как в mineflayer
-    const b = Math.round(yaw / (8 * DEG));
-    const e = buckets.get(b) || { yaw: b * 8 * DEG, n: 0 };
+    const b = Math.round(yaw / (YAW_STEP * DEG));
+    const e = buckets.get(b) || { yaw: b * YAW_STEP * DEG, n: 0 };
     e.n += 1;
     buckets.set(b, e);
   }
-  const yaws = [...buckets.values()].sort((a, b) => b.n - a.n).slice(0, 10);
+  const yaws = [...buckets.values()].sort((a, b) => b.n - a.n).slice(0, 14);
   let best = null;
   for (const { yaw, n } of yaws) {
     for (const deg of PITCHES) {
@@ -291,11 +369,13 @@ function planCast(cell, eye, waters, { others = [], minDist = 2 } = {}) {
       const dist = Math.hypot(r.at.x - eye.x, r.at.z - eye.z);
       if (dist < minDist) continue;
       // Улов полетит обратно мимо другого игрока — достанется ему.
-      if (others.some((o) => segmentDistance(o, r.at, eye) < STEAL_RANGE)) continue;
+      const clear = others.reduce((m, o) => Math.min(m, returnClearance(o, r.at, eye)), Infinity);
+      if (clear < STEAL_RANGE) continue;
       const open = openness(cell, r.cell);
       if (open < 4) continue;
-      // Просторно вокруг, не у самого берега, побольше воды в этом направлении, наклон — как у человека.
-      const score = open * 2 + Math.min(dist, 7) + Math.min(n, 20) / 10 - Math.abs(deg - 10) / 15;
+      // Просторно вокруг, не у самого берега, побольше воды в этом направлении, наклон — как у человека, и подальше
+      // от чужого пути улова.
+      const score = open * 2 + Math.min(dist, 7) + Math.min(n, 20) / 10 - Math.abs(deg - 10) / 15 + Math.min(clear, 5) * 0.6;
       if (!best || score > best.score) best = { yaw, pitch, landing: r.cell, at: r.at, dist, open, score };
     }
   }
@@ -461,7 +541,7 @@ function castStillGood(bot, plan) {
   if (!plan || !plan.eyeAt || !bot.entity) return false;
   const eye = bot.entity.position.offset(0, EYE, 0);
   if (eye.distanceTo(plan.eyeAt) > 0.05) return false;
-  return !otherPlayers(bot).some((o) => segmentDistance(o, plan.at, eye) < STEAL_RANGE || hookPathNear(o, plan));
+  return !otherPlayers(bot).some((o) => returnClearance(o, plan.at, eye) < STEAL_RANGE || hookPathNear(o, plan));
 }
 
 /** Игрок рядом с полётом поплавка (по прямой от глаз до места падения) — его может зацепить. */
@@ -471,7 +551,8 @@ function hookPathNear(o, plan) {
 }
 
 module.exports = {
-  simulateCast, planCast, planSpot, planFromHere, castStillGood, findWater, shoreSpots, cellReader, isWaterBlock, openness,
+  simulateCast, planCast, planSpot, planFromHere, castStillGood, returnClearance, STEAL_RANGE, findWater, shoreSpots, cellReader, isWaterBlock, openness,
   claimSpot, touchSpot, releaseSpot, claimFree, otherPlayers, lootName,
+  rodLeft, rodMax, rodWorn, botRods, usableRods, wornRods, ROD_SAVE_LEFT,
   FISH_ITEMS, FISH_LOOT, FISH_RADIUS, SPOT_GAP, _claims: claims,
 };

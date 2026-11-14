@@ -9,7 +9,7 @@ const DEFAULT_CONFIG = Object.freeze({
   // Пул прокси: ссылки по одной на строку (socks5://user:pass@host:port). Свои прокси — только в настройках на ПК
   // (config.json), не в коде: репозиторий публичный.
   proxyPool: '',
-  botsPerProxy: 4, // сколько ботов пускать через один прокси
+  botsPerProxy: 1, // сколько ботов пускать через один прокси
   accounts: '', // боты: «ник» или «ник:пароль», по одному в строке (хранится зашифрованным)
   version: '1.21.11',
   auth: 'offline',
@@ -23,6 +23,13 @@ const DEFAULT_CONFIG = Object.freeze({
   whitelist: '', // белый список охраны: ники, по одному в строке
   // Много ботов. Входы (и переподключения) — по одному с паузой: прокси не пускает частые входы с одного IP.
   startInterval: 5, // секунд между входами ботов
+  // Проверка «я не робот»: MineBlaze после 4 проверок подряд с одного компьютера пишет «Вы превысили лимит прохождения
+  // проверки, подождите» (13.11). Очередь входа: не больше captchaBurst проверок за captchaWindow минут (src/fleet.js).
+  captchaBurst: 0, // 0 — без ограничения (по умолчанию: очередь не ждёт после проверок)
+  captchaWindow: 10, // минут
+  // Только через прокси: бот без прокси не входит вовсе — ни с IP компьютера, ни переподключением (fleet.start,
+  // BotManager._connect); ссылку проверки панель открывает только через прокси бота.
+  proxyOnly: true,
   viewDistance: 4, // дальность прорисовки, которую бот сообщает серверу: меньше чанков — меньше памяти на бота
   botsPerProcess: 10, // ботов в одном процессе: больше — тики начнут опаздывать, меньше — больше памяти на процессы
   // ИИ-помощник (src/ai.js). Где работает модель: 'ollama' — Ollama на этом ПК (бесплатно, без ключа и лимитов),
@@ -44,11 +51,15 @@ const DEFAULT_CONFIG = Object.freeze({
   questFarm: '', // дом фермы: «Передайте пшеницу…» — сначала собрать урожай там (#урожай)
   questPen: '', // дом загона: «Разведите коров…» — покормить пары там (#разведи)
   questMine: '', // дом шахты: «Передайте редстоун…» — сначала добыть руду оттуда (#добудь)
+  // «Авто фиш» (рыбалка): куда переводить деньги ботов (/pay ник сумма) и как часто — сами, пока рыбачат (0 — только кнопкой).
+  payTo: '',
+  payEvery: 10,
   questTogether: 2, // ботов делают задания одновременно
   questPause: 15, // минут между проверками одного бота
   // Рентген (src/bot/xray.js): какие блоки подсвечивать в «Экране бота» и искать #рентген — цвета, радиус, лава.
   xray: DEFAULT_XRAY,
   liveBackground: true, // живой фон окна «Вороны» (src/renderer/background.js); на ботов не влияет
+  captchaExternal: false, // проверку «я не робот» — в отдельном браузере (приватное окно, прокси бота); обычно — в панели
 });
 
 const MAX_WHITELIST_LENGTH = 5000;
@@ -117,13 +128,15 @@ function sanitize(src) {
   if (typeof src.guard === 'boolean') out.guard = src.guard;
   if (typeof src.godMode === 'boolean') out.godMode = src.godMode;
   if (typeof src.liveBackground === 'boolean') out.liveBackground = src.liveBackground;
+  if (typeof src.captchaExternal === 'boolean') out.captchaExternal = src.captchaExternal;
+  if (typeof src.proxyOnly === 'boolean') out.proxyOnly = src.proxyOnly;
   if (typeof src.whitelist === 'string') out.whitelist = src.whitelist.replace(/\r\n?/g, '\n').slice(0, MAX_WHITELIST_LENGTH);
   if (typeof src.accounts === 'string') out.accounts = src.accounts.replace(/\r\n?/g, '\n').slice(0, MAX_ACCOUNTS_LENGTH);
   const int = (value, min, max) => {
     const n = parseInt(value, 10);
     return n >= min && n <= max ? n : undefined;
   };
-  for (const [key, min, max] of [['startInterval', 1, 120], ['viewDistance', 2, 16], ['botsPerProcess', 1, 20]]) {
+  for (const [key, min, max] of [['startInterval', 1, 120], ['captchaBurst', 0, 20], ['captchaWindow', 1, 120], ['viewDistance', 2, 16], ['botsPerProcess', 1, 20]]) {
     const n = src[key] === undefined ? undefined : int(src[key], min, max);
     if (n !== undefined) out[key] = n;
   }
@@ -156,7 +169,11 @@ function sanitize(src) {
     if (!c || c.startsWith('/')) out.netherCommand = c;
   }
   if (typeof src.questMobHomes === 'string') out.questMobHomes = src.questMobHomes.replace(/\r\n?/g, '\n').slice(0, 2000);
-  for (const [key, min, max] of [['questTogether', 1, 5], ['questPause', 5, 240]]) {
+  if (typeof src.payTo === 'string') {
+    const nick = src.payTo.trim();
+    if (!nick || NICK_RE.test(nick)) out.payTo = nick;
+  }
+  for (const [key, min, max] of [['questTogether', 1, 5], ['questPause', 5, 240], ['payEvery', 0, 240]]) {
     const n = src[key] === undefined ? undefined : int(src[key], min, max);
     if (n !== undefined) out[key] = n;
   }

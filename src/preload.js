@@ -50,9 +50,19 @@ contextBridge.exposeInMainWorld('api', {
     target: String(target || 'selected'), ids: Array.isArray(ids) ? ids.map(String) : null, home: String(home || ''),
   }),
   fishStop: (ids) => ipcRenderer.invoke('fish:stop', { ids: Array.isArray(ids) ? ids.map(String) : null }), // без ids — всех рыбаков
+  // Перевести деньги ботов на ник to (/pay ник весь баланс): target — 'selected' | 'group' | 'online'. → { ok, targets, error }
+  fishPay: (target, ids, to) => ipcRenderer.invoke('fish:pay', {
+    target: String(target || 'online'), ids: Array.isArray(ids) ? ids.map(String) : null, to: String(to || ''),
+  }),
   fishList: () => ipcRenderer.invoke('fish:list'),
   fishClear: () => ipcRenderer.invoke('fish:clear'), // убрать тех, кто уже не рыбачит
-  onFish: listen('fish:update'), // { rows: [{ bot, nick, state, stateText, text, caught, last, items, rods, active }], active, caught }
+  onFish: listen('fish:update'), // { rows: [{ bot, nick, state, stateText, text, caught, last, items, rods, balance, active }], active, caught, balances, balanceTotal }
+  // Проверка «я не робот» внутри панели: место под страницу (null — спрятать), вкладки ботов.
+  captchaBounds: (r) => ipcRenderer.send('captcha:bounds', r ? { x: r.x, y: r.y, width: r.width, height: r.height } : null),
+  captchaState: () => ipcRenderer.invoke('captcha:state'),
+  // action: 'show' | 'reload' | 'close'
+  captchaControl: (action, bot) => ipcRenderer.invoke('captcha:control', { action: String(action), bot: bot === undefined || bot === null ? null : String(bot) }),
+  onCaptcha: listen('captcha:state'), // { active, items: [{ bot, nick, via, failed }] }
   onLog: listen('bot:log'),
   onChat: listen('bot:chat'),
   onState: listen('bot:state'), // { bot, nick, state }

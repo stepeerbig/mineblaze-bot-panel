@@ -18,6 +18,7 @@ class FakeManager extends EventEmitter {
   constructor(opts) {
     super();
     this.opts = opts;
+    this.proxy = opts.proxy || null; // как у BotManager
     this.state = 'offline';
     this.calls = [];
     this.admittedAt = null;

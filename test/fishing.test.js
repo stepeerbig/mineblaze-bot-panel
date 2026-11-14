@@ -8,89 +8,14 @@ const test = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
 const { Vec3 } = require('vec3');
-const { fakeClock, makeWorld, physicsBot, autoServer, teleport, take, runFor, VERSION } = require('./fake-bot');
+const { makeWorld, runFor, VERSION } = require('./fake-bot');
 
 const fishing = require(path.join(__dirname, '..', 'src', 'bot', 'fishing.js'));
 const { runCommand } = require(path.join(__dirname, '..', 'src', 'bot', 'commands.js'));
 
-const registry = require('prismarine-registry')(VERSION);
-const BOBBER = registry.entitiesByName.fishing_bobber.id;
+const { pond, setup, fishServer, registry } = require('./fish-fake');
+
 const DEG = Math.PI / 180;
-
-/** Пруд 8×8 в камне: вода x 6…13, z −4…3, глубиной 2 (y 62, 63); берег — камень на y 63, стоять — на y 64. */
-function pond(world) {
-  for (let x = 6; x <= 13; x += 1) for (let z = -4; z <= 3; z += 1) for (let y = 62; y <= 63; y += 1) world.set(new Vec3(x, y, z), 'water');
-}
-
-function setup({ at = { x: 0.5, y: 64, z: 0.5 }, storage = {}, username = 'Fisher' } = {}) {
-  const clock = fakeClock();
-  const world = makeWorld(registry);
-  pond(world);
-  const bot = physicsBot({ clock, world, actions: true });
-  autoServer(bot, world, { storage });
-  bot.username = username;
-  bot.emit('login');
-  teleport(bot, at);
-  clock.advance(100);
-  take(bot);
-  return { clock, world, bot };
-}
-
-/**
- * «Сервер рыбалки»: правая кнопка с удочкой — поплавок (свой — через тик, objectData = номер бота; перед ним —
- * чужой, от игрока 4242); через biteTicks — «клюёт» (entity_metadata, ключ 9 = true); правая кнопка ещё раз —
- * поплавок пропал, если клевало — улов (loot) в инвентарь и «подобрал».
- */
-function fishServer(bot, { biteTicks = 30, loot = 'cod', at = new Vec3(10.5, 63.9, 0.5) } = {}) {
-  const st = { casts: 0, reels: 0, bobber: null, biting: false, tick: 0, castTick: 0, biteTick: null, reelAfterBite: [] };
-  let nextId = 900;
-  bot.on('physicsTick', () => {
-    st.tick += 1;
-    if (st.bobber !== null && !st.biting && st.tick - st.castTick >= biteTicks) {
-      st.biting = true;
-      st.biteTick = st.tick;
-      bot._client.emit('entity_metadata', { entityId: st.bobber, metadata: [{ key: 9, type: 'boolean', value: true }] });
-    }
-  });
-  const write = bot._client.write;
-  bot._client.write = (name, params) => {
-    write(name, params);
-    if (name !== 'use_item' || params.hand !== 0 || !bot.heldItem || bot.heldItem.name !== 'fishing_rod') return;
-    if (st.bobber === null) {
-      st.casts += 1;
-      st.castTick = st.tick;
-      st.biting = false;
-      nextId += 2;
-      const id = nextId;
-      st.bobber = id;
-      setImmediate(() => {
-        const other = id - 1; // чужой поплавок — раньше своего и рядом
-        bot.entities[other] = { id: other, name: 'fishing_bobber', type: 'projectile', position: at.offset(-1, 0, 2) };
-        bot._client.emit('spawn_entity', { entityId: other, type: BOBBER, objectData: 4242, x: at.x - 1, y: at.y, z: at.z + 2 });
-        bot.entities[id] = { id, name: 'fishing_bobber', type: 'projectile', position: at.clone() };
-        bot._client.emit('spawn_entity', { entityId: id, type: BOBBER, objectData: bot.entity.id, x: at.x, y: at.y, z: at.z });
-      });
-    } else {
-      st.reels += 1;
-      st.reelAfterBite.push(st.biteTick === null ? null : st.tick - st.biteTick);
-      const id = st.bobber;
-      const caught = st.biting;
-      st.bobber = null;
-      st.biting = false;
-      st.biteTick = null;
-      setImmediate(() => {
-        delete bot.entities[id];
-        bot._client.emit('entity_destroy', { entityIds: [id] });
-        if (caught) {
-          const free = bot.inventory.slots.findIndex((it, i) => i >= 9 && i < 45 && !it);
-          if (free >= 0) bot.inventory.slots[free] = { name: loot, count: 1, displayName: loot };
-          bot.emit('playerCollect', bot.entity, { id: 999, name: 'item' });
-        }
-      });
-    }
-  };
-  return st;
-}
 
 test('заброс как у сервера: вниз — у берега, прямо — дальше, вверх — перелетает пруд на берег', () => {
   const world = makeWorld(registry);
@@ -180,7 +105,7 @@ test('рыбачить: #стоп, пока ждёт поклёвку, — по�
   assert.equal(st.bobber, null);
 });
 
-test('#рыбалка здесь 2: удочки из сундука, место на берегу, ловит 2 и заканчивает; ход — событиями «fishing»', async () => {
+test('#рыбалка здесь 2: удочку из сундука, место на берегу, ловит 2 и заканчивает; ход — событиями «fishing»', async () => {
   const s = setup({ storage: { '2,64,-2': { items: [[0, 'fishing_rod', 1], [1, 'fishing_rod', 1], [2, 'fishing_rod', 1], [3, 'fishing_rod', 1], [5, 'bread', 10]] } } });
   s.world.set(new Vec3(2, 64, -2), 'chest');
   const st = fishServer(s.bot, { biteTicks: 30, loot: 'cod' });
@@ -193,7 +118,7 @@ test('#рыбалка здесь 2: удочки из сундука, место
   assert.equal(r.value.data.caught, 2, text);
   assert.deepEqual(r.value.data.items, { cod: 2 });
   assert.match(text, /Рыбалка готова: поймал 2 — треска ×2/);
-  assert.equal(r.value.data.rods, 3, 'взял 3 удочки (четвёртая осталась в сундуке)');
+  assert.equal(r.value.data.rods, 1, 'взял одну целую удочку (остальные — в сундуке)');
   assert.equal(st.casts, 2);
   const p = s.bot.entity.position;
   assert.ok(Math.abs(p.x - 5.5) < 0.5 && Math.abs(p.z - 0.5) < 0.5, `стоит на берегу: ${p}`);
@@ -268,10 +193,14 @@ test('заброс: улов летит обратно мимо соседа —
   const neighbor = new Vec3(5.5, 64, 2.5);
   const plan = fishing.planCast(cell, eye, waters, { others: [neighbor] });
   assert.ok(plan, 'заброс нашёлся');
-  const t = Math.max(0, Math.min(1, ((neighbor.x - plan.at.x) * (eye.x - plan.at.x) + (neighbor.z - plan.at.z) * (eye.z - plan.at.z)) /
-    ((eye.x - plan.at.x) ** 2 + (eye.z - plan.at.z) ** 2)));
-  const near = Math.hypot(neighbor.x - (plan.at.x + (eye.x - plan.at.x) * t), neighbor.z - (plan.at.z + (eye.z - plan.at.z) * t));
-  assert.ok(near >= 1.7, `путь улова в ${near.toFixed(2)} бл. от соседа`);
+  const clear = fishing.returnClearance(neighbor, plan.at, eye);
+  assert.ok(clear >= fishing.STEAL_RANGE, `путь улова в ${clear.toFixed(2)} бл. от соседа`);
+  // Как на стенде: соседи с обеих сторон в 2 блоках, а воды больше наискосок — заброс всё равно почти поперёк
+  // берега (стенд 12.11: наискосок на 26° — улов уходил соседу).
+  const both = fishing.planCast(cell, eye, waters, { others: [neighbor, new Vec3(5.5, 64, -1.5)] });
+  assert.ok(both, 'заброс между двумя соседями нашёлся');
+  const off = Math.abs(Math.atan2(both.at.z - eye.z, both.at.x - eye.x)) * 180 / Math.PI;
+  assert.ok(off <= 6, `отклонение от «поперёк берега» ${off.toFixed(1)}°`);
 
   // Всплеск: свой поплавок в 2 блоках от соседского, всплеск — у соседского.
   const s = setup({ at: { x: 5.5, y: 64, z: 0.5 } });

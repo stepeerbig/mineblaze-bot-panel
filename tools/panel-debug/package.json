@@ -1,0 +1,11 @@
+{
+  "name": "panel-debug",
+  "private": true,
+  "description": "Отладка запущенной панели через порт отладки (см. start-debug.bat)",
+  "scripts": {
+    "start": "node panel-debug.js"
+  },
+  "dependencies": {
+    "playwright-core": "^1.65.1"
+  }
+}

@@ -1497,3 +1497,22 @@ test('кик: журнал пакетов в файле, пароль из /logi
   assert.equal(fs.readdirSync(dir).length, 1);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('только через прокси: бот без прокси не подключается — ни при старте, ни при переподключении; с прокси — входит', () => {
+  const { mgr, bots, logs } = setup({ proxyOnly: true });
+  assert.equal(mgr.start(), false);
+  assert.equal(mgr.state, 'offline');
+  assert.equal(bots.length, 0, 'createBot не вызывался — соединения не было');
+  assert.ok(lines(logs).some((t) => /^error:Нет прокси — с IP компьютера не вхожу \(включено «Только через прокси»\)/.test(t)));
+
+  const withProxy = setup({ proxyOnly: true }, {}, { proxy: { host: '10.0.0.1', port: 1080, username: 'u', password: 'p' } });
+  assert.equal(withProxy.mgr.start(), true);
+  assert.equal(withProxy.bots.length, 1, 'с прокси — подключается');
+  assert.equal(typeof withProxy.bots[0].opts.connect, 'function', 'и само подключение — через прокси');
+  // Прокси пропал (например, убрали из пула) — переподключение не пойдёт с IP компьютера.
+  withProxy.mgr.proxy = null;
+  withProxy.mgr._connect();
+  assert.equal(withProxy.mgr.state, 'offline');
+  assert.equal(withProxy.bots.length, 1, 'второго подключения не было');
+  assert.equal(withProxy.mgr.wantRun, false);
+});

@@ -10,7 +10,9 @@ const DONE_STATES = new Set(['stopped', 'error', 'done', 'offline']);
 const STATE_TEXT = {
   start: 'команда отправлена',
   travel: 'идёт на дом',
-  rods: 'берёт удочки',
+  job: 'устраивается Рыбаком',
+  rods: 'удочки',
+  wait: 'ждёт удочки',
   search: 'ищет воду',
   walk: 'идёт к воде',
   fishing: 'рыбачит',
@@ -26,6 +28,16 @@ class FishBoard extends EventEmitter {
     super();
     this.now = now;
     this.bots = new Map(); // номер бота → сведения
+    this.balances = new Map(); // номер бота → { bot, nick, value, safe, text, at } — баланс с табло справа
+  }
+
+  /** Баланс бота с табло (событие «balance»): { bot, nick, value, safe, text }. */
+  setBalance(p) {
+    if (!p || !p.bot || !Number.isFinite(p.value)) return;
+    const prev = this.balances.get(p.bot);
+    if (prev && prev.value === p.value && prev.text === p.text) return;
+    this.balances.set(p.bot, { bot: p.bot, nick: p.nick || (prev && prev.nick) || p.bot, value: p.value, safe: p.safe, text: p.text, at: this.now() });
+    this.emit('update');
   }
 
   /** Событие от бота: { bot, nick, state, text, caught, casts, last, items, rods, since, spot, home }. */
@@ -82,37 +94,53 @@ class FishBoard extends EventEmitter {
   retain(ids) {
     const keep = new Set(ids);
     let n = 0;
-    for (const id of [...this.bots.keys()]) {
-      if (!keep.has(id)) {
-        this.bots.delete(id);
-        n += 1;
+    for (const map of [this.bots, this.balances]) {
+      for (const id of [...map.keys()]) {
+        if (!keep.has(id)) {
+          map.delete(id);
+          n += 1;
+        }
       }
     }
     if (n) this.emit('update');
   }
 
-  /** Для окна: [{ bot, nick, state, stateText, text, caught, last, items, rods, active, since }] и сводка. */
+  /**
+   * Для окна: rows — рыбаки [{ bot, nick, state, stateText, text, caught, last, items, rods, rodLeft, rodMax, job, balance,
+   * active, since }], balances — балансы ботов с табло [{ bot, nick, value, safe, text }], и сводка.
+   */
   list() {
-    const rows = [...this.bots.values()].map((e) => ({
-      bot: e.bot,
-      nick: e.nick || e.bot,
-      state: e.state,
-      stateText: STATE_TEXT[e.state] || e.state,
-      text: e.text || '',
-      caught: e.caught || 0,
-      casts: e.casts || 0,
-      last: e.last || '',
-      items: Array.isArray(e.items) ? e.items.slice(0, 6) : [],
-      rods: Number.isFinite(e.rods) ? e.rods : null,
-      active: e.active,
-      since: e.since || null,
-      at: e.at,
-    }));
+    const rows = [...this.bots.values()].map((e) => {
+      const b = this.balances.get(e.bot);
+      return {
+        bot: e.bot,
+        nick: e.nick || e.bot,
+        state: e.state,
+        stateText: STATE_TEXT[e.state] || e.state,
+        text: e.text || '',
+        caught: e.caught || 0,
+        casts: e.casts || 0,
+        last: e.last || '',
+        items: Array.isArray(e.items) ? e.items.slice(0, 6) : [],
+        rods: Number.isFinite(e.rods) ? e.rods : null,
+        rodLeft: Number.isFinite(e.rodLeft) ? e.rodLeft : null,
+        rodMax: Number.isFinite(e.rodMax) ? e.rodMax : null,
+        job: e.job || '',
+        balance: b ? b.text : '',
+        active: e.active,
+        since: e.since || null,
+        at: e.at,
+      };
+    });
     rows.sort((a, b) => Number(b.active) - Number(a.active) || a.nick.localeCompare(b.nick));
+    const balances = [...this.balances.values()].map((b) => ({ bot: b.bot, nick: b.nick, value: b.value, safe: b.safe, text: b.text }))
+      .sort((a, b) => a.nick.localeCompare(b.nick));
     return {
       rows,
       active: rows.filter((r) => r.active).length,
       caught: rows.reduce((n, r) => n + r.caught, 0),
+      balances,
+      balanceTotal: balances.reduce((n, b) => n + b.value, 0),
     };
   }
 }

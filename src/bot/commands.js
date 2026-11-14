@@ -17,7 +17,10 @@ const { moveStacks, countIn, itemsIn, storageSlots, playerSlots } = require('./c
 const { sanitizeXray, scanXray, findEntries, registryOf } = require('./xray');
 const { createGuard, prepareShield, cooldownFor, eatIfHungry, isFood, foodRank, FIRE_POTIONS, fireResPotions, hasFireRes, wearsGold } = require('./survival');
 const { potionOf } = require('./item-hash');
-const { planSpot, planFromHere, castStillGood, claimSpot, touchSpot, releaseSpot, lootName, FISH_LOOT, FISH_RADIUS } = require('./fishing');
+const {
+  planSpot, planFromHere, castStillGood, claimSpot, touchSpot, releaseSpot, lootName, rodLeft, rodMax, rodWorn, botRods, usableRods,
+  wornRods, ROD_SAVE_LEFT, FISH_LOOT, FISH_RADIUS,
+} = require('./fishing');
 
 const MAX_WALK = 256; // за раз дальше не ходим: путь ищется по загруженному миру, дальше — по ходу
 const MAX_STEPS = 32; // «#вперёд N»: не больше
@@ -1148,20 +1151,87 @@ const MAX_STORAGE_CHESTS = 24;
 // один-два ближних сундука и говорил «кирки нет», хотя она лежала в соседнем (7 ноября).
 const STORAGE_RANGE = 12;
 
-/** Сундуки склада вокруг бота, от ближнего; половинки большого сундука — один раз. */
-function storageChests(bot) {
+/**
+ * Сундуки склада вокруг бота (до range блоков), от ближнего; половинки большого сундука — один раз. test — какие
+ * блоки считать (по умолчанию — любые хранилища).
+ */
+function storageChests(bot, { range = STORAGE_RANGE, test = isContainer, max = MAX_STORAGE_CHESTS, purpose = null } = {}) {
   const out = [];
   const seen = new Set();
   const key = (p) => `${p.x},${p.y},${p.z}`;
-  for (const c of scanBlocks(bot, STORAGE_RANGE, (b) => isContainer(b.name))) {
-    if (c.dist > STORAGE_RANGE + 0.5 || seen.has(key(c.pos))) continue;
+  for (const c of scanBlocks(bot, range, (b) => test(b.name))) {
+    if (c.dist > range + 0.5 || seen.has(key(c.pos))) continue;
     seen.add(key(c.pos));
     const partner = chestPartner(c.block, c.pos);
     if (partner) seen.add(key(partner));
+    c.label = chestLabel(bot, c.pos, partner);
     out.push(c);
-    if (out.length >= MAX_STORAGE_CHESTS) break;
   }
-  return out;
+  // С назначением: сначала сундуки с его табличкой, потом без таблички; с табличкой другого дела — не трогать
+  // (удочки не класть в «мусор», мусор — в «рыбалку»).
+  if (purpose) {
+    const mine = out.filter((c) => c.label === purpose);
+    const free = out.filter((c) => !c.label);
+    return [...mine, ...free].slice(0, max);
+  }
+  return out.slice(0, max);
+}
+
+// ---------- таблички на сундуках ----------
+
+// Назначение сундука по табличке на нём: «Рыбалка», «Шахтёрство», «Мусор», «Добыча» (регистр, «ё», цвета — не важны).
+const CHEST_LABELS = [
+  ['рыбалка', /рыб|fish/i],
+  ['шахтерство', /шахт|mining|miner/i],
+  ['мусор', /мусор|junk|trash/i],
+  ['добыча', /добыч|loot/i],
+];
+const SIGN_SIDES = { north: [0, -1], south: [0, 1], west: [-1, 0], east: [1, 0] };
+
+/** Текст таблички (обе стороны) или '' — если блок не табличка. */
+function signText(block) {
+  if (!block || !/sign$/.test(block.name || '')) return '';
+  try {
+    const t = typeof block.getSignText === 'function' ? block.getSignText() : [block.signText];
+    return [].concat(t).filter(Boolean).join(' ').replace(/§./g, '');
+  } catch (_) {
+    return '';
+  }
+}
+
+/** Назначение по тексту таблички: 'рыбалка' | 'шахтерство' | 'мусор' | 'добыча' | null. */
+function labelOf(text) {
+  const t = String(text || '').toLowerCase().replace(/ё/g, 'е');
+  if (!t.trim()) return null;
+  for (const [label, re] of CHEST_LABELS) if (re.test(t)) return label;
+  return null;
+}
+
+/**
+ * Табличка сундука: настенная на любой его стороне (висит на нём — смотрит от него), табличка на крышке или над
+ * ней через блок; у большого сундука — на любой из половинок. → назначение или null.
+ */
+function chestLabel(bot, pos, partner = null) {
+  for (const p of partner ? [pos, partner] : [pos]) {
+    for (const [facing, [dx, dz]] of Object.entries(SIGN_SIDES)) {
+      const b = bot.blockAt(p.offset(dx, 0, dz));
+      if (!b || !/wall_sign$/.test(b.name || '')) continue;
+      let props = {};
+      try {
+        props = typeof b.getProperties === 'function' ? b.getProperties() : {};
+      } catch (_) {
+        props = {};
+      }
+      if (props.facing && props.facing !== facing) continue; // висит на другом блоке
+      const label = labelOf(signText(b));
+      if (label) return label;
+    }
+    for (const up of [1, 2]) {
+      const label = labelOf(signText(bot.blockAt(p.offset(0, up, 0))));
+      if (label) return label;
+    }
+  }
+  return null;
 }
 const HOME_NAME_RE = /^[\p{L}\p{N}_-]{1,32}$/u;
 const lastHomes = new Map(); // ник бота → { storage, rewards }: «#квесты принести» без слов — как в прошлый раз
@@ -1356,19 +1426,39 @@ function gearMissing(bot) {
 }
 
 /**
- * Собрать снаряжение со склада вокруг бота: броня на 4 места, меч, кирка, щит, еда (FOOD_WANT штук). Сначала
- * осмотреть все сундуки (до STORAGE_RANGE блоков), потом взять лучшее по каждому месту (незерит → алмаз → железо…),
- * из какого сундука бы оно ни было; чего нет в одном — ищет в остальных. Броню надевает, щит — во вторую руку.
+ * Собрать снаряжение со склада вокруг бота: броня на 4 места, меч, кирка, щит, еда (FOOD_WANT штук). Сундуки — от
+ * ближнего (до STORAGE_RANGE блоков; с назначением purpose — сначала с его табличкой); увидел в открытом сундуке
+ * нужное или лучше своего (незерит → алмаз → железо…) — сразу берёт, старое кладёт туда же; всё нужное есть —
+ * дальше не ходит. Броню надевает, щит — во вторую руку.
  * → { lines, data: { took, wore, missing, food, chests } }
  */
-async function gearUp(bot, { pickTier = 0, fireRes = 0, goldArmor = false } = {}) {
-  const chests = storageChests(bot);
+async function gearUp(bot, { pickTier = 0, fireRes = 0, goldArmor = false, purpose = null } = {}) {
+  const chests = storageChests(bot, { purpose });
   if (!chests.length) throw new CommandError(`рядом нет сундуков склада (до ${STORAGE_RANGE} блоков)`);
-  const own = ownGear(bot);
-  // 1. Осмотр: что где лежит.
-  const found = []; // { chest, name, count, rank?, key? }
+  const took = new Map();
+  const returned = new Map(); // что положил обратно, взяв вместо него лучшее
   let opened = 0;
+  let full = false;
+  // Незер: одна золотая вещь брони (пиглины такого не трогают) — своя или первая, что попадётся в сундуках.
+  const goldKeyOf = (name) => {
+    const m = /^golden_(helmet|chestplate|leggings|boots)$/.exec(name || '');
+    return m ? Object.keys(ARMOR_PIECES).find((k) => ARMOR_PIECES[k] === m[1]) : null;
+  };
+  let gold = null; // { key, name }
+  if (goldArmor && !wearsGold(bot)) {
+    const ownGold = inventoryItems(bot).find((it) => goldKeyOf(it.name));
+    if (ownGold) gold = { key: goldKeyOf(ownGold.name), name: ownGold.name };
+  }
+  const wantGold = () => goldArmor && !gold && !wearsGold(bot);
+  const pickOk = (name) => !(PICK_TIERS[name] < pickTier);
+  // Всё нужное уже есть (любого уровня): дальше по сундукам не ходить.
+  const enough = () => {
+    const own = ownGear(bot);
+    return GEAR.every((g) => (gold && g.key === gold.key) || (own[g.key] && (g.key !== 'pickaxe' || pickOk(own[g.key].item.name)))) &&
+      foodCount(bot) >= FOOD_WANT && fireResPotions(bot).length >= fireRes && !wantGold();
+  };
   for (const c of chests) {
+    if (full || enough()) break;
     let chest;
     try {
       chest = await openStorage(bot, c.pos);
@@ -1378,96 +1468,67 @@ async function gearUp(bot, { pickTier = 0, fireRes = 0, goldArmor = false } = {}
     }
     opened += 1;
     try {
-      const [start, end] = storageSlots(chest.window);
-      for (let i = start; i < end; i += 1) {
-        const it = chest.window.slots[i];
-        if (it) found.push({ chest: c, name: it.name, count: it.count || 1, potion: it.name === 'potion' ? potionOf(it) : null });
+      const w = chest.window;
+      const box = storageSlots(w);
+      const inBox = () => {
+        const out = [];
+        for (let i = box[0]; i < box[1]; i += 1) if (w.slots[i]) out.push(w.slots[i]);
+        return out;
+      };
+      // Увидел нужное — сразу взять (а не осматривать все сундуки и потом возвращаться).
+      const take = async (item, want) => {
+        const r = await moveStacks(bot, w, box, playerSlots(w), (it) => it === item, want);
+        for (const [name, n] of r.moved) took.set(name, (took.get(name) || 0) + n);
+        if (r.full) full = true;
+        return r.total;
+      };
+      if (wantGold()) {
+        const g = inBox().find((it) => goldKeyOf(it.name));
+        if (g && (await take(g, 1))) gold = { key: goldKeyOf(g.name), name: g.name };
+      }
+      for (const g of GEAR) {
+        if (full) break;
+        if (gold && g.key === gold.key) continue;
+        const mine = ownGear(bot)[g.key];
+        let best = null;
+        for (const it of inBox()) {
+          const r = g.rank(it.name);
+          if (r === null || (g.key === 'pickaxe' && !pickOk(it.name))) continue;
+          if (!best || r < best.rank) best = { item: it, rank: r };
+        }
+        const mineOk = mine && (g.key !== 'pickaxe' || pickOk(mine.item.name));
+        if (!best || (mineOk && best.rank >= mine.rank)) continue;
+        if (!(await take(best.item, 1))) continue;
+        // Взял лучше своего — старое (если не надето) кладёт на его место в этот сундук: не таскать лишнее.
+        if (mine && mine.slot >= 9 && mine.slot <= 44) {
+          const old = w.slots[w.inventoryStart + (mine.slot - 9)];
+          if (old && old.name === mine.item.name) {
+            const r = await moveStacks(bot, w, playerSlots(w), box, (it) => it === old, 1);
+            for (const [name, n] of r.moved) returned.set(name, (returned.get(name) || 0) + n);
+          }
+        }
+      }
+      // Пока сундук открыт, инвентарь бота обновится только после закрытия — считаем взятое здесь сами.
+      let foodNeed = FOOD_WANT - foodCount(bot);
+      const foods = inBox().filter((it) => isFood(it.name, bot.registry)).sort((a, b) => foodRank(a.name) - foodRank(b.name));
+      for (const f of foods) {
+        if (full || foodNeed <= 0) break;
+        foodNeed -= await take(f, Math.min(f.count || 1, foodNeed));
+      }
+      let potionNeed = fireRes - fireResPotions(bot).length;
+      const potions = inBox().filter((it) => it.name === 'potion' && FIRE_POTIONS.includes(potionOf(it)))
+        .sort((a, b) => FIRE_POTIONS.indexOf(potionOf(a)) - FIRE_POTIONS.indexOf(potionOf(b)));
+      for (const p of potions) {
+        if (full || potionNeed <= 0) break;
+        potionNeed -= await take(p, Math.min(p.count || 1, potionNeed));
       }
     } finally {
       await closeAfter(bot);
     }
   }
   if (!opened) throw new CommandError('ни один сундук склада не открылся');
-  // 2. Что брать: по каждому месту — лучшее из найденного, если оно лучше своего; еда — до FOOD_WANT.
-  const plan = new Map(); // сундук → [{ name, want, key }]
-  const add = (chest, entry) => {
-    if (!plan.has(chest)) plan.set(chest, []);
-    plan.get(chest).push(entry);
-  };
-  const missing = [];
-  // Незер: одна золотая вещь (пиглины такого не трогают) — на самое слабое место брони, где золотая есть (своя или в
-  // сундуке). Остальное — лучшее, как обычно.
-  let gold = null; // { key, name, chest? }
-  if (goldArmor && !wearsGold(bot)) {
-    for (const g of GEAR.filter((x) => ARMOR_PIECES[x.key])) {
-      const name = `golden_${ARMOR_PIECES[g.key]}`;
-      const ownIt = inventoryItems(bot).find((it) => it.name === name);
-      const inChest = found.find((f) => f.name === name);
-      if (!ownIt && !inChest) continue;
-      let rank = own[g.key] ? own[g.key].rank : Infinity;
-      for (const f of found) {
-        const r = g.rank(f.name);
-        if (r !== null && r < rank) rank = r;
-      }
-      if (!gold || rank > gold.rank) gold = { key: g.key, name, rank, chest: ownIt ? null : inChest.chest };
-    }
-    if (gold && gold.chest) add(gold.chest, { name: gold.name, want: 1, key: gold.key });
-  }
-  for (const g of GEAR) {
-    if (gold && g.key === gold.key) continue;
-    let best = null;
-    for (const f of found) {
-      const r = g.rank(f.name);
-      if (r === null || (g.key === 'pickaxe' && PICK_TIERS[f.name] < pickTier)) continue;
-      if (!best || r < best.rank) best = { ...f, rank: r };
-    }
-    const mine = own[g.key];
-    if (best && (!mine || best.rank < mine.rank)) add(best.chest, { name: best.name, want: 1, key: g.key });
-    else if (!best && !mine) missing.push(g.label);
-  }
-  let foodNeed = Math.max(0, FOOD_WANT - foodCount(bot));
-  const foods = found.filter((f) => isFood(f.name, bot.registry)).sort((a, b) => foodRank(a.name) - foodRank(b.name) || a.count - b.count);
-  for (const f of foods) {
-    if (foodNeed <= 0) break;
-    add(f.chest, { name: f.name, want: Math.min(f.count, foodNeed), key: 'food' });
-    foodNeed -= Math.min(f.count, foodNeed);
-  }
-  // Зелья огнестойкости (в Незер): до fireRes штук, долгие — первыми.
-  let potionNeed = Math.max(0, fireRes - fireResPotions(bot).length);
-  const potions = found.filter((f) => FIRE_POTIONS.includes(f.potion)).sort((a, b) => FIRE_POTIONS.indexOf(a.potion) - FIRE_POTIONS.indexOf(b.potion));
-  for (const f of potions) {
-    if (potionNeed <= 0) break;
-    const n = Math.min(f.count, potionNeed);
-    add(f.chest, { name: f.name, potion: f.potion, want: n, key: 'potion' });
-    potionNeed -= n;
-  }
-  // 3. Взять: только те сундуки, где лежит выбранное.
-  const took = new Map();
-  let full = false;
-  for (const [c, entries] of plan) {
-    if (full) break;
-    let chest;
-    try {
-      chest = await openStorage(bot, c.pos);
-    } catch (err) {
-      if (isFatal(err)) throw err;
-      continue;
-    }
-    try {
-      const w = chest.window;
-      for (const e of entries) {
-        const test = (it) => it.name === e.name && (!e.potion || potionOf(it) === e.potion);
-        const r = await moveStacks(bot, w, storageSlots(w), playerSlots(w), test, e.want);
-        for (const [name, n] of r.moved) took.set(name, (took.get(name) || 0) + n);
-        if (r.full) {
-          full = true;
-          break;
-        }
-      }
-    } finally {
-      await closeAfter(bot);
-    }
-  }
+  const have = ownGear(bot);
+  const missing = GEAR.filter((g) => !(gold && g.key === gold.key) && !have[g.key]).map((g) => g.label);
   // 4. Надеть лучшее: броня, щит во вторую руку.
   const wore = [];
   const now = ownGear(bot);
@@ -1486,6 +1547,7 @@ async function gearUp(bot, { pickTier = 0, fireRes = 0, goldArmor = false } = {}
   const lines = [];
   lines.push(`Снаряжение: сундуков осмотрел ${opened}${took.size ? `, взял ${countsText(took)}` : ', брать нечего — у бота уже лучшее'}`);
   if (wore.length) lines.push(`Надел: ${wore.join(', ')}`);
+  if (returned.size) lines.push(`Вернул в сундук (взял лучше): ${countsText(returned)}`);
   lines.push(`Еда: ${food} из ${FOOD_WANT}${food < FOOD_WANT ? ' — на складе больше нет' : ''}`);
   if (fireRes) lines.push(`Зелья огнестойкости: ${fireResPotions(bot).length} из ${fireRes}`);
   if (goldArmor && !wearsGold(bot)) lines.push('Золотой брони нет — пиглины будут нападать (положи на склад хоть золотые ботинки)');
@@ -1547,7 +1609,7 @@ function junkItems(bot) {
  * Одну стопку блоков для «столба» бот оставляет себе. → { put: Map, left: [{ name, count }], opened, kept }
  */
 async function depositJunk(bot) {
-  const chests = storageChests(bot);
+  const chests = storageChests(bot, { purpose: 'мусор' });
   if (!chests.length) throw new CommandError(`рядом нет сундуков для мусора (до ${STORAGE_RANGE} блоков)`);
   const put = new Map();
   let opened = 0;
@@ -1582,8 +1644,8 @@ async function depositJunk(bot) {
  * Сложить добычу (предметы, для которых test(предмет) — да) в сундуки вокруг бота, от ближнего: полон — в следующий.
  * → { put: Map, opened, left } (left — что-то осталось у бота: в сундуках не хватило места)
  */
-async function depositLoot(bot, test) {
-  const chests = storageChests(bot);
+async function depositLoot(bot, test, purpose = null) {
+  const chests = storageChests(bot, { purpose });
   if (!chests.length) throw new CommandError(`рядом нет сундуков склада (до ${STORAGE_RANGE} блоков)`);
   const has = () => inventoryItems(bot).some((it) => test(it));
   const put = new Map();
@@ -2025,6 +2087,153 @@ async function putIntoStorage(bot, at, test, want) {
   } finally {
     await closeAfter(bot);
   }
+}
+
+// ---------- «#скинь»: всё — и надетое тоже — в ближайший сундук, где есть место ----------
+
+const DUMP_RANGE = 16; // сундуки до стольких блоков от бота
+const DUMP_MAX_CHESTS = 48;
+const DUMP_MAX_ROUNDS = 60; // заходов к сундукам за раз (сундук полон — следующий; снял броню — ещё заход)
+// Куда скидывать: сундук, сундук-ловушка, бочка. Эндер-сундук — личный (что в нём, видит только сам бот), шалкер
+// не примет другие шалкеры.
+const isDumpTarget = (name) => /^(?:chest|trapped_chest|barrel)$/.test(name || '');
+// Надетое: броня (ячейки 5–8) и вторая рука (45) — как у mineflayer: head, torso, legs, feet, off-hand.
+const GEAR_SLOTS = [['head', 5], ['torso', 6], ['legs', 7], ['feet', 8], ['off-hand', 45]];
+
+/** Что надето: броня и вторая рука → [{ dest, slot, item }]. */
+function wornGear(bot) {
+  const slots = bot.inventory && bot.inventory.slots ? bot.inventory.slots : [];
+  return GEAR_SLOTS.filter(([, slot]) => slots[slot]).map(([dest, slot]) => ({ dest, slot, item: slots[slot] }));
+}
+
+/** Броня с проклятием несъёмности: сервер её не снимет (только в творческом). */
+function boundArmor(bot, item) {
+  const list = typeof bot.enchantsOf === 'function' ? bot.enchantsOf(item) : [];
+  return list.some((e) => e.name === 'binding_curse');
+}
+
+/**
+ * Снять в инвентарь надетое, на что хватит свободных ячеек. stuck (место → почему) — что не снимается: проклятие
+ * несъёмности, отказ сервера, снятое вернулось на место (taken — места, откуда уже снимали). → имена снятого
+ */
+async function takeOffGear(bot, stuck, taken) {
+  const off = [];
+  for (const g of wornGear(bot)) {
+    if (stuck.has(g.dest)) continue;
+    if (taken.has(g.dest) || (g.dest !== 'off-hand' && boundArmor(bot, g.item))) {
+      stuck.set(g.dest, `${g.item.name} (${taken.has(g.dest) ? 'сервер вернул на место' : 'проклятие несъёмности'})`);
+      continue;
+    }
+    if (freeSlots(bot) < 1) break; // снимется, когда инвентарь опустеет
+    try {
+      const r = await bot.actions.takeOff(g.dest);
+      if (r && !r.already) {
+        taken.add(g.dest);
+        off.push(g.item.name);
+      }
+    } catch (err) {
+      if (isFatal(err)) throw err;
+      if (err && err.code === 'full') break;
+      stuck.set(g.dest, `${g.item.name} (${err.message})`);
+    }
+  }
+  return off;
+}
+
+/**
+ * Всё из инвентаря и всё надетое — в сундуки вокруг (до range блоков): в ближайший, где есть место; полон, чужой или
+ * не открылся — в следующий ближайший. Надетое сначала снимается в инвентарь (на сколько хватит свободных ячеек; не
+ * хватило — снимется, когда инвентарь опустеет, и бот сходит к сундуку ещё раз).
+ * → { put: Map, chests: [{ pos, block, moved }], skipped: [{ pos, block, why }], off, stuck: Map, left }
+ */
+async function dumpAll(bot, range = DUMP_RANGE) {
+  const key = (p) => `${p.x},${p.y},${p.z}`;
+  const put = new Map();
+  const used = new Map(); // ключ сундука → { pos, block, moved }
+  const skipped = new Map(); // ключ (обе половины большого) → { pos, block, why }
+  const stuck = new Map();
+  const taken = new Set();
+  const off = [];
+  for (let round = 0; round < DUMP_MAX_ROUNDS; round += 1) {
+    off.push(...(await takeOffGear(bot, stuck, taken)));
+    if (!inventoryItems(bot).length) break; // всё в сундуках (а что надето — не снимается)
+    const c = storageChests(bot, { range, test: isDumpTarget, max: DUMP_MAX_CHESTS }).find((x) => !skipped.has(key(x.pos)));
+    if (!c) break; // сундуки рядом кончились: все полны или не открылись
+    const partner = chestPartner(c.block, c.pos);
+    const keys = partner ? [key(c.pos), key(partner)] : [key(c.pos)];
+    const skip = (why) => {
+      const entry = { pos: c.pos, block: c.block, why };
+      for (const k of keys) skipped.set(k, entry);
+    };
+    let chest;
+    try {
+      chest = await openStorage(bot, c.pos);
+    } catch (err) {
+      if (isFatal(err)) throw err;
+      skip(err.message);
+      continue;
+    }
+    let r;
+    try {
+      const w = chest.window;
+      r = await moveStacks(bot, w, playerSlots(w), storageSlots(w), () => true);
+    } finally {
+      await closeAfter(bot);
+    }
+    if (r.total) {
+      const entry = used.get(keys[0]) || { pos: c.pos, block: c.block, moved: new Map() };
+      for (const [name, n] of r.moved) {
+        put.set(name, (put.get(name) || 0) + n);
+        entry.moved.set(name, (entry.moved.get(name) || 0) + n);
+      }
+      used.set(keys[0], entry);
+    }
+    // Что-то не влезло — этот сундук для него полон: дальше — в следующий ближайший.
+    if (inventoryItems(bot).length) skip(r.rejected ? 'сервер не дал положить' : 'полон');
+  }
+  return { put, chests: [...used.values()], skipped: [...new Set(skipped.values())], off, stuck, left: inventoryItems(bot) };
+}
+
+/** «#скинь [дом X]» — весь инвентарь и всё надетое (броню, вторую руку) — в ближайший сундук, где есть место. */
+async function cmdDump({ bot, args, words }) {
+  const { home } = homeArg(args, words, '#скинь дом склад');
+  if (!inventoryItems(bot).length && !wornGear(bot).length) {
+    return { ok: true, message: 'Скидывать нечего: инвентарь пуст и ничего не надето', data: { home, put: [], chests: [], left: [] } };
+  }
+  if (home) await teleportBy(bot, `/home ${home}`);
+  // После телепорта чанки с сундуками могут ещё догружаться: подождать до 5 с.
+  const near = () => storageChests(bot, { range: DUMP_RANGE, test: isDumpTarget, max: 1 }).length > 0;
+  for (let i = 0; i < 10 && !near(); i += 1) await bot.actions.wait(500);
+  if (!near()) {
+    throw new CommandError(`рядом нет сундуков (до ${DUMP_RANGE} блоков${home ? ` от дома «${home}»` : ''}) — подойди к сундукам или напиши #скинь дом <имя дома>`);
+  }
+  const r = await dumpAll(bot);
+  const total = [...r.put.values()].reduce((a, b) => a + b, 0);
+  const left = new Map();
+  for (const it of r.left) left.set(it.name, (left.get(it.name) || 0) + (it.count || 1));
+  const lines = [];
+  lines.push(total
+    ? `Скинул ${total} шт. в ${r.chests.length === 1 ? 'сундук' : `сундуки (${r.chests.length})`}${left.size ? '' : ' — инвентарь пуст'}`
+    : 'Ничего не скинул');
+  for (const c of r.chests) lines.push(`${storageName(c.block.name)} ${fmtPos(c.pos)}: ${countsText(c.moved)}`);
+  if (r.off.length) lines.push(`Снял с себя: ${r.off.join(', ')}`);
+  if (r.stuck.size) lines.push(`Не снимается: ${[...r.stuck.values()].join(', ')}`);
+  if (left.size) lines.push(`Не влезло: ${countsText(left)} — сундуки рядом полны или не открываются`);
+  for (const s of r.skipped) lines.push(`Пропустил: ${storageName(s.block.name)} ${fmtPos(s.pos)} — ${s.why}`);
+  return {
+    ok: !left.size,
+    code: left.size ? 'full' : undefined,
+    message: lines,
+    data: {
+      home,
+      put: countsData(r.put),
+      chests: r.chests.map((c) => ({ block: c.block.name, position: plain(c.pos), moved: countsData(c.moved) })),
+      skipped: r.skipped.map((s) => ({ block: s.block.name, position: plain(s.pos), why: s.why })),
+      off: r.off,
+      stuck: [...r.stuck.values()],
+      left: countsData(left),
+    },
+  };
 }
 
 async function cmdEquip({ bot, args, words }) {
@@ -2971,7 +3180,7 @@ async function cmdMine({ bot, args: allArgs, words = [] }) {
   if (!pick && !base) {
     throw noPickaxe(`нет кирки для «${ore.name}» (нужна не хуже: ${TIER_NAMES[ore.tier]}) — дай боту кирку или укажи общий дом, где в сундуке лежат кирки: «Дом склада» в настройках автопилота или #добудь ${text} дом база`);
   }
-  const gearOpts = { pickTier: ore.tier, fireRes: ore.nether ? FIRE_RES_WANT : 0, goldArmor: Boolean(ore.nether) };
+  const gearOpts = { pickTier: ore.tier, fireRes: ore.nether ? FIRE_RES_WANT : 0, goldArmor: Boolean(ore.nether), purpose: 'шахтерство' };
   const needGold = () => ore.nether && !inNether() && !wearsGold(bot);
   if (base && (!pick || gearMissing(bot) || fireLow() || needGold())) {
     await teleportBy(bot, `/home ${base}`);
@@ -3052,7 +3261,7 @@ async function cmdMine({ bot, args: allArgs, words = [] }) {
     if (freeSlots(bot) < LOOT_FREE_MIN && base) {
       await teleportBy(bot, `/home ${base}`);
       try {
-        const d = await depositLoot(bot, (it) => loot.has(it.name));
+        const d = await depositLoot(bot, (it) => loot.has(it.name), 'добыча');
         for (const n of d.put.values()) stored += n;
         lines.push(`Добычу — в сундуки у дома «${base}»: ${d.put.size ? countsText(d.put) : 'положить не вышло (сундуки полны?)'}`);
       } catch (err) {
@@ -3128,15 +3337,291 @@ async function cmdMine({ bot, args: allArgs, words = [] }) {
 
 // ---------- рыбалка (вкладка «Авто фиш»): удочки со склада, вода у дома, заброс и подсечка — пока не #стоп ----------
 
-const FISH_RODS_WANT = 3; // удочек с собой: у каждой 64 прочности, улов — минус 1
+const FISH_RODS_WANT = 1; // целых удочек с собой: изношенная — в сундук, вместо неё — самая целая со склада
 const FISH_FREE_MIN = 2; // свободных ячеек меньше — улов в сундуки склада
 const FISH_WAIT_TICKS = 1800; // рыба не клюёт 90 с — вытащить и закинуть снова (под крышей клюёт вдвое реже: до 70 с)
 const FISH_BAD_CASTS = 3; // столько неудачных забросов подряд с одного места (поплавок на берегу, зацепил) — другое место
 const FISH_BAD_SPOTS = 12; // столько мест не вышло — хватит
 const FISH_RESTARTS = 5; // бот погиб или сервер перенёс его — столько раз вернуться на дом и рыбачить дальше
 const FISH_ROD_TRIES = 6; // удочки берут сразу много ботов — у сундука толпа, удочку забрал другой: попробовать ещё
+const FISH_ROD_WAIT_MS = 5 * 60 * 1000; // целых удочек нет нигде — смотреть сундуки снова так часто
+const FISH_SAVE_RETRY_MS = 10 * 60 * 1000; // изношенную в сундук не положить (полны) — пробовать снова не чаще
+const FISH_JOB = 'Рыбак'; // работа в /jobs: деньги за улов
+const PAY_MIN_AUTO = 100; // сами переводят, только когда на балансе хотя бы столько
 
-const rodCount = (bot) => inventoryItems(bot).filter((it) => it.name === 'fishing_rod').length;
+const rodCount = (bot) => botRods(bot).length;
+const posKeyOf = (p) => `${p.x},${p.y},${p.z}`;
+const isRod = (it) => Boolean(it && it.name === 'fishing_rod');
+const rodFull = (it) => isRod(it) && rodLeft(it) >= rodMax(it);
+
+/**
+ * Взять из открытого сундука до n удочек: только целые (не изношенные — прочность больше 3), самые целые — первыми;
+ * onlyFull — только совсем новые (их ловить в первую очередь). → { took, lost, full, best } (best — прочность самой
+ * целой из оставшихся в этом сундуке, не новой, или 0)
+ */
+async function takeRodsFrom(bot, w, n, { onlyFull = false } = {}) {
+  const range = storageSlots(w);
+  let took = 0;
+  let lost = 0;
+  let full = false;
+  for (let tries = 0; took < n && tries < 12 && bot.currentWindow === w; tries += 1) {
+    const rods = [];
+    for (let i = range[0]; i < range[1]; i += 1) {
+      const it = w.slots[i];
+      if (isRod(it) && !rodWorn(it) && (!onlyFull || rodFull(it))) rods.push({ it, left: rodLeft(it) });
+    }
+    if (!rods.length) break;
+    rods.sort((a, b) => b.left - a.left);
+    const target = rods[0].it;
+    const r = await moveStacks(bot, w, range, playerSlots(w), (it) => it === target, 1);
+    took += r.moved.get('fishing_rod') || 0;
+    lost += r.lost || 0;
+    if (r.full) {
+      full = true;
+      break;
+    }
+    if (r.rejected) break;
+  }
+  let best = 0;
+  for (let i = range[0]; i < range[1]; i += 1) {
+    const it = w.slots[i];
+    if (isRod(it) && !rodFull(it) && !rodWorn(it)) best = Math.max(best, rodLeft(it));
+  }
+  return { took, lost, full, best };
+}
+
+/**
+ * Целые удочки со склада (сундуки до STORAGE_RANGE блоков), чтобы у бота их стало want: сначала новые, нет новых —
+ * самые целые (не изношенные). Сундуки, которые сервер не даёт открыть (чужая территория), запоминаются в
+ * skip и больше не обходятся. У сундука толпа, удочку из-под руки забрал другой бот — чуть позже ещё раз.
+ * → сколько взял
+ */
+async function takeRods(bot, want, { skip = new Set() } = {}) {
+  let took = 0;
+  const need = () => want - usableRods(bot).length;
+  for (let round = 0; round < FISH_ROD_TRIES && need() > 0; round += 1) {
+    if (round) await bot.actions.wait(1500 + Math.floor(Math.random() * 1500)); // пусть толпа у сундуков разойдётся
+    let chests = storageChests(bot, { purpose: 'рыбалка' });
+    // Только что телепортировался — чанки с сундуками могут ещё догружаться: подождать до 5 с.
+    for (let i = 0; i < 10 && !chests.length; i += 1) {
+      await bot.actions.wait(500);
+      chests = storageChests(bot, { purpose: 'рыбалка' });
+    }
+    if (!chests.length) throw new CommandError(`рядом нет сундуков склада (до ${STORAGE_RANGE} блоков)`);
+    const open = chests.filter((c) => !skip.has(posKeyOf(c.pos)));
+    if (!open.length) throw new CommandError(`сундуки у дома не открываются (сервер не даёт — чужая территория): дай ботам доступ к сундукам`);
+    let again = false; // мешали другие — есть смысл попробовать ещё
+    // Один обход, от ближнего (сундуки с табличкой «Рыбалка» — первыми): в открытом сундуке целая удочка — сразу
+    // взять (самую целую из этого сундука), не закрывать и не возвращаться потом.
+    for (const c of open) {
+      if (need() <= 0) break;
+      let chest;
+      try {
+        chest = await openStorage(bot, c.pos);
+      } catch (err) {
+        if (isFatal(err)) throw err;
+        if (/сервер не даёт открыть/.test(err.message || '')) skip.add(posKeyOf(c.pos)); // чужой — больше не пробовать
+        else again = true; // не открылся (заняли подход, сервер не успел) — потом ещё раз
+        continue;
+      }
+      let full = false;
+      try {
+        const r = await takeRodsFrom(bot, chest.window, need());
+        took += r.took;
+        full = r.full;
+        again = again || r.lost > 0;
+      } finally {
+        await closeAfter(bot);
+      }
+      if (full) return took; // в инвентаре нет места
+    }
+    if (!again) break; // удочек больше нет ни в одном сундуке
+  }
+  return took;
+}
+
+// ---------- работа в /jobs (MineBlaze: меню «Работы» — «Рыбак», «Нажмите, чтобы устроиться») ----------
+
+const JOBS_CMD = '/jobs';
+const JOBS_WAIT_MS = 4000;
+const JOB_ANSWER_MS = 3000;
+const JOB_JOINED_RE = /устроил(?:ись|ся|ась)\s+на\s+работу/i; // «Вы устроились на работу Рыбак.»
+const JOB_LEFT_RE = /уволил(?:ись|ся|ась)\s+с\s+работы/i; // «Вы уволились с работы Терафформер.»
+const JOB_TOO_MANY_RE = /слишком\s+много\s+работ/i; // «У Вас уже слишком много работ, доступно только 5 одновременно.»
+const JOB_NOT_EMPLOYED_RE = /не\s+устроен|чтобы\s+устроиться/i; // лор: «Статус: Вы не устроены», «Нажмите, чтобы устроиться»
+const JOB_EMPLOYED_RE = /уволиться|устроен|работаете/i; // «Нажмите, чтобы уволиться», «Статус: Вы устроены»
+
+const loreText = (s) => s.lore.join(' / ');
+const jobEmployed = (s) => !JOB_NOT_EMPLOYED_RE.test(loreText(s)) && JOB_EMPLOYED_RE.test(loreText(s));
+
+/** /jobs и дождаться меню работ. */
+async function openJobs(bot) {
+  if (typeof bot.sendCommand !== 'function') throw new CommandError('бот не может писать команды серверу');
+  if (bot.currentWindow) await closeAfter(bot);
+  const chat = watchChat(bot);
+  try {
+    if (!bot.sendCommand(JOBS_CMD)) throw new CommandError(`не удалось отправить ${JOBS_CMD}: бот не в сети`);
+    const w = await waitNewWindow(bot, null, JOBS_WAIT_MS);
+    if (!w) {
+      const said = serverSaid(chat.lines) || chat.lines.slice(-1)[0] || '';
+      throw Object.assign(new CommandError(`${JOBS_CMD} не открыл меню работ${said ? ` (сервер: «${said}»)` : ''}`), { code: 'no_jobs' });
+    }
+    return w;
+  } finally {
+    chat.stop();
+  }
+}
+
+/** Нажать ячейку меню работ и дождаться ответа в чате (устроился, уволился, слишком много работ). */
+async function jobClick(bot, w, slot, chat) {
+  const from = chat.lines.length;
+  await bot.actions.clickSlot(slot);
+  for (let t = 0; t < JOB_ANSWER_MS; t += 100) {
+    const lines = chat.lines.slice(from);
+    if (lines.some((l) => JOB_TOO_MANY_RE.test(l))) return { result: 'too_many', lines };
+    if (lines.some((l) => JOB_JOINED_RE.test(l))) return { result: 'joined', lines };
+    if (lines.some((l) => JOB_LEFT_RE.test(l))) return { result: 'left', lines };
+    await bot.actions.wait(100);
+  }
+  return { result: 'silent', lines: chat.lines.slice(from) };
+}
+
+/** Меню работ открыто (то же или новое после клика) — или открыть снова. */
+async function jobsWindow(bot, w) {
+  return bot.currentWindow && bot.currentWindow === w ? w : (bot.currentWindow && menuSlots(bot.currentWindow).length ? bot.currentWindow : openJobs(bot));
+}
+
+/**
+ * Устроиться на работу job (по умолчанию «Рыбак») в меню /jobs. Уже устроен (в описании нет «не устроены») — ничего
+ * не нажимает: нажатие по своей работе увольняет. «Слишком много работ» — уволиться с одной работы (не этой), потом
+ * устроиться. → { joined, already, quit, text }
+ */
+async function joinJob(bot, job = FISH_JOB) {
+  const want = norm(job);
+  const find = (w) => menuSlots(w).find((s) => norm(s.title).includes(want));
+  let w = await openJobs(bot);
+  const chat = watchChat(bot);
+  try {
+    let slot = find(w);
+    if (!slot) throw new CommandError(`в меню «${windowTitle(w)}» нет работы «${job}»`);
+    if (jobEmployed(slot)) return { joined: false, already: true, text: `уже работает: ${job}` };
+    if (!JOB_NOT_EMPLOYED_RE.test(loreText(slot))) {
+      throw new CommandError(`не понял, устроен ли бот на «${job}»: ${loreText(slot) || 'описания нет'} — нажимать не стал (нажатие по своей работе увольняет)`);
+    }
+    let r = await jobClick(bot, w, slot.slot, chat);
+    let quit = null;
+    if (r.result === 'too_many') {
+      // Уволиться с одной работы — любой, кроме нужной: в её описании «устроены» / «уволиться».
+      w = await jobsWindow(bot, w);
+      const other = menuSlots(w).find((s) => !norm(s.title).includes(want) && jobEmployed(s));
+      if (!other) throw new CommandError('у бота уже 5 работ, а с какой уволиться — в меню не видно');
+      const q = await jobClick(bot, w, other.slot, chat);
+      if (q.result !== 'left') {
+        const said = serverSaid(q.lines) || q.lines.slice(-1)[0] || '';
+        throw new CommandError(`у бота уже 5 работ; уволиться с «${other.title}» не вышло${said ? ` (сервер: «${said}»)` : ''}`);
+      }
+      quit = other.title;
+      w = await jobsWindow(bot, w);
+      slot = find(w);
+      if (!slot) throw new CommandError(`в меню «${windowTitle(w)}» нет работы «${job}»`);
+      r = await jobClick(bot, w, slot.slot, chat);
+    }
+    if (r.result !== 'joined') {
+      const said = serverSaid(r.lines) || r.lines.slice(-1)[0] || '';
+      throw new CommandError(`не устроился на «${job}»${said ? ` (сервер: «${said}»)` : ': сервер не ответил'}`);
+    }
+    return { joined: true, already: false, quit, text: quit ? `уволился с «${quit}», устроился: ${job}` : `устроился на работу: ${job}` };
+  } finally {
+    chat.stop();
+    await closeAfter(bot);
+  }
+}
+
+/** «#работа [название]» — устроиться на работу в /jobs (по умолчанию «Рыбак»). */
+async function cmdJob({ bot, args }) {
+  const job = args.join(' ').trim() || FISH_JOB;
+  const r = await joinJob(bot, job);
+  return { ok: true, message: r.already ? `Бот уже устроен: ${job}` : `${r.text[0].toUpperCase()}${r.text.slice(1)}`, data: r };
+}
+
+// ---------- деньги: баланс с табло, перевод /pay ----------
+
+const PAY_NICK_RE = /^[A-Za-z0-9_]{3,16}$/;
+const PAY_WAIT_MS = 4000;
+const PAY_FAIL_RE = /недостаточно|не\s+найден|нельзя|не\s+удалось|ошибк|не\s+в\s+сети|offline|not\s+found|insufficient|неверн/i;
+
+const readBalance = (bot) => {
+  try {
+    return bot.sidebar ? bot.sidebar.balance() : null;
+  } catch (_) {
+    return null;
+  }
+};
+
+/**
+ * Перевести деньги игроку to: «/pay to сумма». Сумма — amount или весь баланс с табло (его безопасная часть: на
+ * табло он округлён). Меньше min — не переводит. Прошёл ли перевод — по балансу на табло (уменьшился), не видно —
+ * по ответу сервера. → { ok, paid, skipped, before, after, said, text }
+ */
+async function payMoney(bot, to, { amount = null, min = 1 } = {}) {
+  if (!PAY_NICK_RE.test(to)) throw new CommandError(`кому переводить? Ник: 3–16 латинских букв, цифр и _ (а не «${to}»)`);
+  if (norm(to) === norm(bot.username)) throw new CommandError('себе переводить нечего — впиши другой ник');
+  if (typeof bot.sendCommand !== 'function') throw new CommandError('бот не может писать команды серверу');
+  const before = readBalance(bot);
+  const sum = amount !== null ? amount : before ? before.safe : null;
+  if (sum === null) throw Object.assign(new CommandError('баланса не видно: на табло справа нет строки «Баланс» — укажи сумму: #перевод ник 1000'), { code: 'no_balance' });
+  if (sum < min) return { ok: true, paid: 0, skipped: true, before, after: before, said: '', text: `переводить нечего: на балансе ${before ? before.text : '0'}` };
+  const chat = watchChat(bot);
+  let after = before;
+  try {
+    if (!bot.sendCommand(`/pay ${to} ${sum}`)) throw new CommandError('не удалось отправить /pay: бот не в сети');
+    for (let t = 0; t < PAY_WAIT_MS; t += 100) {
+      await bot.actions.wait(100);
+      after = readBalance(bot);
+      if (before && after && after.value <= before.value - sum / 2) break; // табло уже показывает новый баланс
+      if (chat.lines.some((l) => PAY_FAIL_RE.test(l))) break;
+    }
+  } finally {
+    chat.stop();
+  }
+  after = readBalance(bot);
+  const said = serverSaid(chat.lines) || chat.lines.slice(-2).join(' / ');
+  const dropped = before && after ? after.value <= before.value - sum / 2 : null;
+  const ok = dropped === null ? !PAY_FAIL_RE.test(said) : dropped;
+  return {
+    ok, paid: ok ? sum : 0, skipped: false, before, after, said,
+    text: ok ? `перевёл ${sum}$ игроку ${to}${after ? ` (на балансе ${after.text})` : ''}` : `перевод ${sum}$ игроку ${to} не прошёл${said ? ` (сервер: «${said}»)` : ''}`,
+  };
+}
+
+/** «#баланс» — баланс бота с табло справа. */
+async function cmdBalance({ bot }) {
+  const b = readBalance(bot);
+  if (!b) return { ok: false, code: 'no_balance', message: 'Баланса не видно: на табло справа нет строки «Баланс»' };
+  try {
+    bot.emit('balance', { value: b.value, safe: b.safe, text: b.text }); // вкладке «Авто фиш» — сразу
+  } catch (_) {
+    /* панели нет — не страшно */
+  }
+  return { ok: true, message: `Баланс (табло): ${b.text} — перевести можно ${b.safe}$`, data: { balance: b.value, safe: b.safe, text: b.text } };
+}
+
+/** «#перевод ник [сумма | всё]» — /pay ник сумма; без суммы — весь баланс с табло. */
+async function cmdPay({ bot, args, words }) {
+  const to = args[0] || String((bot.panelConfig && bot.panelConfig.payTo) || '').trim();
+  if (!to) throw new CommandError('кому? Например: #перевод BARABYLKAyt (весь баланс) или #перевод BARABYLKAyt 5000');
+  const rest = (args[0] ? words.slice(1) : words).filter(Boolean);
+  const num = rest.find((w) => /^\d+$/.test(w));
+  const r = await payMoney(bot, to, { amount: num ? parseInt(num, 10) : null });
+  try {
+    if (r.after) bot.emit('balance', { value: r.after.value, safe: r.after.safe, text: r.after.text });
+  } catch (_) {
+    /* панели нет — не страшно */
+  }
+  const text = `${r.text[0].toUpperCase()}${r.text.slice(1)}`;
+  if (r.skipped) return { ok: true, message: text, data: { paid: 0, to } };
+  return { ok: r.ok, code: r.ok ? undefined : 'pay_failed', message: text, data: { paid: r.paid, to, balance: r.after ? r.after.value : null } };
+}
 
 /** Сколько чего в инвентаре: имя → штук. */
 function inventoryCounts(bot) {
@@ -3150,50 +3635,6 @@ const fmtMinutes = (ms) => {
   return min >= 60 ? `${Math.floor(min / 60)} ч ${String(min % 60).padStart(2, '0')} мин` : `${min} мин`;
 };
 
-/**
- * Удочки из сундуков вокруг бота (до STORAGE_RANGE блоков): добрать до want. Удочки берут сразу много ботов —
- * у сундука толпа (не открылся), удочку забрал тот, кто кликнул раньше: тогда чуть позже ещё раз (FISH_ROD_TRIES).
- * → сколько взял
- */
-async function takeRods(bot, want) {
-  let took = 0;
-  for (let round = 0; round < FISH_ROD_TRIES && rodCount(bot) < want; round += 1) {
-    if (round) await bot.actions.wait(1500 + Math.floor(Math.random() * 1500)); // пусть толпа у сундуков разойдётся
-    let chests = storageChests(bot);
-    // Только что телепортировался — чанки с сундуками могут ещё догружаться: подождать до 5 с.
-    for (let i = 0; i < 10 && !chests.length; i += 1) {
-      await bot.actions.wait(500);
-      chests = storageChests(bot);
-    }
-    if (!chests.length) throw new CommandError(`рядом нет сундуков склада (до ${STORAGE_RANGE} блоков)`);
-    let again = false; // мешали другие — есть смысл попробовать ещё
-    for (const c of chests) {
-      const need = want - rodCount(bot);
-      if (need <= 0) break;
-      let chest;
-      try {
-        chest = await openStorage(bot, c.pos);
-      } catch (err) {
-        if (isFatal(err)) throw err;
-        again = true; // не открылся (заняли подход, сервер не успел) — потом ещё раз
-        continue;
-      }
-      let full = false;
-      try {
-        const w = chest.window;
-        const r = await moveStacks(bot, w, storageSlots(w), playerSlots(w), (it) => it.name === 'fishing_rod', need);
-        took += r.moved.get('fishing_rod') || 0;
-        full = r.full;
-        again = again || r.rejected || r.lost > 0;
-      } finally {
-        await closeAfter(bot);
-      }
-      if (full) return took; // в инвентаре нет места
-    }
-    if (!again) break; // удочек больше нет ни в одном сундуке
-  }
-  return took;
-}
 
 /**
  * «#рыбалка [дом X | здесь] [N]» — автоматическая рыбалка (вкладка «Авто фиш»): /home на «Дом склада» (или дом X),
@@ -3216,7 +3657,11 @@ async function cmdFish({ bot, args, words }) {
   const owner = String(bot.username || 'bot').toLowerCase();
   const started = Date.now();
   const stops0 = bot.actions.stops;
-  const stats = { caught: 0, casts: 0, empty: 0, items: new Map(), stored: new Map(), took: 0 };
+  const stats = { caught: 0, casts: 0, empty: 0, items: new Map(), stored: new Map(), took: 0, saved: 0, paid: 0, job: '', waits: 0, payFail: '' };
+  const badChests = new Set(); // сундуки, которые сервер не даёт открыть: больше не обходить
+  let rodsWhy = ''; // почему не взял удочку
+  let saveRetryAt = 0; // изношенную в сундук не положить — когда пробовать снова
+  let lastPayAt = bot.actions.now();
   let spot = null; // { feet, key, yaw, pitch } — где бот рыбачит
   let homePos = null;
   let note = '';
@@ -3229,6 +3674,8 @@ async function cmdFish({ bot, args, words }) {
   // Что видит панель (вкладка «Авто фиш»): что бот делает, сколько поймал, удочек осталось.
   const report = (state, text) => {
     try {
+      const rods = botRods(bot);
+      const held = rods.find((r) => r.item === bot.heldItem) || rods[0];
       bot.emit('fishing', {
         state,
         text,
@@ -3237,7 +3684,11 @@ async function cmdFish({ bot, args, words }) {
         casts: stats.casts,
         last,
         items: [...stats.items].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([name, count]) => ({ name, label: lootName(name), count })),
-        rods: rodCount(bot),
+        rods: rods.filter((r) => !rodWorn(r.item)).length, // целых удочек
+        rodLeft: held ? (Number.isFinite(held.left) ? held.left : null) : null, // прочность той, которой ловит
+        rodMax: held && Number.isFinite(held.left) ? rodMax(held.item) : null, // из скольких
+        job: stats.job,
+        paid: stats.paid,
         since: started,
         spot: spot ? plain(spot.feet) : null,
       });
@@ -3262,26 +3713,107 @@ async function cmdFish({ bot, args, words }) {
     if (!homePos || bot.entity.position.distanceTo(homePos) <= 3) return;
     await guarded(() => bot.actions.goTo(homePos, { range: 1.5, vertical: 2, maxDistance: 96 }));
   };
-  /** Удочки: добрать до FISH_RODS_WANT (у сундуков склада). → сколько взял */
+  /** Целую удочку — со склада (самую целую; у сундуков склада). → сколько взял */
   const restock = async () => {
     await goHome();
-    report('rods', 'беру удочки из сундуков склада');
+    report('rods', 'беру целую удочку из сундуков склада');
     let took = 0;
     try {
-      took = await guarded(() => takeRods(bot, FISH_RODS_WANT));
+      took = await guarded(() => takeRods(bot, FISH_RODS_WANT, { skip: badChests }));
+      rodsWhy = took ? '' : 'в сундуках склада целых нет';
     } catch (err) {
       if (isFatal(err)) throw err;
-      if (!rodCount(bot)) throw Object.assign(new CommandError(`нет удочки, а взять негде: ${err.message}`), { code: 'no_rod' });
+      rodsWhy = err.message;
     }
     stats.took += took;
     return took;
+  };
+  /** Изношенные удочки (прочность 3 и меньше) — в сундук склада: сохранить, а не доламывать. */
+  const saveWorn = async () => {
+    if (bot.actions.now() < saveRetryAt) return;
+    const worn = wornRods(bot);
+    if (!worn.length) return;
+    await goHome();
+    report('rods', `кладу изношенную удочку (прочность ${worn[0].left} из ${rodMax(worn[0].item)}) в сундук склада`);
+    try {
+      const d = await guarded(() => depositLoot(bot, (it) => isRod(it) && rodWorn(it), 'рыбалка'));
+      stats.saved += d.put.get('fishing_rod') || 0;
+      if (wornRods(bot).length) saveRetryAt = bot.actions.now() + FISH_SAVE_RETRY_MS; // сундуки полны
+    } catch (err) {
+      if (isFatal(err)) throw err;
+      saveRetryAt = bot.actions.now() + FISH_SAVE_RETRY_MS;
+    }
+  };
+  /** Изношенные — в сундук; целой нет — взять со склада. → есть ли целая */
+  const rodsReady = async () => {
+    await saveWorn();
+    if (!usableRods(bot).length) await restock();
+    return usableRods(bot).length > 0;
+  };
+  /**
+   * Целых удочек нет ни у бота, ни в сундуках — ждать: раз в FISH_ROD_WAIT_MS смотреть сундуки снова (положили
+   * новые — рыбачить дальше). Ждёт у сундуков, как обычно: ест, отбивается; #стоп — сразу.
+   */
+  const waitRods = async () => {
+    for (;;) {
+      const why = rodsWhy ? ` (${rodsWhy})` : '';
+      report('wait', `нужны новые удочки: целых (прочность больше ${ROD_SAVE_LEFT}) нет ни у бота, ни в сундуках${why} — смотрю снова через ${Math.round(FISH_ROD_WAIT_MS / 60000)} мин`);
+      stats.waits += 1;
+      const until = bot.actions.now() + FISH_ROD_WAIT_MS;
+      while (bot.actions.now() < until) {
+        if (stopAsked()) throw new CommandError('остановлено');
+        if (guard.wants()) await guard.handle();
+        await guarded(() => bot.actions.wait(Math.max(50, Math.min(10000, until - bot.actions.now()))));
+      }
+      if (await rodsReady()) return;
+    }
+  };
+  /** Ловить этой: той, что в руке, пока она целая; иначе — самой целой. */
+  const rodToUse = () => {
+    const usable = usableRods(bot);
+    const held = usable.find((r) => r.item === bot.heldItem);
+    return (held || usable[0] || {}).item || null;
+  };
+  /** Пора перевести деньги (вкладка «Авто фиш»: ник и «раз в N минут») — /pay ник весь баланс. */
+  const payIfDue = async () => {
+    const cfg = bot.panelConfig || {};
+    const to = String(cfg.payTo || '').trim();
+    const every = Number(cfg.payEvery) || 0;
+    if (!to || every <= 0 || bot.actions.now() - lastPayAt < every * 60 * 1000) return;
+    lastPayAt = bot.actions.now();
+    try {
+      const r = await payMoney(bot, to, { min: PAY_MIN_AUTO });
+      if (r.paid) {
+        stats.paid += r.paid;
+        report('fishing', r.text);
+      } else if (!r.ok) {
+        stats.payFail = r.text;
+      }
+    } catch (err) {
+      if (isFatal(err)) throw err;
+      stats.payFail = err.message;
+    }
+  };
+  /** Устроиться Рыбаком в /jobs (за улов — деньги); не вышло — рыбачить всё равно. */
+  let jobChecked = false;
+  const ensureJob = async () => {
+    if (jobChecked) return;
+    jobChecked = true;
+    report('job', `устраиваюсь на работу «${FISH_JOB}» (${JOBS_CMD})`);
+    try {
+      const r = await guarded(() => joinJob(bot, FISH_JOB));
+      stats.job = r.already ? `уже работает: ${FISH_JOB}` : r.text;
+    } catch (err) {
+      if (isFatal(err)) throw err;
+      stats.job = `не устроился: ${err.message}`;
+    }
   };
   /** Улов — в сундуки склада. → свободных ячеек после */
   const unload = async () => {
     await goHome();
     report('unload', 'складываю улов в сундуки склада');
     try {
-      const d = await guarded(() => depositLoot(bot, (it) => FISH_LOOT.has(it.name)));
+      const d = await guarded(() => depositLoot(bot, (it) => FISH_LOOT.has(it.name), 'рыбалка'));
       for (const [n, c] of d.put) stats.stored.set(n, (stats.stored.get(n) || 0) + c);
     } catch (err) {
       if (isFatal(err)) throw err;
@@ -3322,12 +3854,9 @@ async function cmdFish({ bot, args, words }) {
     }
     homePos = bot.entity.position.clone();
     await prepareShield(bot);
-    if (rodCount(bot) < FISH_RODS_WANT) await restock();
-    if (!rodCount(bot)) {
-      code = 'no_rod';
-      note = `нет удочки: положи удочки в сундуки ${base ? `у дома «${base}»` : 'рядом с ботом'} (до ${STORAGE_RANGE} блоков от точки дома)`;
-      return;
-    }
+    await ensureJob();
+    // Удочка: есть целая у бота — сразу рыбачить (сундуки не обходить); изношенные — в сундук; целых нет — со склада.
+    if (!(await rodsReady())) await waitRods();
     let badCasts = 0;
     let counts = inventoryCounts(bot);
     let reported = '';
@@ -3341,14 +3870,13 @@ async function cmdFish({ bot, args, words }) {
         return;
       }
       if (guard.wants()) await guard.handle();
-      if (!rodCount(bot)) {
-        if (!(await restock()) && !rodCount(bot)) {
-          code = 'no_rod';
-          note = `удочки кончились, на складе ${base ? `«${base}» ` : ''}больше нет — положи новые в сундуки`;
-          return;
-        }
+      // Удочка износилась (прочность 3 и меньше) — в сундук, вместо неё — самая целая; целых нигде нет — ждать новые.
+      if (!usableRods(bot).length || (wornRods(bot).length && bot.actions.now() >= saveRetryAt)) {
+        if (!(await rodsReady())) await waitRods();
         counts = inventoryCounts(bot);
+        reported = '';
       }
+      await payIfDue();
       if (freeSlots(bot) < FISH_FREE_MIN) {
         if ((await unload()) < FISH_FREE_MIN) {
           code = 'storage_full';
@@ -3400,7 +3928,7 @@ async function cmdFish({ bot, args, words }) {
         reported = where();
         report('fishing', `рыбачит у ${where()}`);
       }
-      const r = await guarded(() => bot.actions.fish({ yaw: plan.yaw, pitch: plan.pitch, maxWaitTicks: FISH_WAIT_TICKS }));
+      const r = await guarded(() => bot.actions.fish({ yaw: plan.yaw, pitch: plan.pitch, maxWaitTicks: FISH_WAIT_TICKS, rod: rodToUse() }));
       stats.casts += 1;
       // Улов — то, что прибавилось в инвентаре (подлетевшее и после подсечки — тоже).
       const now = inventoryCounts(bot);
@@ -3475,15 +4003,23 @@ async function cmdFish({ bot, args, words }) {
   const lines = [];
   const head = stopped === 'stopped' ? 'Рыбалка остановлена' : stopped ? 'Рыбалку прервала другая команда' : note ? 'Рыбалка окончена' : 'Рыбалка готова';
   lines.push(`${head}: ${stats.caught ? `поймал ${stats.caught} — ${list}` : 'ничего не поймал'} (забросов ${stats.casts}, ${took})`);
+  if (stats.job) lines.push(`Работа: ${stats.job}`);
   if (stats.stored.size) lines.push(`Сложил в сундуки склада: ${[...stats.stored].map(([name, n]) => `${lootName(name)} ×${n}`).join(', ')}`);
-  if (stats.took) lines.push(`Брал удочки со склада: ${stats.took}`);
+  if (stats.took) lines.push(`Брал целые удочки со склада: ${stats.took}`);
+  if (stats.saved) lines.push(`Изношенные удочки (прочность ${ROD_SAVE_LEFT} и меньше) — в сундук: ${stats.saved}`);
+  if (stats.waits) lines.push(`Ждал новые удочки: ${stats.waits} ${plural(stats.waits, 'раз', 'раза', 'раз')} по ${Math.round(FISH_ROD_WAIT_MS / 60000)} мин`);
+  if (stats.paid) lines.push(`Перевёл денег: ${stats.paid}$ игроку ${String((bot.panelConfig && bot.panelConfig.payTo) || '').trim()}`);
+  if (stats.payFail) lines.push(`Перевод денег: ${stats.payFail}`);
   if (stats.empty) lines.push(`Клюнуло, а улов не долетел: ${stats.empty} ${plural(stats.empty, 'раз', 'раза', 'раз')}`);
   const g = guard.stats || {};
   if (g.kills) lines.push(`Отбился от мобов: ${g.kills}`);
   if (g.ate) lines.push(`Поел: ${g.ate} ${plural(g.ate, 'раз', 'раза', 'раз')}`);
   if (g.hungry) lines.push('Голоден, а еды нет — положи боту еду (хлеб, жареное мясо)');
   if (note && !stopped) lines.push(`Остановился: ${note}`);
-  const data = { caught: stats.caught, casts: stats.casts, items: Object.fromEntries(stats.items), stored: Object.fromEntries(stats.stored), rods: rodCount(bot), stopped: Boolean(stopped) };
+  const data = {
+    caught: stats.caught, casts: stats.casts, items: Object.fromEntries(stats.items), stored: Object.fromEntries(stats.stored), rods: rodCount(bot),
+    usableRods: usableRods(bot).length, saved: stats.saved, took: stats.took, paid: stats.paid, job: stats.job, stopped: Boolean(stopped),
+  };
   report(stopped ? 'stopped' : note ? 'error' : 'done', lines[0]);
   if (stopped) return { ok: false, code: stopped, message: lines, data };
   if (note) return { ok: stats.caught > 0, code: code || 'failed', message: lines, data };
@@ -3742,6 +4278,16 @@ const COMMANDS = [
     about: 'положить в ближайший сундук (или по координатам); «всё» — кроме инструментов, оружия и брони',
     run: cmdPut,
   },
+  {
+    name: 'скинь',
+    aliases: ['скинуть', 'скидывай', 'выложи', 'dump'],
+    usage: ['#скинь', '#скинь дом склад'],
+    about: 'скинуть всё: весь инвентарь и всё надетое (броню, щит или другое во второй руке) — в ближайший сундук или бочку, ' +
+      `где есть место (до ${DUMP_RANGE} блоков; полон или не открывается — в следующий ближайший); броню сначала снимает ` +
+      'в инвентарь (не влезла — снимет, когда инвентарь опустеет); броню с проклятием несъёмности снять нельзя — скажет; ' +
+      '«дом X» — сначала /home X',
+    run: cmdDump,
+  },
   { name: 'возьми', aliases: ['equip', 'вруку'], usage: ['#возьми <предмет>'], about: 'взять в руку; можно по-русски: земля, булыжник, доски, кирка, меч… («из сундука» — как #достань)', run: cmdEquip },
   { name: 'инвентарь', aliases: ['inv', 'инв'], usage: ['#инвентарь'], about: 'что у бота в руке и в инвентаре', observe: true, run: cmdInventory },
   { name: 'рядом', aliases: ['near', 'кто'], usage: ['#рядом'], about: 'игроки и сундуки поблизости', observe: true, run: cmdNearby },
@@ -3805,11 +4351,40 @@ const COMMANDS = [
     aliases: ['рыбачь', 'рыбачить', 'рыба', 'удочка', 'автофиш', 'фиш', 'fish', 'autofish'],
     usage: ['#рыбалка', '#рыбалка дом база', '#рыбалка здесь', '#рыбалка 100'],
     about: 'автоматическая рыбалка (вкладка «Авто фиш»): /home на «Дом склада» из настроек (или дом X; «здесь» — на месте), ' +
-      `удочки из сундуков у дома (до ${STORAGE_RANGE} блоков, берёт ${FISH_RODS_WANT}), ближайшая вода (до ${FISH_RADIUS} блоков) — ` +
-      'место на берегу и заброс туда, где поплавок упадёт в воду; клюнуло — подсекает и закидывает снова, пока не #стоп ' +
-      '(с числом — пока не поймает столько); удочка сломалась — берёт следующую, кончились — новые со склада; инвентарь забился — ' +
-      'улов в сундуки склада; ботов много — каждый встаёт на своё место у воды; за работой ест и отбивается от мобов',
+      `устраивается на работу «${FISH_JOB}» в /jobs (за улов — деньги), удочка — своя, нет целой — самая целая из сундуков у дома ` +
+      `(до ${STORAGE_RANGE} блоков); ближайшая вода (до ${FISH_RADIUS} блоков) — место на берегу и заброс туда, где поплавок упадёт в ` +
+      'воду; клюнуло — подсекает и закидывает снова, пока не #стоп (с числом — пока не поймает столько); поплавок лёг на берег ' +
+      'или зацепил кого-то — убирает его сменой ячейки (вытаскивать — износ удочки); удочка износилась ' +
+      `(прочность ${ROD_SAVE_LEFT} и меньше) — кладёт её в сундук и берёт целую, целых нет нигде — ждёт и раз в 5 мин смотрит сундуки; ` +
+      'инвентарь забился — улов в сундуки склада; ник для денег во вкладке — сам переводит баланс раз в N минут (/pay); ' +
+      'ботов много — каждый встаёт на своё место у воды; за работой ест и отбивается от мобов',
     run: cmdFish,
+  },
+  {
+    name: 'работа',
+    aliases: ['работы', 'jobs', 'job', 'устройся'],
+    usage: ['#работа', '#работа рыбак', '#работа шахтёр'],
+    about: `устроиться на работу в /jobs (по умолчанию «${FISH_JOB}»): открывает меню «Работы», нажимает работу, если в описании ` +
+      '«Вы не устроены», и ждёт «Вы устроились на работу …»; уже устроен — ничего не нажимает (нажатие по своей работе увольняет); ' +
+      '«слишком много работ» — увольняется с одной другой и устраивается',
+    run: cmdJob,
+  },
+  {
+    name: 'баланс',
+    aliases: ['balance', 'bal', 'деньги'],
+    usage: ['#баланс'],
+    about: 'баланс бота с табло справа («Баланс • $837.7k») и сколько из него можно перевести: на табло сумма округлена — ' +
+      'перевести можно чуть меньше показанного',
+    observe: true,
+    run: cmdBalance,
+  },
+  {
+    name: 'перевод',
+    aliases: ['переведи', 'pay', 'заплати'],
+    usage: ['#перевод BARABYLKAyt', '#перевод BARABYLKAyt 5000'],
+    about: 'перевести деньги игроку: /pay ник сумма; без суммы — весь баланс с табло (чуть меньше показанного: там округлено); ' +
+      'прошёл ли перевод — по балансу на табло и ответу сервера; без ника — на ник из вкладки «Авто фиш»',
+    run: cmdPay,
   },
   {
     name: 'рентген',
